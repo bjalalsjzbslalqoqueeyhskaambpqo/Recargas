@@ -13,6 +13,15 @@ cd recargas
 ./install.sh
 ```
 
+Al instalar, el script genera automáticamente:
+- `APP_ADMIN_KEY`
+- usuario/contraseña admin por defecto
+- `admin-app/bootstrap-config.json` con datos para incrustar en el APK
+
+## Seguridad mínima de app
+Todas las rutas `/api/admin/*` exigen header:
+- `X-App-Key: <APP_ADMIN_KEY>`
+
 ## API Admin principal
 - `GET /api/status`
 - `POST /api/admin/login`

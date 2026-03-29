@@ -4,35 +4,49 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 SERVICE_FILE="/etc/systemd/system/recargas-admin-api.service"
+APK_BOOTSTRAP_FILE="$ROOT_DIR/admin-app/bootstrap-config.json"
 
 echo "== Instalador Recargas Admin API (HTTP) =="
-echo "Este modo instala solo backend API para entorno controlado detrás de Cloudflare (nube naranja)."
+echo "Este instalador deja el servidor listo y genera datos para incrustar en el APK Admin."
 echo
 
-read -r -p "Usuario administrador inicial: " ADMIN_USER
-read -r -s -p "Contraseña administrador inicial: " ADMIN_PASS
-echo
+read -r -p "Host/IP público para el APK (ej: api.midominio.com o 1.2.3.4): " PUBLIC_HOST
 read -r -p "Puerto API interno [3000]: " APP_PORT
 APP_PORT="${APP_PORT:-3000}"
 
-if [[ -z "$ADMIN_USER" || -z "$ADMIN_PASS" ]]; then
-  echo "Error: usuario y contraseña admin son obligatorios."
+if [[ -z "$PUBLIC_HOST" ]]; then
+  echo "Error: host público requerido."
   exit 1
 fi
 
+DEFAULT_ADMIN_USER="admin_$(openssl rand -hex 2)"
+DEFAULT_ADMIN_PASS="Adm$(openssl rand -base64 9 | tr -dc 'A-Za-z0-9' | head -c 12)9"
 SECRET="$(openssl rand -hex 32)"
+APP_ADMIN_KEY="$(openssl rand -hex 24)"
 
 cat > "$ENV_FILE" <<ENV
 NODE_ENV=production
 BIND_HOST=0.0.0.0
 PORT=$APP_PORT
 SECRET=$SECRET
-BOOTSTRAP_ADMIN_USER=$ADMIN_USER
-BOOTSTRAP_ADMIN_PASS=$ADMIN_PASS
+APP_ADMIN_KEY=$APP_ADMIN_KEY
+BOOTSTRAP_ADMIN_USER=$DEFAULT_ADMIN_USER
+BOOTSTRAP_ADMIN_PASS=$DEFAULT_ADMIN_PASS
 DIRECT_TLS=false
 ENV
 
-chmod 600 "$ENV_FILE"
+mkdir -p "$(dirname "$APK_BOOTSTRAP_FILE")"
+cat > "$APK_BOOTSTRAP_FILE" <<ENV
+{
+  "api_base_url": "http://$PUBLIC_HOST:$APP_PORT",
+  "api_status_url": "http://$PUBLIC_HOST:$APP_PORT/api/status",
+  "x_app_key": "$APP_ADMIN_KEY",
+  "default_admin_user": "$DEFAULT_ADMIN_USER",
+  "default_admin_password": "$DEFAULT_ADMIN_PASS"
+}
+ENV
+
+chmod 600 "$ENV_FILE" "$APK_BOOTSTRAP_FILE"
 
 cd "$ROOT_DIR"
 command -v npm >/dev/null 2>&1 || { echo "npm no está instalado"; exit 1; }
@@ -76,5 +90,11 @@ fi
 
 echo
 echo "Instalación finalizada."
-echo "Admin inicial: $ADMIN_USER"
-echo "API: http://TU_IP_O_HOST:$APP_PORT/api/status"
+echo "---------------------------------------------"
+echo "DATOS PARA INCRUSTAR EN APK ADMIN"
+echo "API Base URL: http://$PUBLIC_HOST:$APP_PORT"
+echo "X-App-Key: $APP_ADMIN_KEY"
+echo "Usuario admin por defecto: $DEFAULT_ADMIN_USER"
+echo "Password admin por defecto: $DEFAULT_ADMIN_PASS"
+echo "Archivo generado: $APK_BOOTSTRAP_FILE"
+echo "---------------------------------------------"
