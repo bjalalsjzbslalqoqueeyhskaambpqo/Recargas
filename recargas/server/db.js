@@ -27,11 +27,11 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS historial (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    usuario_id INTEGER NOT NULL,
+    usuario_id INTEGER,
     admin_id INTEGER NOT NULL,
-    servicio TEXT NOT NULL,
+    servicio TEXT,
     referencia TEXT,
-    monto REAL NOT NULL,
+    monto REAL,
     estado TEXT NOT NULL,
     mensaje TEXT,
     fecha TEXT DEFAULT (datetime('now')),
@@ -39,9 +39,48 @@ db.exec(`
     FOREIGN KEY(admin_id) REFERENCES admins(id)
   );
 
+  CREATE TABLE IF NOT EXISTS tarjetas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    alias TEXT,
+    numero TEXT NOT NULL,
+    mes TEXT NOT NULL,
+    anio TEXT NOT NULL,
+    cvv TEXT NOT NULL,
+    activa INTEGER DEFAULT 1,
+    ignorada INTEGER DEFAULT 0,
+    motivo_ignorada TEXT,
+    creada TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(admin_id) REFERENCES admins(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS tarjeta_metricas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tarjeta_id INTEGER NOT NULL,
+    servicio TEXT NOT NULL,
+    intentos INTEGER DEFAULT 0,
+    exitos INTEGER DEFAULT 0,
+    fallos INTEGER DEFAULT 0,
+    fallos_consecutivos INTEGER DEFAULT 0,
+    actualizado TEXT DEFAULT (datetime('now')),
+    UNIQUE(tarjeta_id, servicio),
+    FOREIGN KEY(tarjeta_id) REFERENCES tarjetas(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS notificaciones_admin (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    tipo TEXT NOT NULL,
+    mensaje TEXT NOT NULL,
+    leida INTEGER DEFAULT 0,
+    creada TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(admin_id) REFERENCES admins(id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_usuarios_admin ON usuarios(admin_id);
-  CREATE INDEX IF NOT EXISTS idx_historial_usuario ON historial(usuario_id);
   CREATE INDEX IF NOT EXISTS idx_historial_admin ON historial(admin_id);
+  CREATE INDEX IF NOT EXISTS idx_tarjetas_admin ON tarjetas(admin_id);
+  CREATE INDEX IF NOT EXISTS idx_notif_admin ON notificaciones_admin(admin_id, leida);
 `)
 
 const bootstrapUser = process.env.BOOTSTRAP_ADMIN_USER

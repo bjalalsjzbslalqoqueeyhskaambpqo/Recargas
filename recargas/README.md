@@ -1,43 +1,41 @@
-# Recargas
+# Recargas Admin API (HTTP)
 
-## Arquitectura (eficiente)
-- **App Node**: corre interno en `127.0.0.1:3000`.
-- **Gateway Go**: corre en `:443` (HTTPS), expone solo `https://dominio/recargas`.
-- El gateway reescribe `/recargas/*` hacia la app interna (`/`).
+Backend centrado en administración (sin páginas web), pensado para app Android Admin.
 
-## Instalación rápida
+## Qué incluye
+- Login admin
+- Gestión de usuarios (crear, eliminar, ajustar saldo +/-)
+- Historial admin
+- Gestión de tarjetas
+- Métricas de fallos por tarjeta/servicio con auto-ignorado y notificación
+
+## Instalación
 ```bash
 cd recargas
 ./install.sh
 ```
 
-### Flujo del instalador
-1. Espera 5 segundos y abre editor para pegar **Origin Certificate** de Cloudflare.
-2. Guardas y sales del editor (en nano: `Ctrl+X`).
-3. Espera 5 segundos y abre editor para pegar **Private Key** de Cloudflare.
-4. Guardas y sales del editor.
-5. Pide usuario y contraseña del **admin inicial**.
-6. Pide dominio y ruta pública (por defecto `/recargas`).
-7. Compila gateway Go, instala dependencias Node y configura `systemd`.
+## Endpoints base
+- `GET /api/status`
+- `POST /api/admin/login`
+- `GET /api/admin/usuarios`
+- `POST /api/admin/usuarios`
+- `DELETE /api/admin/usuarios/:id`
+- `PATCH /api/admin/usuarios/:id/saldo`
+- `GET /api/admin/historial`
+- `GET /api/admin/tarjetas`
+- `POST /api/admin/tarjetas`
+- `PATCH /api/admin/tarjetas/:id/activa`
+- `DELETE /api/admin/tarjetas/:id`
+- `POST /api/admin/tarjetas/:id/resultado`
+- `GET /api/admin/notificaciones`
+- `PATCH /api/admin/notificaciones/:id/leida`
 
-Resultado esperado:
-- `https://TU_DOMINIO/recargas`
-- `https://TU_DOMINIO/recargas/admin`
+## Regla de auto-ignorado de tarjeta
+El servidor ignora una tarjeta automáticamente cuando:
+- acumula `>= 5` fallos consecutivos globales, o
+- venía con al menos 1 éxito y luego llega a `>= 4` fallos consecutivos en un servicio.
 
-## Agregar un nuevo bot (sin tocar backend)
-1. Crear carpeta: `server/bots/<nombre_servicio>/`
-2. Agregar `ui.html`
-3. Agregar `bot.js` exportando mínimo:
-
-```js
-async function procesar({ referencia, monto, usuario }) {
-  return { ok: true, mensaje: 'Procesado' }
-}
-module.exports = { procesar }
-```
-
-Opcional:
-- `nombre`
-- `montos`
-- `validarReferencia(referencia)`
-- `disponible` (`false` para ocultar)
+Al ignorarse:
+- se marca `ignorada=1`, `activa=0`
+- se crea notificación para el admin.
