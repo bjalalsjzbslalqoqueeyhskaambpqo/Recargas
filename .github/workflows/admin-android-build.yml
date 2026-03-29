@@ -1,0 +1,99 @@
+name: admin-android-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - 'recargas/admin-app/**'
+      - '.github/workflows/admin-android-build.yml'
+
+jobs:
+  build-admin-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: recargas/admin-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Android project presence
+        id: detect
+        run: |
+          if [[ ! -f ./gradlew ]]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No se encontró gradlew en recargas/admin-app. Se omite compilación."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            chmod +x ./gradlew
+          fi
+
+      - name: Setup Java 17
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        if: steps.detect.outputs.found == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate signing keystore (ephemeral)
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          KEY_ALIAS="upload"
+          KEYSTORE_FILE="$PWD/android-signing.jks"
+          STORE_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
+          KEY_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
+
+          keytool -genkeypair \
+            -v \
+            -storetype PKCS12 \
+            -keystore "$KEYSTORE_FILE" \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -storepass "$STORE_PASS" \
+            -keypass "$KEY_PASS" \
+            -dname "CN=RecargasAdmin, OU=Mobile, O=Recargas, L=NA, S=NA, C=US"
+
+          echo "KEYSTORE_FILE=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "STORE_PASS=$STORE_PASS" >> "$GITHUB_ENV"
+          echo "KEY_PASS=$KEY_PASS" >> "$GITHUB_ENV"
+
+          cat > signing-data.txt <<DATA
+          keystore_file=$KEYSTORE_FILE
+          key_alias=$KEY_ALIAS
+          store_password=$STORE_PASS
+          key_password=$KEY_PASS
+          DATA
+
+      - name: Build signed release APK
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$STORE_PASS" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASS"
+
+      - name: Upload signed APK
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-signed-release-apk
+          path: recargas/admin-app/app/build/outputs/apk/release/*.apk
+
+      - name: Upload signing data (for controlled environments)
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-signing-data
+          path: |
+            recargas/admin-app/android-signing.jks
+            recargas/admin-app/signing-data.txt
