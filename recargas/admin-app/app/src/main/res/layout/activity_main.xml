@@ -17,30 +17,17 @@
             android:textStyle="bold" />
 
         <TextView
+            android:id="@+id/txtServer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="Configuración cargada desde build (bootstrap.properties)" />
-
-        <EditText
-            android:id="@+id/inputApiBase"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
-            android:hint="API Base URL" />
-
-        <EditText
-            android:id="@+id/inputAppKey"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:hint="X-App-Key" />
+            android:layout_marginTop="6dp"
+            android:text="Servidor: comprobando..." />
 
         <EditText
             android:id="@+id/inputUser"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="14dp"
             android:hint="Usuario admin" />
 
         <EditText
@@ -52,17 +39,17 @@
             android:inputType="textPassword" />
 
         <Button
-            android:id="@+id/btnSave"
+            android:id="@+id/btnLogin"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="Probar configuración" />
+            android:text="Ingresar" />
 
         <TextView
             android:id="@+id/txtStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
-            android:text="Estado: pendiente" />
+            android:text="Estado: listo" />
     </LinearLayout>
 </ScrollView>

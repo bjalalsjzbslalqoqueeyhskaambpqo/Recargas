@@ -6,41 +6,37 @@ ENV_FILE="$ROOT_DIR/.env"
 SERVICE_FILE="/etc/systemd/system/recargas-admin-api.service"
 APK_BOOTSTRAP_FILE="$ROOT_DIR/admin-app/local/bootstrap.properties"
 
-echo "== Instalador Recargas Admin API (HTTP) =="
-echo "Este instalador deja el servidor listo y genera datos para incrustar en el APK Admin."
-echo
+PUBLIC_HOST="$(hostname -I | awk '{print $1}')"
+PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+APP_PORT="80"
 
-read -r -p "Host/IP público para el APK (ej: api.midominio.com o 1.2.3.4): " PUBLIC_HOST
-read -r -p "Puerto API interno [3000]: " APP_PORT
-APP_PORT="${APP_PORT:-3000}"
+echo "== Instalador Recargas Admin API (IP:80) =="
+echo "Configuración automática sin preguntas."
+echo "IP detectada: $PUBLIC_HOST"
+echo "Puerto API: $APP_PORT"
 
-if [[ -z "$PUBLIC_HOST" ]]; then
-  echo "Error: host público requerido."
-  exit 1
-fi
-
-DEFAULT_ADMIN_USER="admin_$(openssl rand -hex 2)"
-DEFAULT_ADMIN_PASS="Adm$(openssl rand -base64 9 | tr -dc 'A-Za-z0-9' | head -c 12)9"
-SECRET="$(openssl rand -hex 32)"
-APP_ADMIN_KEY="$(openssl rand -hex 24)"
+default_admin_user="admin_$(openssl rand -hex 2)"
+default_admin_pass="Adm$(openssl rand -base64 9 | tr -dc 'A-Za-z0-9' | head -c 12)9"
+secret="$(openssl rand -hex 32)"
+app_admin_key="$(openssl rand -hex 24)"
 
 cat > "$ENV_FILE" <<ENV
 NODE_ENV=production
 BIND_HOST=0.0.0.0
 PORT=$APP_PORT
-SECRET=$SECRET
-APP_ADMIN_KEY=$APP_ADMIN_KEY
-BOOTSTRAP_ADMIN_USER=$DEFAULT_ADMIN_USER
-BOOTSTRAP_ADMIN_PASS=$DEFAULT_ADMIN_PASS
+SECRET=$secret
+APP_ADMIN_KEY=$app_admin_key
+BOOTSTRAP_ADMIN_USER=$default_admin_user
+BOOTSTRAP_ADMIN_PASS=$default_admin_pass
 DIRECT_TLS=false
 ENV
 
 mkdir -p "$(dirname "$APK_BOOTSTRAP_FILE")"
 cat > "$APK_BOOTSTRAP_FILE" <<ENV
 API_BASE_URL=http://$PUBLIC_HOST:$APP_PORT
-APP_ADMIN_KEY=$APP_ADMIN_KEY
-DEFAULT_ADMIN_USER=$DEFAULT_ADMIN_USER
-DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASS
+APP_ADMIN_KEY=$app_admin_key
+DEFAULT_ADMIN_USER=$default_admin_user
+DEFAULT_ADMIN_PASSWORD=$default_admin_pass
 ENV
 
 chmod 600 "$ENV_FILE" "$APK_BOOTSTRAP_FILE"
@@ -66,7 +62,7 @@ ExecStart=/usr/bin/env npm start
 Restart=always
 RestartSec=3
 EnvironmentFile=$ENV_FILE
-User=$(whoami)
+User=root
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -82,7 +78,7 @@ SERVICE
   sudo systemctl restart recargas-admin-api.service
   sudo systemctl status recargas-admin-api.service --no-pager || true
 else
-  echo "systemctl no disponible. Inicia manualmente con: npm start"
+  echo "systemctl no disponible. Inicia manualmente con: sudo npm start"
 fi
 
 echo
@@ -90,14 +86,14 @@ echo "Instalación finalizada."
 echo "---------------------------------------------"
 echo "DATOS PARA INCRUSTAR EN APK ADMIN"
 echo "API Base URL: http://$PUBLIC_HOST:$APP_PORT"
-echo "X-App-Key: $APP_ADMIN_KEY"
-echo "Usuario admin por defecto: $DEFAULT_ADMIN_USER"
-echo "Password admin por defecto: $DEFAULT_ADMIN_PASS"
+echo "X-App-Key: $app_admin_key"
+echo "Usuario admin por defecto: $default_admin_user"
+echo "Password admin por defecto: $default_admin_pass"
 echo "Archivo generado: $APK_BOOTSTRAP_FILE"
 echo
 echo "BLOQUE PARA COPIAR EN recargas/admin-app/local/bootstrap.properties"
 echo "API_BASE_URL=http://$PUBLIC_HOST:$APP_PORT"
-echo "APP_ADMIN_KEY=$APP_ADMIN_KEY"
-echo "DEFAULT_ADMIN_USER=$DEFAULT_ADMIN_USER"
-echo "DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASS"
+echo "APP_ADMIN_KEY=$app_admin_key"
+echo "DEFAULT_ADMIN_USER=$default_admin_user"
+echo "DEFAULT_ADMIN_PASSWORD=$default_admin_pass"
 echo "---------------------------------------------"

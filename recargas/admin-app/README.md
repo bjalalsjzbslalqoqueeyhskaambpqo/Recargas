@@ -1,17 +1,20 @@
-# Admin App (Android) - Base compilable
+# Admin App (Android) - Base funcional
 
-Esta app ya tiene estructura mínima Android y compila en CI.
+La app abre directamente pantalla de login admin.
 
-## Archivo de datos desde servidor
-`local/bootstrap.properties` con:
-- `API_BASE_URL`
-- `APP_ADMIN_KEY`
-- `DEFAULT_ADMIN_USER`
-- `DEFAULT_ADMIN_PASSWORD`
+## Datos que consume desde build
+Archivo: `local/bootstrap.properties`
 
-Ese archivo lo genera `recargas/install.sh` y también imprime el bloque para copiar/pegar.
+```properties
+API_BASE_URL=http://IP:80
+APP_ADMIN_KEY=...
+DEFAULT_ADMIN_USER=...
+DEFAULT_ADMIN_PASSWORD=...
+```
 
-## Compilación en workflow
-GitHub Actions instala JDK + Android SDK + Gradle, compila `assembleRelease` y firma automáticamente.
+El instalador del servidor (`recargas/install.sh`) genera este archivo automáticamente.
 
-> Para producción real, cambia la firma efímera por una keystore fija tuya.
+## Comportamiento actual
+- Al abrir, prueba conexión con `GET /api/status`
+- Prellena usuario y contraseña por defecto
+- Login contra `POST /api/admin/login` enviando `X-App-Key`

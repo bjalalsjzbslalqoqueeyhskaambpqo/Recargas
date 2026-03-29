@@ -1,30 +1,47 @@
-# Recargas - Etapa Admin API + Bots base
+# Recargas - Admin API + App Android Admin
 
-Esta etapa deja únicamente lo necesario para:
-- Servidor Admin API (HTTP)
-- Gestión de usuarios/saldo/tarjetas/notificaciones
-- Guardado de tarjetas para uso de bots
-- Scripts de bots activos (`movistar` y `personal`)
-- Base para compilar App Android Admin por GitHub Actions
+## 1) Instalación del servidor (automática)
+Ejecuta desde la carpeta `recargas`:
 
-## Instalación servidor
 ```bash
 cd recargas
 ./install.sh
 ```
 
-Al instalar, el script genera automáticamente:
-- `APP_ADMIN_KEY`
-- usuario/contraseña admin por defecto
-- `admin-app/local/bootstrap.properties` con datos para incrustar en el APK
+No hace preguntas:
+- Detecta IP local de la máquina
+- Usa puerto `80`
+- Genera usuario/pass admin por defecto
+- Genera `APP_ADMIN_KEY`
+- Escribe `admin-app/local/bootstrap.properties`
+- Instala dependencias y levanta servicio `recargas-admin-api`
 
-## Seguridad mínima de app
-Todas las rutas `/api/admin/*` exigen header:
-- `X-App-Key: <APP_ADMIN_KEY>`
+## 2) Datos para compilar APK
+Al terminar, el instalador imprime este bloque:
 
-## API Admin principal
+```properties
+API_BASE_URL=http://IP_DE_TU_SERVIDOR:80
+APP_ADMIN_KEY=...
+DEFAULT_ADMIN_USER=...
+DEFAULT_ADMIN_PASSWORD=...
+```
+
+Ese mismo bloque queda guardado en:
+`recargas/admin-app/local/bootstrap.properties`
+
+## 3) Compilación Android en GitHub Actions
+Workflow: `.github/workflows/admin-android-build.yml`
+- Corre en cualquier rama
+- Instala Java 17 + Android SDK + Gradle
+- Genera keystore JKS temporal
+- Compila `assembleRelease` firmado
+- Sube:
+  - `admin-signed-release-apk`
+  - `admin-signing-data`
+
+## 4) API Admin principal
 - `GET /api/status`
-- `POST /api/admin/login`
+- `POST /api/admin/login` (requiere header `X-App-Key`)
 - `GET /api/admin/usuarios`
 - `POST /api/admin/usuarios`
 - `DELETE /api/admin/usuarios/:id`
@@ -38,16 +55,6 @@ Todas las rutas `/api/admin/*` exigen header:
 - `GET /api/admin/notificaciones`
 - `PATCH /api/admin/notificaciones/:id/leida`
 
-## Workflow Android Admin
-Archivo: `.github/workflows/admin-android-build.yml`
-
-Compila automáticamente el APK release firmado desde `recargas/admin-app/`.
-
 ## Bots activos
 - `server/bots/movistar/bot.js`
 - `server/bots/personal/bot.js`
-
-
-## Workflow de compilación
-- Se ejecuta en cualquier rama (`branches: **`) cuando cambie `recargas/admin-app/**`.
-- Instala Java/Android SDK/Gradle, compila `assembleRelease` y firma automáticamente con keystore generada en CI (artefactos `admin-signed-release-apk` y `admin-signing-data`).
