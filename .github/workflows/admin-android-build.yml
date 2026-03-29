@@ -3,7 +3,7 @@ name: admin-android-build
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "work"]
+    branches: ["codex/reorganize-project-structure-for-recargas"]
     paths:
       - 'recargas/admin-app/**'
       - '.github/workflows/admin-android-build.yml'
