@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin - Recargas</title>
+  <style>
+    body{font-family:Arial,sans-serif;background:#f3f4f6;margin:0}
+    .container{max-width:900px;margin:0 auto;padding:20px}
+    .card{background:#fff;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+    input,button{padding:10px;border-radius:8px;border:1px solid #d0d5dd}
+    button{background:#111827;color:#fff;border:none;cursor:pointer}
+    .row{display:flex;gap:8px;flex-wrap:wrap}
+    table{width:100%;border-collapse:collapse}
+    td,th{padding:8px;border-bottom:1px solid #ececec;text-align:left}
+    .msg{margin-top:8px;color:#b42318}
+  </style>
+</head>
+<body>
+<div class="container">
+  <div id="loginCard" class="card">
+    <h2>Acceso admin</h2>
+    <p>Si es primera ejecución, crea el admin con variables: <code>BOOTSTRAP_ADMIN_USER</code> y <code>BOOTSTRAP_ADMIN_PASS</code>.</p>
+    <div class="row">
+      <input id="adminUser" placeholder="Usuario" autocomplete="username" />
+      <input id="adminPass" placeholder="Contraseña" type="password" autocomplete="current-password" />
+      <button onclick="loginAdmin()">Entrar</button>
+    </div>
+    <div id="loginMsg" class="msg"></div>
+  </div>
+
+  <div id="adminPanel" style="display:none">
+    <div class="card">
+      <h3>Crear usuario</h3>
+      <div class="row">
+        <input id="newUser" placeholder="Usuario" />
+        <input id="newPass" placeholder="Contraseña" type="password" />
+        <input id="newSaldo" placeholder="Saldo inicial" type="number" />
+        <button onclick="crearUsuario()">Crear</button>
+      </div>
+      <div id="createMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h3>Usuarios y saldo</h3>
+      <table>
+        <thead><tr><th>Usuario</th><th>Saldo</th><th>Agregar saldo</th></tr></thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Historial general</h3>
+      <table>
+        <thead><tr><th>Fecha</th><th>Usuario</th><th>Servicio</th><th>Ref.</th><th>Monto</th><th>Estado</th></tr></thead>
+        <tbody id="historialBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+let token = localStorage.getItem('adminToken')
+if (token) iniciarAdmin()
+
+async function api(url, method='GET', body) {
+  const opts = { method, headers: { 'Content-Type':'application/json', Authorization: `Bearer ${token}` } }
+  if (body) opts.body = JSON.stringify(body)
+  const response = await fetch(url, opts)
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(data.error || 'Error de servidor.')
+  return data
+}
+
+async function loginAdmin() {
+  const usuario = document.getElementById('adminUser').value.trim()
+  const password = document.getElementById('adminPass').value
+
+  try {
+    const r = await fetch('/api/admin/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ usuario, password })
+    }).then(r => r.json())
+
+    if (!r.token) throw new Error(r.error || 'Error')
+
+    token = r.token
+    localStorage.setItem('adminToken', token)
+    document.getElementById('loginMsg').textContent = ''
+    await iniciarAdmin()
+  } catch (error) {
+    document.getElementById('loginMsg').textContent = error.message
+  }
+}
+
+async function iniciarAdmin() {
+  document.getElementById('loginCard').style.display = 'none'
+  document.getElementById('adminPanel').style.display = 'block'
+  await Promise.all([cargarUsuarios(), cargarHistorial()])
+}
+
+async function crearUsuario() {
+  try {
+    await api('/api/admin/usuarios', 'POST', {
+      usuario: document.getElementById('newUser').value.trim(),
+      password: document.getElementById('newPass').value,
+      saldo: Number(document.getElementById('newSaldo').value || 0)
+    })
+    document.getElementById('createMsg').textContent = ''
+    await cargarUsuarios()
+  } catch (error) {
+    document.getElementById('createMsg').textContent = error.message
+  }
+}
+
+async function agregarSaldo(id) {
+  try {
+    const input = document.getElementById(`saldo-${id}`)
+    await api(`/api/admin/usuarios/${id}/saldo`, 'PUT', { monto: Number(input.value || 0) })
+    await cargarUsuarios()
+  } catch (error) {
+    alert(error.message)
+  }
+}
+
+async function cargarUsuarios() {
+  const rows = await api('/api/admin/usuarios')
+  const tbody = document.getElementById('usersBody')
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="3">Sin usuarios.</td></tr>'
+    return
+  }
+
+  tbody.innerHTML = rows.map(u => `
+    <tr>
+      <td>${u.usuario}</td>
+      <td>$${u.saldo}</td>
+      <td>
+        <div class="row">
+          <input id="saldo-${u.id}" type="number" placeholder="Monto (+/-)" />
+          <button onclick="agregarSaldo(${u.id})">Aplicar</button>
+        </div>
+      </td>
+    </tr>
+  `).join('')
+}
+
+async function cargarHistorial() {
+  const rows = await api('/api/admin/historial')
+  const tbody = document.getElementById('historialBody')
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6">Sin movimientos.</td></tr>'
+    return
+  }
+
+  tbody.innerHTML = rows.map(h => `<tr><td>${h.fecha}</td><td>${h.usuario || '-'}</td><td>${h.servicio}</td><td>${h.referencia}</td><td>$${h.monto}</td><td>${h.estado}</td></tr>`).join('')
+}
+</script>
+</body>
+</html>
