@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 SERVICE_FILE="/etc/systemd/system/recargas-admin-api.service"
-APK_BOOTSTRAP_FILE="$ROOT_DIR/admin-app/bootstrap-config.json"
+APK_BOOTSTRAP_FILE="$ROOT_DIR/admin-app/local/bootstrap.properties"
 
 echo "== Instalador Recargas Admin API (HTTP) =="
 echo "Este instalador deja el servidor listo y genera datos para incrustar en el APK Admin."
@@ -37,13 +37,10 @@ ENV
 
 mkdir -p "$(dirname "$APK_BOOTSTRAP_FILE")"
 cat > "$APK_BOOTSTRAP_FILE" <<ENV
-{
-  "api_base_url": "http://$PUBLIC_HOST:$APP_PORT",
-  "api_status_url": "http://$PUBLIC_HOST:$APP_PORT/api/status",
-  "x_app_key": "$APP_ADMIN_KEY",
-  "default_admin_user": "$DEFAULT_ADMIN_USER",
-  "default_admin_password": "$DEFAULT_ADMIN_PASS"
-}
+API_BASE_URL=http://$PUBLIC_HOST:$APP_PORT
+APP_ADMIN_KEY=$APP_ADMIN_KEY
+DEFAULT_ADMIN_USER=$DEFAULT_ADMIN_USER
+DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASS
 ENV
 
 chmod 600 "$ENV_FILE" "$APK_BOOTSTRAP_FILE"
@@ -97,4 +94,10 @@ echo "X-App-Key: $APP_ADMIN_KEY"
 echo "Usuario admin por defecto: $DEFAULT_ADMIN_USER"
 echo "Password admin por defecto: $DEFAULT_ADMIN_PASS"
 echo "Archivo generado: $APK_BOOTSTRAP_FILE"
+echo
+echo "BLOQUE PARA COPIAR EN recargas/admin-app/local/bootstrap.properties"
+echo "API_BASE_URL=http://$PUBLIC_HOST:$APP_PORT"
+echo "APP_ADMIN_KEY=$APP_ADMIN_KEY"
+echo "DEFAULT_ADMIN_USER=$DEFAULT_ADMIN_USER"
+echo "DEFAULT_ADMIN_PASSWORD=$DEFAULT_ADMIN_PASS"
 echo "---------------------------------------------"

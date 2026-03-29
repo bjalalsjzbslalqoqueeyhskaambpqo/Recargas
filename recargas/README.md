@@ -16,7 +16,7 @@ cd recargas
 Al instalar, el script genera automáticamente:
 - `APP_ADMIN_KEY`
 - usuario/contraseña admin por defecto
-- `admin-app/bootstrap-config.json` con datos para incrustar en el APK
+- `admin-app/local/bootstrap.properties` con datos para incrustar en el APK
 
 ## Seguridad mínima de app
 Todas las rutas `/api/admin/*` exigen header:
@@ -41,8 +41,7 @@ Todas las rutas `/api/admin/*` exigen header:
 ## Workflow Android Admin
 Archivo: `.github/workflows/admin-android-build.yml`
 
-Compila automáticamente el APK debug cuando subas la app completa en:
-`recargas/admin-app/`
+Compila automáticamente el APK release firmado desde `recargas/admin-app/`.
 
 ## Bots activos
 - `server/bots/movistar/bot.js`
@@ -51,5 +50,4 @@ Compila automáticamente el APK debug cuando subas la app completa en:
 
 ## Workflow de compilación
 - Se ejecuta en cualquier rama (`branches: **`) cuando cambie `recargas/admin-app/**`.
-- Si no existe `gradlew`, el job se omite sin fallar.
-- Si existe proyecto Android, compila `assembleRelease` y firma automáticamente con keystore generada en CI (artefactos `admin-signed-release-apk` y `admin-signing-data`).
+- Instala Java/Android SDK/Gradle, compila `assembleRelease` y firma automáticamente con keystore generada en CI (artefactos `admin-signed-release-apk` y `admin-signing-data`).

@@ -11,38 +11,25 @@ on:
 jobs:
   build-admin-apk:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: recargas/admin-app
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate Android project presence
-        id: detect
-        run: |
-          if [[ ! -f ./gradlew ]]; then
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No se encontró gradlew en recargas/admin-app. Se omite compilación."
-          else
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            chmod +x ./gradlew
-          fi
-
       - name: Setup Java 17
-        if: steps.detect.outputs.found == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Setup Gradle
-        if: steps.detect.outputs.found == 'true'
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Generate signing keystore (ephemeral)
-        if: steps.detect.outputs.found == 'true'
+      - name: Generate signing keystore
+        working-directory: recargas/admin-app
         run: |
           KEY_ALIAS="upload"
           KEYSTORE_FILE="$PWD/android-signing.jks"
@@ -74,23 +61,20 @@ jobs:
           DATA
 
       - name: Build signed release APK
-        if: steps.detect.outputs.found == 'true'
         run: |
-          ./gradlew assembleRelease \
+          gradle -p recargas/admin-app assembleRelease \
             -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
             -Pandroid.injected.signing.store.password="$STORE_PASS" \
             -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="$KEY_PASS"
 
       - name: Upload signed APK
-        if: steps.detect.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: admin-signed-release-apk
           path: recargas/admin-app/app/build/outputs/apk/release/*.apk
 
-      - name: Upload signing data (for controlled environments)
-        if: steps.detect.outputs.found == 'true'
+      - name: Upload signing data
         uses: actions/upload-artifact@v4
         with:
           name: admin-signing-data

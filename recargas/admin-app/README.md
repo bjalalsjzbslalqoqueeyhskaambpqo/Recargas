@@ -1,25 +1,17 @@
-# Admin App (Android) - Placeholder
+# Admin App (Android) - Base compilable
 
-Aquí irá la app Android del administrador.
+Esta app ya tiene estructura mínima Android y compila en CI.
 
-## Archivo clave que genera el instalador
-`bootstrap-config.json` con:
-- `api_base_url`
-- `x_app_key`
-- `default_admin_user`
-- `default_admin_password`
+## Archivo de datos desde servidor
+`local/bootstrap.properties` con:
+- `API_BASE_URL`
+- `APP_ADMIN_KEY`
+- `DEFAULT_ADMIN_USER`
+- `DEFAULT_ADMIN_PASSWORD`
 
-## Para que el workflow compile
-Esta carpeta debe incluir proyecto Android completo con:
-- `gradlew`
-- `settings.gradle` o `settings.gradle.kts`
-- módulo `app/`
+Ese archivo lo genera `recargas/install.sh` y también imprime el bloque para copiar/pegar.
 
-## Firma automática en GitHub Actions
-El workflow genera automáticamente:
-- `android-signing.jks`
-- credenciales de firma (`signing-data.txt`)
+## Compilación en workflow
+GitHub Actions instala JDK + Android SDK + Gradle, compila `assembleRelease` y firma automáticamente.
 
-y compila `assembleRelease` firmado.
-
-> Para entorno productivo, reemplaza esta firma efímera por una keystore fija y segura.
+> Para producción real, cambia la firma efímera por una keystore fija tuya.
