@@ -1,21 +1,19 @@
-# Recargas Admin API (HTTP)
+# Recargas - Etapa Admin API + Bots base
 
-Backend centrado en administración (sin páginas web), pensado para app Android Admin.
+Esta etapa deja únicamente lo necesario para:
+- Servidor Admin API (HTTP)
+- Gestión de usuarios/saldo/tarjetas/notificaciones
+- Guardado de tarjetas para uso de bots
+- Scripts de bots activos (`movistar` y `personal`)
+- Base para compilar App Android Admin por GitHub Actions
 
-## Qué incluye
-- Login admin
-- Gestión de usuarios (crear, eliminar, ajustar saldo +/-)
-- Historial admin
-- Gestión de tarjetas
-- Métricas de fallos por tarjeta/servicio con auto-ignorado y notificación
-
-## Instalación
+## Instalación servidor
 ```bash
 cd recargas
 ./install.sh
 ```
 
-## Endpoints base
+## API Admin principal
 - `GET /api/status`
 - `POST /api/admin/login`
 - `GET /api/admin/usuarios`
@@ -31,11 +29,12 @@ cd recargas
 - `GET /api/admin/notificaciones`
 - `PATCH /api/admin/notificaciones/:id/leida`
 
-## Regla de auto-ignorado de tarjeta
-El servidor ignora una tarjeta automáticamente cuando:
-- acumula `>= 5` fallos consecutivos globales, o
-- venía con al menos 1 éxito y luego llega a `>= 4` fallos consecutivos en un servicio.
+## Workflow Android Admin
+Archivo: `.github/workflows/admin-android-build.yml`
 
-Al ignorarse:
-- se marca `ignorada=1`, `activa=0`
-- se crea notificación para el admin.
+Compila automáticamente el APK debug cuando subas la app completa en:
+`recargas/admin-app/`
+
+## Bots activos
+- `server/bots/movistar/bot.js`
+- `server/bots/personal/bot.js`
