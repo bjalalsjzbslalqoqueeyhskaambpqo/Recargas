@@ -100,7 +100,14 @@ function loadBots() {
     if (!fs.existsSync(botPath)) continue
     try {
       const bot = require(botPath)
-      if (typeof bot?.procesar === 'function') services[entry.name] = bot
+      if (typeof bot?.procesar === 'function') {
+        services[entry.name] = bot
+      } else if (typeof bot?.recargar === 'function') {
+        services[entry.name] = {
+          ...bot,
+          procesar: async ({ referencia, monto, tarjetas }) => bot.recargar(referencia, monto, tarjetas)
+        }
+      }
     } catch (err) {
       console.warn(`No se pudo cargar bot ${entry.name}: ${err.message}`)
     }
@@ -109,6 +116,10 @@ function loadBots() {
 }
 
 const bots = loadBots()
+const CATALOGO_SERVICIOS = [
+  { id: 'movistar', nombre: 'Movistar', montos: [100, 200, 300, 500, 1000] },
+  { id: 'personal', nombre: 'Personal', montos: [100, 200, 300, 500, 1000] }
+]
 
 function getCardMetrics(cardId) {
   return db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ?').all(cardId)
@@ -194,6 +205,83 @@ app.post('/api/client/login', loginLimiter, async (req, res) => {
   if (!ok) return res.status(401).json({ error: 'Credenciales inválidas.' })
   const token = jwt.sign({ id: user.id, admin_id: user.admin_id, usuario: user.usuario, rol: 'usuario' }, SECRET, { expiresIn: '12h' })
   res.json({ token })
+})
+
+app.get('/api/client/me', authUser, (req, res) => {
+  const user = db.prepare('SELECT id, usuario, saldo, activo, creado FROM usuarios WHERE id = ?').get(req.userAuth.id)
+  if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
+  res.json(user)
+})
+
+app.get('/api/client/servicios', authUser, (req, res) => {
+  const disponibles = CATALOGO_SERVICIOS.filter((item) => Boolean(bots[item.id]))
+  res.json(disponibles)
+})
+
+app.get('/api/client/historial', authUser, (req, res) => {
+  const rows = db.prepare(
+    `SELECT servicio, referencia, monto, estado, mensaje, fecha
+     FROM historial
+     WHERE usuario_id = ? AND admin_id = ?
+     ORDER BY id DESC
+     LIMIT 100`
+  ).all(req.userAuth.id, req.userAuth.admin_id)
+  res.json(rows)
+})
+
+app.post('/api/client/recargar', authUser, async (req, res) => {
+  const servicio = String(req.body?.servicio || '').trim().toLowerCase()
+  const monto = Number(req.body?.monto)
+  const referencia = String(req.body?.referencia || '').replace(/\D/g, '')
+
+  const bot = bots[servicio]
+  const servicioInfo = CATALOGO_SERVICIOS.find((item) => item.id === servicio)
+  if (!bot || !servicioInfo) return res.status(400).json({ error: 'Servicio no disponible.' })
+  if (!Number.isFinite(monto) || !servicioInfo.montos.includes(monto)) {
+    return res.status(400).json({ error: 'Monto inválido para el servicio seleccionado.' })
+  }
+  if (!/^\d{10}$/.test(referencia)) {
+    return res.status(400).json({ error: 'Número inválido. Debe tener 10 dígitos.' })
+  }
+
+  const user = db.prepare('SELECT id, saldo, activo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)
+  if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
+  if (Number(user.saldo) < monto) return res.status(400).json({ error: 'Saldo insuficiente.' })
+
+  const tarjetas = db.prepare(
+    `SELECT id, numero, mes, anio, cvv
+     FROM tarjetas
+     WHERE admin_id = ? AND activa = 1 AND ignorada = 0
+     ORDER BY id ASC`
+  ).all(req.userAuth.admin_id)
+  if (tarjetas.length === 0) return res.status(400).json({ error: 'No hay tarjetas activas disponibles.' })
+
+  let resultado
+  try {
+    resultado = await bot.procesar({ referencia, monto, tarjetas })
+  } catch (error) {
+    resultado = { ok: false, mensaje: error.message || 'Error al procesar recarga.' }
+  }
+
+  const ok = Boolean(resultado?.ok)
+  const mensaje = String(resultado?.mensaje || (ok ? 'Recarga exitosa' : 'No se pudo completar la recarga')).slice(0, 280)
+
+  db.transaction(() => {
+    if (ok) {
+      db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
+    }
+    db.prepare(
+      `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje)
+  })()
+
+  if (Number.isInteger(resultado?.tarjeta_idx)) {
+    const card = tarjetas[resultado.tarjeta_idx]
+    if (card) registerCardResult(card.id, req.userAuth.admin_id, servicio, ok, mensaje)
+  }
+
+  return res.status(ok ? 200 : 502).json({ ok, mensaje })
 })
 
 app.get('/api/admin/perfil', authAdmin, (req, res) => {
