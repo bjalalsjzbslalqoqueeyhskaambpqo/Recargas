@@ -428,7 +428,7 @@ private fun HomeScreen(state: ClientUiState, viewModel: ClientViewModel, padding
                 if (state.processingRecarga) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 else Text("Recargar")
             }
-            TextButton(onClick = viewModel::refreshData, enabled = !state.processingRecarga) { Text("Actualizar") }
+            TextButton(onClick = { viewModel.refreshData() }, enabled = !state.processingRecarga) { Text("Actualizar") }
             TextButton(onClick = viewModel::logout, enabled = !state.processingRecarga) { Text("Salir") }
         }
         if (showOperators) {
