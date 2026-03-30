@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Recargas Cliente</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="wrap">
+    <h1>Recargas Cliente</h1>
+    <p class="muted" id="serverStatus">Servidor: comprobando…</p>
+
+    <section id="loginCard" class="card">
+      <h2>Iniciar sesión</h2>
+      <input id="inputUser" type="text" placeholder="Usuario" />
+      <input id="inputPass" type="password" placeholder="Password" />
+      <button id="btnLogin">Entrar</button>
+      <p id="loginMsg" class="muted"></p>
+    </section>
+
+    <section id="appCard" class="card hidden">
+      <h2 id="welcome">Bienvenido</h2>
+      <p id="saldo">Saldo: -</p>
+      <div class="row">
+        <button id="btnReload">Actualizar</button>
+        <button id="btnLogout">Salir</button>
+      </div>
+
+      <h3>Servicios</h3>
+      <select id="servicio"></select>
+      <select id="monto"></select>
+      <input id="referencia" type="text" placeholder="Número (10 dígitos)" />
+      <button id="btnRecargar">Recargar</button>
+
+      <h3>Últimos movimientos</h3>
+      <ul id="historial"></ul>
+      <p id="result"></p>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

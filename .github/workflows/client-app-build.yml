@@ -1,0 +1,39 @@
+name: client-app-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - 'recargas/client-app/**'
+      - 'recargas/server/**'
+      - '.github/workflows/client-app-build.yml'
+
+jobs:
+  build-client-app:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate client app JS
+        run: node --check recargas/client-app/app.js
+
+      - name: Build client web artifact
+        run: |
+          mkdir -p recargas/client-app/dist
+          cp recargas/client-app/index.html recargas/client-app/dist/
+          cp recargas/client-app/app.js recargas/client-app/dist/
+          cp recargas/client-app/styles.css recargas/client-app/dist/
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-app-web
+          path: recargas/client-app/dist/*
