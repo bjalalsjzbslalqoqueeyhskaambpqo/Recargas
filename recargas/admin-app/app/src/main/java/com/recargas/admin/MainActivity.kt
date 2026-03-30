@@ -57,7 +57,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnRefresh.setOnClickListener { loadSummary() }
-        binding.btnUsuarios.setOnClickListener { loadUsers() }
+        binding.btnSecCreate.setOnClickListener { showSection(binding.secCreateUser) }
+        binding.btnSecUsers.setOnClickListener {
+            showSection(binding.secUsers)
+            loadUsers()
+        }
+        binding.btnSecCards.setOnClickListener {
+            showSection(binding.secCards)
+            loadCards()
+        }
+        binding.btnSecHistory.setOnClickListener {
+            showSection(binding.secHistory)
+            loadHistory()
+        }
+        binding.btnSecNotif.setOnClickListener {
+            showSection(binding.secNotif)
+            loadNotifications()
+        }
+        binding.btnSecSettings.setOnClickListener { showSection(binding.secSettings) }
         binding.btnTarjetas.setOnClickListener { loadCards() }
         binding.btnHistorial.setOnClickListener { loadHistory() }
         binding.btnNotif.setOnClickListener { loadNotifications() }
@@ -123,6 +140,17 @@ class MainActivity : AppCompatActivity() {
         binding.loginPanel.visibility = View.GONE
         binding.dashboardPanel.visibility = View.VISIBLE
         binding.txtWelcome.text = "Bienvenido, $user"
+        showSection(binding.secCreateUser)
+    }
+
+    private fun showSection(section: View) {
+        binding.secCreateUser.visibility = View.GONE
+        binding.secUsers.visibility = View.GONE
+        binding.secCards.visibility = View.GONE
+        binding.secHistory.visibility = View.GONE
+        binding.secNotif.visibility = View.GONE
+        binding.secSettings.visibility = View.GONE
+        section.visibility = View.VISIBLE
     }
 
     private fun logout() {
