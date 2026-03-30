@@ -107,7 +107,7 @@ jobs:
           DATA
 
       - name: Build APK
-        run: cd recargas/client-android-app && ./gradlew assembleRelease
+        run: gradle -p recargas/client-android-app assembleRelease
 
       - name: Upload client signed APK
         uses: actions/upload-artifact@v4
