@@ -62,6 +62,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -115,6 +118,9 @@ class ClientViewModel(
     private val repository: ClientRepository,
     private val prefs: SharedPreferences
 ) : ViewModel() {
+    @Volatile
+    private var isRefreshing = false
+
     private val _uiState = MutableStateFlow(
         ClientUiState(
             user = prefs.getString("user", BuildConfig.DEFAULT_CLIENT_USER) ?: BuildConfig.DEFAULT_CLIENT_USER,
@@ -127,6 +133,7 @@ class ClientViewModel(
     init {
         checkServer()
         if (_uiState.value.isLoggedIn) refreshData()
+        startAutoRefresh()
     }
 
     fun updateUser(user: String) = _uiState.update { it.copy(user = user) }
@@ -158,6 +165,10 @@ class ClientViewModel(
     fun logout() {
         prefs.edit().remove("token").apply()
         _uiState.update { it.copy(isLoggedIn = false, token = null, selectedServicio = null, selectedMonto = null, phone = "") }
+    }
+
+    fun onAppForeground() {
+        if (_uiState.value.isLoggedIn) refreshData()
     }
 
     fun clearSnackbar() = _uiState.update { it.copy(snackbarMessage = null) }
@@ -201,10 +212,19 @@ class ClientViewModel(
 
     fun refreshData(onComplete: (() -> Unit)? = null) {
         val token = _uiState.value.token ?: return
+        if (isRefreshing) {
+            onComplete?.invoke()
+            return
+        }
+        isRefreshing = true
+        fun finish() {
+            isRefreshing = false
+            onComplete?.invoke()
+        }
         repository.me(token) { c1, me ->
             if (c1 !in 200..299) {
                 _uiState.update { it.copy(snackbarMessage = me.optString("error", "No se pudo cargar perfil"), snackbarSuccess = false) }
-                onComplete?.invoke()
+                finish()
                 return@me
             }
             _uiState.update {
@@ -229,7 +249,7 @@ class ClientViewModel(
             }
             repository.historial(token) { c3, hist ->
                 if (c3 !in 200..299) {
-                    onComplete?.invoke()
+                    finish()
                     return@historial
                 }
                 val movs = (0 until hist.length()).map { i ->
@@ -259,13 +279,24 @@ class ClientViewModel(
                         } ?: it.ultimaRecarga
                     )
                 }
-                onComplete?.invoke()
+                finish()
             }
         }
     }
 
     private fun checkServer() {
         repository.checkServer { ok, text -> _uiState.update { it.copy(serverOk = ok, serverText = text) } }
+    }
+
+    private fun startAutoRefresh() {
+        viewModelScope.launch {
+            while (true) {
+                delay(10_000)
+                if (_uiState.value.isLoggedIn && !isRefreshing) {
+                    refreshData()
+                }
+            }
+        }
     }
 }
 
