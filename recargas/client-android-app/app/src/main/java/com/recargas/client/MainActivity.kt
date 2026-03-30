@@ -21,6 +21,19 @@ class MainActivity : AppCompatActivity() {
     private var servicios = JSONArray()
     private var selectedServiceIndex = -1
     @Volatile private var isRecargaInProgress = false
+    private fun fallbackServicios(): JSONArray {
+        val movistar = JSONObject()
+            .put("id", "movistar")
+            .put("nombre", "Movistar")
+            .put("disponible", true)
+            .put("montos", JSONArray(listOf(2000, 4000, 5000, 6000, 7000, 8000, 10000, 15000, 20000)))
+        val personal = JSONObject()
+            .put("id", "personal")
+            .put("nombre", "Personal")
+            .put("disponible", true)
+            .put("montos", JSONArray(listOf(4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 15000, 30000)))
+        return JSONArray().put(movistar).put(personal)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,18 +109,18 @@ class MainActivity : AppCompatActivity() {
             binding.txtSaldo.text = "Saldo: \$${"%.2f".format(me.optDouble("saldo", 0.0))}"
 
             getJsonArray("/api/client/servicios") { c2, srv ->
+                servicios = if (c2 in 200..299 && srv.length() > 0) srv else fallbackServicios()
                 if (c2 !in 200..299) {
-                    binding.txtResult.text = "Error servicios"; return@getJsonArray
+                    binding.txtResult.text = "Servicios cargados en modo respaldo. Revisa conexión/API."
                 }
-                servicios = srv
-                if (srv.length() == 0) {
+                if (servicios.length() == 0) {
                     selectedServiceIndex = -1
-                    binding.txtOperadorSeleccionado.text = "Operador: no disponible"
-                } else if (selectedServiceIndex !in 0 until srv.length()) {
+                    binding.txtOperadorSeleccionado.text = "Operador: no seleccionado"
+                } else if (selectedServiceIndex !in 0 until servicios.length()) {
                     selectedServiceIndex = -1
                     binding.txtOperadorSeleccionado.text = "Operador: no seleccionado"
                 }
-                if (selectedServiceIndex in 0 until srv.length()) setMontos(selectedServiceIndex)
+                if (selectedServiceIndex in 0 until servicios.length()) setMontos(selectedServiceIndex)
                 updateRecargaFormVisibility()
 
                 getJsonArray("/api/client/historial") { c3, hist ->
@@ -140,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         binding.inputTelefono.visibility = if (visible) View.VISIBLE else View.GONE
         binding.btnRecargar.visibility = if (visible) View.VISIBLE else View.GONE
         binding.btnRecargar.isEnabled = visible && !isRecargaInProgress
+        binding.btnSelectOperator.isEnabled = !isRecargaInProgress
     }
 
     private fun openOperatorSelector() {
@@ -147,7 +161,11 @@ class MainActivity : AppCompatActivity() {
             binding.txtResult.text = "No hay operadores disponibles por ahora."
             return
         }
-        val nombres = (0 until servicios.length()).map { idx -> servicios.getJSONObject(idx).optString("nombre", "Operador") }.toTypedArray()
+        val nombres = (0 until servicios.length()).map { idx ->
+            val item = servicios.getJSONObject(idx)
+            val nombre = item.optString("nombre", "Operador")
+            if (item.optBoolean("disponible", true)) nombre else "$nombre (No disponible)"
+        }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Seleccionar operador")
             .setItems(nombres) { _, which ->
@@ -168,6 +186,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val serviceId = servicios.getJSONObject(serviceIndex).optString("id")
+        val disponible = servicios.getJSONObject(serviceIndex).optBoolean("disponible", true)
+        if (!disponible) {
+            binding.txtResult.text = "Servicio no disponible en este momento. Intenta luego."
+            return
+        }
         val monto = binding.spMonto.selectedItem?.toString()?.toDoubleOrNull() ?: 0.0
         val referencia = binding.inputTelefono.text.toString().trim()
         if (!Regex("^\\d{10}$").matches(referencia)) {

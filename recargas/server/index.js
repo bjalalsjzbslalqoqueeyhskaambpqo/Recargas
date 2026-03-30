@@ -31,7 +31,7 @@ if (!APP_CLIENT_KEY || APP_CLIENT_KEY.length < 24) {
 app.disable('x-powered-by')
 app.use(helmet())
 app.use(express.json({ limit: '20kb' }))
-app.use('/client', express.static(path.join(__dirname, 'client-app')))
+app.use('/client', express.static(path.join(__dirname, '..', 'client-app')))
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -92,8 +92,9 @@ function validatePassword(value) {
 
 function loadBots() {
   const baseDir = path.join(__dirname, 'bots')
-  if (!fs.existsSync(baseDir)) return {}
+  if (!fs.existsSync(baseDir)) return { services: {}, errors: ['No existe directorio de bots.'] }
   const services = {}
+  const errors = []
   for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const botPath = path.join(baseDir, entry.name, 'bot.js')
@@ -109,16 +110,23 @@ function loadBots() {
         }
       }
     } catch (err) {
-      console.warn(`No se pudo cargar bot ${entry.name}: ${err.message}`)
+      const msg = `No se pudo cargar bot ${entry.name}: ${err.message}`
+      errors.push(msg)
+      console.warn(msg)
     }
   }
-  return services
+  return { services, errors }
 }
 
-const bots = loadBots()
+let botLoadResult = loadBots()
+let bots = botLoadResult.services
+function refreshBots() {
+  botLoadResult = loadBots()
+  bots = botLoadResult.services
+}
 const CATALOGO_SERVICIOS = [
-  { id: 'movistar', nombre: 'Movistar', montos: [100, 200, 300, 500, 1000] },
-  { id: 'personal', nombre: 'Personal', montos: [100, 200, 300, 500, 1000] }
+  { id: 'movistar', nombre: 'Movistar', montos: [2000, 4000, 5000, 6000, 7000, 8000, 10000, 15000, 20000] },
+  { id: 'personal', nombre: 'Personal', montos: [4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 15000, 30000] }
 ]
 
 function getCardMetrics(cardId) {
@@ -175,7 +183,15 @@ function registerCardResult(cardId, adminId, servicio, ok, detalle) {
 }
 
 app.get('/api/status', (_req, res) => {
-  res.json({ ok: true, servicio: 'recargas-admin-api' })
+  res.json({
+    ok: true,
+    servicio: 'recargas-admin-api',
+    bots: {
+      cargados: Object.keys(bots),
+      total: Object.keys(bots).length,
+      errores: botLoadResult.errors
+    }
+  })
 })
 
 app.use('/api/admin', requireAdminAppKey)
@@ -214,6 +230,7 @@ app.get('/api/client/me', authUser, (req, res) => {
 })
 
 app.get('/api/client/servicios', authUser, (req, res) => {
+  if (Object.keys(bots).length === 0) refreshBots()
   const catalogo = CATALOGO_SERVICIOS.map((item) => ({
     ...item,
     disponible: Boolean(bots[item.id])
@@ -316,7 +333,35 @@ app.get('/api/admin/perfil', authAdmin, (req, res) => {
   res.json(admin)
 })
 
+app.get('/api/admin/me', authAdmin, (req, res) => {
+  const admin = db.prepare('SELECT id, usuario, activo, creado FROM admins WHERE id = ?').get(req.admin.id)
+  res.json(admin)
+})
+
 app.patch('/api/admin/perfil', authAdmin, async (req, res) => {
+  const { usuario, password } = req.body || {}
+  if (usuario !== undefined && !validateUsername(usuario)) {
+    return res.status(400).json({ error: 'Usuario inválido.' })
+  }
+  if (password !== undefined && !validatePassword(password)) {
+    return res.status(400).json({ error: 'Password inválida.' })
+  }
+  try {
+    if (usuario !== undefined) {
+      db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
+    }
+    if (password !== undefined) {
+      const hash = await bcrypt.hash(password, 12)
+      db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hash, req.admin.id)
+    }
+    const admin = db.prepare('SELECT id, usuario, activo, creado FROM admins WHERE id = ?').get(req.admin.id)
+    res.json({ ok: true, admin })
+  } catch {
+    res.status(400).json({ error: 'No se pudo actualizar perfil admin.' })
+  }
+})
+
+app.patch('/api/admin/me', authAdmin, async (req, res) => {
   const { usuario, password } = req.body || {}
   if (usuario !== undefined && !validateUsername(usuario)) {
     return res.status(400).json({ error: 'Usuario inválido.' })
