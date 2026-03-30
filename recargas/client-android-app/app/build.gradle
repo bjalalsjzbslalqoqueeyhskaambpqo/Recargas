@@ -25,9 +25,31 @@ def readBootstrapProperties() {
 def bootstrapInfo = readBootstrapProperties()
 def bootstrap = bootstrapInfo.props
 
-def apiBaseUrl = System.getenv('API_BASE_URL') ?: bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
-def appClientKey = System.getenv('APP_CLIENT_KEY') ?: bootstrap.getProperty('APP_CLIENT_KEY', 'REPLACE_APP_KEY')
-def defaultClientUser = System.getenv('DEFAULT_CLIENT_USER') ?: bootstrap.getProperty('DEFAULT_CLIENT_USER', 'cliente_demo')
+def firstNonBlank(String... values) {
+    for (value in values) {
+        if (value != null) {
+            def normalized = value.trim()
+            if (!normalized.isEmpty()) return normalized
+        }
+    }
+    return null
+}
+
+def apiBaseUrl = firstNonBlank(
+    System.getenv('API_BASE_URL'),
+    bootstrap.getProperty('API_BASE_URL'),
+    'http://127.0.0.1:3000'
+)
+def appClientKey = firstNonBlank(
+    System.getenv('APP_CLIENT_KEY'),
+    bootstrap.getProperty('APP_CLIENT_KEY'),
+    'REPLACE_APP_KEY'
+)
+def defaultClientUser = firstNonBlank(
+    System.getenv('DEFAULT_CLIENT_USER'),
+    bootstrap.getProperty('DEFAULT_CLIENT_USER'),
+    'cliente_demo'
+)
 def configSource = bootstrapInfo.loadedFrom != null ? bootstrapInfo.loadedFrom.absolutePath : 'defaults/env'
 
 println("[client-app] Config source: ${configSource}")
