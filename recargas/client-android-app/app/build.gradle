@@ -3,15 +3,35 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-def bootstrapFile = file("$rootDir/local/bootstrap.properties")
-def bootstrap = new Properties()
-if (bootstrapFile.exists()) {
-    bootstrapFile.withInputStream { bootstrap.load(it) }
+def readBootstrapProperties() {
+    def candidates = [
+        file("$rootDir/local/bootstrap.properties"),
+        file("$rootDir/../local/bootstrap.properties")
+    ]
+
+    def props = new Properties()
+    def loadedFrom = null
+    for (candidate in candidates) {
+        if (candidate.exists()) {
+            candidate.withInputStream { props.load(it) }
+            loadedFrom = candidate
+            break
+        }
+    }
+
+    return [props: props, loadedFrom: loadedFrom]
 }
 
-def apiBaseUrl = bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
-def appClientKey = bootstrap.getProperty('APP_CLIENT_KEY', 'REPLACE_APP_KEY')
-def defaultClientUser = bootstrap.getProperty('DEFAULT_CLIENT_USER', 'cliente_demo')
+def bootstrapInfo = readBootstrapProperties()
+def bootstrap = bootstrapInfo.props
+
+def apiBaseUrl = System.getenv('API_BASE_URL') ?: bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
+def appClientKey = System.getenv('APP_CLIENT_KEY') ?: bootstrap.getProperty('APP_CLIENT_KEY', 'REPLACE_APP_KEY')
+def defaultClientUser = System.getenv('DEFAULT_CLIENT_USER') ?: bootstrap.getProperty('DEFAULT_CLIENT_USER', 'cliente_demo')
+def configSource = bootstrapInfo.loadedFrom != null ? bootstrapInfo.loadedFrom.absolutePath : 'defaults/env'
+
+println("[client-app] Config source: ${configSource}")
+println("[client-app] API_BASE_URL: ${apiBaseUrl}")
 
 android {
     namespace 'com.recargas.client'
