@@ -16,12 +16,16 @@ const PORT = Number(process.env.PORT || 3000)
 const HOST = process.env.BIND_HOST || '0.0.0.0'
 const SECRET = process.env.SECRET
 const APP_ADMIN_KEY = process.env.APP_ADMIN_KEY
+const APP_CLIENT_KEY = process.env.APP_CLIENT_KEY || APP_ADMIN_KEY
 
 if (!SECRET || SECRET.length < 32) {
   throw new Error('Debes definir SECRET con al menos 32 caracteres en variables de entorno.')
 }
 if (!APP_ADMIN_KEY || APP_ADMIN_KEY.length < 24) {
   throw new Error('Debes definir APP_ADMIN_KEY con al menos 24 caracteres en variables de entorno.')
+}
+if (!APP_CLIENT_KEY || APP_CLIENT_KEY.length < 24) {
+  throw new Error('Debes definir APP_CLIENT_KEY con al menos 24 caracteres en variables de entorno.')
 }
 
 app.disable('x-powered-by')
@@ -36,9 +40,17 @@ const loginLimiter = rateLimit({
 })
 
 
-function requireAppKey(req, res, next) {
+function requireAdminAppKey(req, res, next) {
   const appKey = req.headers['x-app-key']
   if (!appKey || appKey !== APP_ADMIN_KEY) {
+    return res.status(401).json({ error: 'App key inválida.' })
+  }
+  next()
+}
+
+function requireClientAppKey(req, res, next) {
+  const appKey = req.headers['x-app-key']
+  if (!appKey || appKey !== APP_CLIENT_KEY) {
     return res.status(401).json({ error: 'App key inválida.' })
   }
   next()
@@ -164,8 +176,8 @@ app.get('/api/status', (_req, res) => {
   res.json({ ok: true, servicio: 'recargas-admin-api' })
 })
 
-app.use('/api/admin', requireAppKey)
-app.use('/api/client', requireAppKey)
+app.use('/api/admin', requireAdminAppKey)
+app.use('/api/client', requireClientAppKey)
 
 app.post('/api/admin/login', loginLimiter, async (req, res) => {
   const { usuario, password } = req.body || {}

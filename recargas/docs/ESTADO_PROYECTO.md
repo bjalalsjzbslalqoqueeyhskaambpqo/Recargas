@@ -57,6 +57,7 @@
 Variables mínimas necesarias (ver `.env.example`):
 - `SECRET` (>= 32 chars)
 - `APP_ADMIN_KEY` (>= 24 chars)
+- `APP_CLIENT_KEY` (>= 24 chars, o usar el mismo valor de `APP_ADMIN_KEY`)
 - `BOOTSTRAP_ADMIN_USER`
 - `BOOTSTRAP_ADMIN_PASS`
 - `PORT`

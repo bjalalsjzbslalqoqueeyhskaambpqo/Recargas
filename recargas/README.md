@@ -22,17 +22,27 @@ El instalador te pide:
 Después:
 - genera `.env`
 - genera `admin-app/local/bootstrap.properties`
+- genera `client-android-app/local/bootstrap.properties`
 - ejecuta `npm install`
 - configura y arranca `systemd` (si disponible)
 
-## Datos para compilar APK
-Al final imprime y guarda este bloque:
+## Datos para compilar APK (Admin)
+Al final imprime y guarda este bloque para admin:
 
 ```properties
 API_BASE_URL=http://IP_DEL_SERVIDOR:80
 APP_ADMIN_KEY=...
 DEFAULT_ADMIN_USER=...
 DEFAULT_ADMIN_PASSWORD=...
+```
+
+## Datos para compilar APK (Cliente)
+También imprime este bloque para cliente:
+
+```properties
+API_BASE_URL=http://IP_DEL_SERVIDOR:80
+APP_CLIENT_KEY=...
+DEFAULT_CLIENT_USER=cliente_demo
 ```
 
 ## API Admin principal
@@ -60,16 +70,21 @@ DEFAULT_ADMIN_PASSWORD=...
 - `GET /api/client/historial`
 - `POST /api/client/recargar`
 
-## Cliente web básico (nuevo)
+## Cliente web básico
 - Ruta estática servida por la API: `GET /client`
 - Archivos en `recargas/client-app/` (`index.html`, `app.js`, `styles.css`)
 - Usa los endpoints `/api/client/*` para login, consulta de saldo, servicios y recargas.
 - Por defecto lee:
   - `API_BASE`: `location.origin`
   - `APP_KEY`: `localStorage.app_key` (si no existe usa `dev-change-me`)
-- CI de cliente: workflow `.github/workflows/client-app-build.yml` (valida `app.js` y sube artefacto web `client-app-web`).
+- CI app Android cliente: workflow `.github/workflows/client-app-build.yml` (compila APK firmado de cliente).
 
 ## App Android Admin
 - usa `admin-app/local/bootstrap.properties`
 - prueba conexión a `/api/status`
 - hace login a `/api/admin/login` con `X-App-Key`
+
+## App Android Cliente
+- usa `client-android-app/local/bootstrap.properties`
+- prueba conexión a `/api/status`
+- hace login a `/api/client/login` con `X-App-Key`
