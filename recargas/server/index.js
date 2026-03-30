@@ -6,7 +6,7 @@ const fs = require('fs')
 const path = require('path')
 const rateLimit = require('express-rate-limit')
 const helmet = require('helmet')
-require('dotenv').config({ path: path.join(__dirname, '.env') })
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
 const db = require('./db')
 
 const app = express()
@@ -41,17 +41,13 @@ const loginLimiter = rateLimit({
 
 function requireAdminAppKey(req, res, next) {
   const appKey = req.headers['x-app-key']
-  if (!appKey || appKey !== APP_ADMIN_KEY) {
-    return res.status(401).json({ error: 'App key inválida.' })
-  }
+  if (!appKey || appKey !== APP_ADMIN_KEY) return res.status(401).json({ error: 'App key inválida.' })
   next()
 }
 
 function requireClientAppKey(req, res, next) {
   const appKey = req.headers['x-app-key']
-  if (!appKey || appKey !== APP_CLIENT_KEY) {
-    return res.status(401).json({ error: 'App key inválida.' })
-  }
+  if (!appKey || appKey !== APP_CLIENT_KEY) return res.status(401).json({ error: 'App key inválida.' })
   next()
 }
 
@@ -120,10 +116,12 @@ function loadBots() {
 
 let botLoadResult = loadBots()
 let bots = botLoadResult.services
+
 function refreshBots() {
   botLoadResult = loadBots()
   bots = botLoadResult.services
 }
+
 const CATALOGO_SERVICIOS = [
   { id: 'movistar', nombre: 'Movistar', montos: [2000, 4000, 5000, 6000, 7000, 8000, 10000, 15000, 20000] },
   { id: 'personal', nombre: 'Personal', montos: [4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 15000, 30000] }
@@ -243,8 +241,7 @@ app.get('/api/client/historial', authUser, (req, res) => {
     `SELECT servicio, referencia, monto, estado, mensaje, fecha
      FROM historial
      WHERE usuario_id = ? AND admin_id = ?
-     ORDER BY id DESC
-     LIMIT 100`
+     ORDER BY id DESC LIMIT 100`
   ).all(req.userAuth.id, req.userAuth.admin_id)
   res.json(rows)
 })
@@ -266,20 +263,20 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
 
   const user = db.prepare('SELECT id, saldo, activo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)
   if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
+
   try {
     db.prepare('INSERT INTO recarga_locks (usuario_id) VALUES (?)').run(req.userAuth.id)
   } catch {
     return res.status(409).json({ error: 'Ya tienes una recarga en proceso. Espera a que termine.' })
   }
 
-  let tarjetas = []
   try {
     const saldoActual = Number(
       db.prepare('SELECT saldo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)?.saldo || 0
     )
     if (saldoActual < monto) return res.status(400).json({ error: 'Saldo insuficiente.' })
 
-    tarjetas = db.prepare(
+    const tarjetas = db.prepare(
       `SELECT id, numero, mes, anio, cvv
        FROM tarjetas
        WHERE admin_id = ? AND activa = 1 AND ignorada = 0
@@ -301,15 +298,9 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
 
     const txResult = db.transaction(() => {
       const current = db.prepare('SELECT saldo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)
-      if (!current) {
-        throw new Error('Usuario no encontrado.')
-      }
-      if (ok && Number(current.saldo) < monto) {
-        throw new Error('Saldo insuficiente al confirmar la recarga.')
-      }
-      if (ok) {
-        db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
-      }
+      if (!current) throw new Error('Usuario no encontrado.')
+      if (ok && Number(current.saldo) < monto) throw new Error('Saldo insuficiente al confirmar la recarga.')
+      if (ok) db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
       db.prepare(
         `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -340,16 +331,10 @@ app.get('/api/admin/me', authAdmin, (req, res) => {
 
 app.patch('/api/admin/perfil', authAdmin, async (req, res) => {
   const { usuario, password } = req.body || {}
-  if (usuario !== undefined && !validateUsername(usuario)) {
-    return res.status(400).json({ error: 'Usuario inválido.' })
-  }
-  if (password !== undefined && !validatePassword(password)) {
-    return res.status(400).json({ error: 'Password inválida.' })
-  }
+  if (usuario !== undefined && !validateUsername(usuario)) return res.status(400).json({ error: 'Usuario inválido.' })
+  if (password !== undefined && !validatePassword(password)) return res.status(400).json({ error: 'Password inválida.' })
   try {
-    if (usuario !== undefined) {
-      db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
-    }
+    if (usuario !== undefined) db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
     if (password !== undefined) {
       const hash = await bcrypt.hash(password, 12)
       db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hash, req.admin.id)
@@ -363,16 +348,10 @@ app.patch('/api/admin/perfil', authAdmin, async (req, res) => {
 
 app.patch('/api/admin/me', authAdmin, async (req, res) => {
   const { usuario, password } = req.body || {}
-  if (usuario !== undefined && !validateUsername(usuario)) {
-    return res.status(400).json({ error: 'Usuario inválido.' })
-  }
-  if (password !== undefined && !validatePassword(password)) {
-    return res.status(400).json({ error: 'Password inválida.' })
-  }
+  if (usuario !== undefined && !validateUsername(usuario)) return res.status(400).json({ error: 'Usuario inválido.' })
+  if (password !== undefined && !validatePassword(password)) return res.status(400).json({ error: 'Password inválida.' })
   try {
-    if (usuario !== undefined) {
-      db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
-    }
+    if (usuario !== undefined) db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
     if (password !== undefined) {
       const hash = await bcrypt.hash(password, 12)
       db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hash, req.admin.id)
@@ -395,9 +374,7 @@ app.post('/api/admin/usuarios', authAdmin, async (req, res) => {
     return res.status(400).json({ error: 'Usuario o contraseña inválidos.' })
   }
   const initialSaldo = Number(saldo || 0)
-  if (!Number.isFinite(initialSaldo) || initialSaldo < 0) {
-    return res.status(400).json({ error: 'Saldo inicial inválido.' })
-  }
+  if (!Number.isFinite(initialSaldo) || initialSaldo < 0) return res.status(400).json({ error: 'Saldo inicial inválido.' })
   try {
     const hash = await bcrypt.hash(password, 12)
     const result = db.prepare('INSERT INTO usuarios (admin_id, usuario, password, saldo) VALUES (?, ?, ?, ?)').run(req.admin.id, usuario, hash, initialSaldo)
@@ -413,12 +390,8 @@ app.patch('/api/admin/usuarios/:id', authAdmin, async (req, res) => {
   if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Usuario inválido.' })
   if (usuario !== undefined && !validateUsername(usuario)) return res.status(400).json({ error: 'Usuario inválido.' })
   if (password !== undefined && !validatePassword(password)) return res.status(400).json({ error: 'Password inválida.' })
-  if (saldo !== undefined) {
-    const parsedSaldo = Number(saldo)
-    if (!Number.isFinite(parsedSaldo) || parsedSaldo < 0) return res.status(400).json({ error: 'Saldo inválido.' })
-  }
+  if (saldo !== undefined && (!Number.isFinite(Number(saldo)) || Number(saldo) < 0)) return res.status(400).json({ error: 'Saldo inválido.' })
   if (activo !== undefined && ![0, 1, true, false].includes(activo)) return res.status(400).json({ error: 'Activo inválido.' })
-
   const existing = db.prepare('SELECT id FROM usuarios WHERE id = ? AND admin_id = ?').get(userId, req.admin.id)
   if (!existing) return res.status(404).json({ error: 'Usuario no encontrado.' })
   try {
@@ -530,4 +503,8 @@ app.use((err, _req, res, _next) => {
 
 http.createServer(app).listen(PORT, HOST, () => {
   console.log(`API admin escuchando en http://${HOST}:${PORT}`)
+  console.log(`Bots cargados: ${Object.keys(bots).join(', ') || 'ninguno'}`)
+  if (botLoadResult.errors.length > 0) {
+    console.warn('Errores al cargar bots:', botLoadResult.errors)
+  }
 })
