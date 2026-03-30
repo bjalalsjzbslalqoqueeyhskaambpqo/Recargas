@@ -1,27 +1,65 @@
 package com.recargas.admin
 
-import android.Manifest
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
+import android.content.SharedPreferences
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.View
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.TextView
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import com.google.android.material.chip.Chip
-import com.google.android.material.snackbar.Snackbar
-import com.recargas.admin.databinding.ActivityMainBinding
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.viewModels
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.CreditCard
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -30,668 +68,437 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
 
-class MainActivity : AppCompatActivity() {
-    private lateinit var binding: ActivityMainBinding
-    private var authToken: String? = null
-    private var lastNotifId = 0
+data class AdminUser(val id: Int, val usuario: String, val saldo: Double, val activo: Boolean)
+data class AdminCard(val id: Int, val alias: String, val numero: String, val estado: String, val ultimoUso: String, val metricas: String)
+data class AdminHist(val id: Int, val servicio: String, val referencia: String, val monto: Double, val estado: String, val fecha: String)
 
-    private val prefs by lazy { getSharedPreferences("admin_prefs", MODE_PRIVATE) }
-    private val handler = Handler(Looper.getMainLooper())
-    private val notifRunnable = object : Runnable {
-        override fun run() {
-            if (authToken != null) pollNotificationsSilently()
-            handler.postDelayed(this, 30000)
-        }
+enum class AdminTab { Crear, Usuarios, Tarjetas, Historial }
+
+data class AdminUiState(
+    val user: String = BuildConfig.DEFAULT_ADMIN_USER,
+    val pass: String = BuildConfig.DEFAULT_ADMIN_PASSWORD,
+    val token: String? = null,
+    val loading: Boolean = false,
+    val serverText: String = "Comprobando servidor...",
+    val isLoggedIn: Boolean = false,
+    val summary: String = "",
+    val unreadNotif: Int = 0,
+    val tab: AdminTab = AdminTab.Crear,
+    val users: List<AdminUser> = emptyList(),
+    val cards: List<AdminCard> = emptyList(),
+    val history: List<AdminHist> = emptyList(),
+    val historyFilter: String = "todos",
+    val newUser: String = "",
+    val newPass: String = "",
+    val newSaldo: String = "0",
+    val cardAlias: String = "",
+    val cardNumero: String = "",
+    val cardMes: String = "",
+    val cardAnio: String = "",
+    val cardCvv: String = "",
+    val snackbar: String? = null,
+)
+
+class MainActivity : ComponentActivity() {
+    private val viewModel by viewModels<AdminViewModel> {
+        val prefs = getSharedPreferences("admin_prefs", MODE_PRIVATE)
+        AdminViewModelFactory(prefs)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        setContent {
+            val state = viewModel.uiState
+            AdminTheme {
+                AdminApp(state.value, viewModel)
+            }
+        }
+    }
+}
 
-        createNotificationChannel()
-        requestNotifPermissionIfNeeded()
+class AdminViewModelFactory(private val prefs: SharedPreferences) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        @Suppress("UNCHECKED_CAST")
+        return AdminViewModel(prefs) as T
+    }
+}
 
-        val savedUser = prefs.getString("user", BuildConfig.DEFAULT_ADMIN_USER) ?: BuildConfig.DEFAULT_ADMIN_USER
-        val savedPass = prefs.getString("pass", BuildConfig.DEFAULT_ADMIN_PASSWORD) ?: BuildConfig.DEFAULT_ADMIN_PASSWORD
-        binding.inputUser.setText(savedUser)
-        binding.inputPass.setText(savedPass)
+class AdminViewModel(private val prefs: SharedPreferences) : ViewModel() {
+    private val _uiState = MutableStateFlow(AdminUiState(
+        user = prefs.getString("user", BuildConfig.DEFAULT_ADMIN_USER) ?: BuildConfig.DEFAULT_ADMIN_USER,
+        pass = prefs.getString("pass", BuildConfig.DEFAULT_ADMIN_PASSWORD) ?: BuildConfig.DEFAULT_ADMIN_PASSWORD,
+        token = prefs.getString("token", null),
+        isLoggedIn = prefs.getString("token", null) != null
+    ))
+    val uiState: StateFlow<AdminUiState> = _uiState
 
+    init {
         checkServer()
-
-        binding.btnLogin.setOnClickListener {
-            doLogin(binding.inputUser.text.toString().trim(), binding.inputPass.text.toString())
-        }
-
-        binding.btnRefresh.setOnClickListener { loadSummary() }
-        binding.btnSecCreate.setOnClickListener { showSection(binding.secCreateUser) }
-        binding.btnSecUsers.setOnClickListener {
-            showSection(binding.secUsers)
-            loadUsers()
-        }
-        binding.btnSecCards.setOnClickListener {
-            showSection(binding.secCards)
-            loadCards()
-        }
-        binding.btnSecHistory.setOnClickListener {
-            showSection(binding.secHistory)
-            loadHistory()
-        }
-        binding.btnSecNotif.setOnClickListener {
-            showSection(binding.secNotif)
-            loadNotifications()
-        }
-        binding.btnSecSettings.setOnClickListener { showSection(binding.secSettings) }
-        binding.btnTarjetas.setOnClickListener { loadCards() }
-        binding.btnHistorial.setOnClickListener { loadHistory() }
-        binding.btnNotif.setOnClickListener { loadNotifications() }
-        binding.btnReloadUsers.setOnClickListener { loadUsers() }
-        binding.btnLogout.setOnClickListener { logout() }
-        binding.btnCreateUser.setOnClickListener { createUser() }
-        binding.btnAddCard.setOnClickListener { addCard() }
-        binding.btnUpdateMe.setOnClickListener { updateMe() }
-
-        authToken = prefs.getString("token", null)
-        if (authToken != null) {
-            showDashboard(savedUser)
-            loadSummary()
-        }
-
-        handler.postDelayed(notifRunnable, 15000)
+        if (_uiState.value.isLoggedIn) refreshAll()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        handler.removeCallbacks(notifRunnable)
+    fun updateUser(v: String) = _uiState.update { it.copy(user = v) }
+    fun updatePass(v: String) = _uiState.update { it.copy(pass = v) }
+    fun setTab(tab: AdminTab) = _uiState.update { it.copy(tab = tab) }
+    fun setHistoryFilter(v: String) = _uiState.update { it.copy(historyFilter = v) }
+    fun clearSnackbar() = _uiState.update { it.copy(snackbar = null) }
+
+    fun updateCreateUser(v: String) = _uiState.update { it.copy(newUser = v) }
+    fun updateCreatePass(v: String) = _uiState.update { it.copy(newPass = v) }
+    fun updateCreateSaldo(v: String) = _uiState.update { it.copy(newSaldo = v) }
+    fun updateCardAlias(v: String) = _uiState.update { it.copy(cardAlias = v) }
+    fun updateCardNumero(v: String) = _uiState.update { it.copy(cardNumero = v) }
+    fun updateCardMes(v: String) = _uiState.update { it.copy(cardMes = v) }
+    fun updateCardAnio(v: String) = _uiState.update { it.copy(cardAnio = v) }
+    fun updateCardCvv(v: String) = _uiState.update { it.copy(cardCvv = v) }
+
+    fun login() {
+        val s = _uiState.value
+        _uiState.update { it.copy(loading = true) }
+        postJson("/api/admin/login", JSONObject().put("usuario", s.user).put("password", s.pass), withAuth = false) { code, json ->
+            if (code in 200..299 && json.has("token")) {
+                val token = json.getString("token")
+                prefs.edit().putString("user", s.user).putString("pass", s.pass).putString("token", token).apply()
+                _uiState.update { it.copy(token = token, isLoggedIn = true, loading = false, snackbar = "Login correcto") }
+                refreshAll()
+            } else {
+                _uiState.update { it.copy(loading = false, snackbar = json.optString("error", "Error de login")) }
+            }
+        }
     }
 
-    private fun saveSession(user: String, pass: String, token: String) {
-        prefs.edit().putString("user", user).putString("pass", pass).putString("token", token).apply()
+    fun logout() {
+        prefs.edit().remove("token").apply()
+        _uiState.update { it.copy(token = null, isLoggedIn = false) }
+    }
+
+    fun refreshAll() {
+        loadSummary(); loadUsers(); loadCards(); loadHistory()
+    }
+
+    fun createUser() {
+        val s = _uiState.value
+        postJson("/api/admin/usuarios", JSONObject().put("usuario", s.newUser).put("password", s.newPass).put("saldo", s.newSaldo.toDoubleOrNull() ?: 0.0)) { code, json ->
+            _uiState.update { it.copy(snackbar = if (code in 200..299) "Usuario creado" else json.optString("error", "Error creando usuario"), newUser = "", newPass = "", newSaldo = "0") }
+            if (code in 200..299) refreshAll()
+        }
+    }
+
+    fun addCard() {
+        val s = _uiState.value
+        val body = JSONObject().put("alias", s.cardAlias).put("numero", s.cardNumero).put("mes", s.cardMes).put("anio", s.cardAnio).put("cvv", s.cardCvv)
+        postJson("/api/admin/tarjetas", body) { code, json ->
+            _uiState.update {
+                it.copy(
+                    snackbar = if (code in 200..299) "Tarjeta agregada ✓" else json.optString("error", "Error tarjeta"),
+                    cardAlias = "", cardNumero = "", cardMes = "", cardAnio = "", cardCvv = ""
+                )
+            }
+            if (code in 200..299) refreshAll()
+        }
+    }
+
+    fun deleteCard(cardId: Int) {
+        deleteJson("/api/admin/tarjetas/$cardId") { code, json ->
+            _uiState.update { it.copy(snackbar = if (code in 200..299) "Tarjeta eliminada" else json.optString("error", "Error al eliminar")) }
+            if (code in 200..299) refreshAll()
+        }
+    }
+
+    fun toggleCard(cardId: Int, activa: Boolean) {
+        patchJson("/api/admin/tarjetas/$cardId/activa", JSONObject().put("activa", if (activa) 1 else 0)) { code, json ->
+            _uiState.update { it.copy(snackbar = if (code in 200..299) "Tarjeta actualizada" else json.optString("error", "Error al actualizar")) }
+            if (code in 200..299) loadCards()
+        }
     }
 
     private fun checkServer() {
-        thread {
-            try {
-                val url = URL("${BuildConfig.API_BASE_URL}/api/status")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
-                val code = conn.responseCode
-                runOnUiThread {
-                    binding.txtServer.text = if (code in 200..299) "Servidor: conectado (${BuildConfig.API_BASE_URL})" else "Servidor: error HTTP $code"
-                }
-            } catch (e: Exception) {
-                runOnUiThread { binding.txtServer.text = "Servidor: sin conexión (${e.message})" }
-            }
-        }
-    }
-
-    private fun doLogin(user: String, pass: String) {
-        binding.txtStatus.text = "Estado: iniciando sesión..."
-        val body = JSONObject().put("usuario", user).put("password", pass)
-
-        postJson("/api/admin/login", body, withAuth = false) { code, json ->
-            if (code in 200..299 && json.has("token")) {
-                authToken = json.getString("token")
-                saveSession(user, pass, authToken!!)
-                binding.txtStatus.text = "Estado: login OK"
-                showDashboard(user)
-                loadSummary()
-            } else {
-                binding.txtStatus.text = "Estado: fallo login (${json.optString("error", "sin detalle")})"
-            }
-        }
-    }
-
-    private fun showDashboard(user: String) {
-        binding.loginPanel.visibility = View.GONE
-        binding.dashboardPanel.visibility = View.VISIBLE
-        binding.txtWelcome.text = "Bienvenido, $user"
-        showSection(binding.secCreateUser)
-    }
-
-    private fun showSection(section: View) {
-        binding.secCreateUser.visibility = View.GONE
-        binding.secUsers.visibility = View.GONE
-        binding.secCards.visibility = View.GONE
-        binding.secHistory.visibility = View.GONE
-        binding.secNotif.visibility = View.GONE
-        binding.secSettings.visibility = View.GONE
-        section.visibility = View.VISIBLE
-    }
-
-    private fun logout() {
-        authToken = null
-        prefs.edit().remove("token").apply()
-        binding.dashboardPanel.visibility = View.GONE
-        binding.loginPanel.visibility = View.VISIBLE
-        binding.txtStatus.text = "Estado: sesión cerrada"
-    }
-
-    private fun authorizedGet(path: String, onDone: (Int, String) -> Unit) {
-        val token = authToken ?: return
-        thread {
-            try {
-                val url = URL("${BuildConfig.API_BASE_URL}$path")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.setRequestProperty("Authorization", "Bearer $token")
-                conn.setRequestProperty("X-App-Key", BuildConfig.APP_ADMIN_KEY)
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-
-                val code = conn.responseCode
-                val text = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
-                runOnUiThread { onDone(code, text) }
-            } catch (e: Exception) {
-                runOnUiThread { onDone(500, "{\"error\":\"${e.message}\"}") }
-            }
-        }
-    }
-
-    private fun postJson(path: String, body: JSONObject, withAuth: Boolean = true, onDone: (Int, JSONObject) -> Unit) {
-        thread {
-            try {
-                val url = URL("${BuildConfig.API_BASE_URL}$path")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("X-App-Key", BuildConfig.APP_ADMIN_KEY)
-                if (withAuth && authToken != null) conn.setRequestProperty("Authorization", "Bearer $authToken")
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-
-                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-                val code = conn.responseCode
-                val response = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
-                runOnUiThread { onDone(code, JSONObject(response)) }
-            } catch (e: Exception) {
-                runOnUiThread { onDone(500, JSONObject().put("error", e.message ?: "error")) }
-            }
-        }
-    }
-
-    private fun patchJson(path: String, body: JSONObject, onDone: (Int, JSONObject) -> Unit) {
-        thread {
-            try {
-                val url = URL("${BuildConfig.API_BASE_URL}$path")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "PATCH"
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("X-App-Key", BuildConfig.APP_ADMIN_KEY)
-                conn.setRequestProperty("Authorization", "Bearer $authToken")
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-
-                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-                val code = conn.responseCode
-                val response = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
-                runOnUiThread { onDone(code, JSONObject(response)) }
-            } catch (e: Exception) {
-                runOnUiThread { onDone(500, JSONObject().put("error", e.message ?: "error")) }
-            }
-        }
-    }
-
-    private fun deleteJson(path: String, onDone: (Int, JSONObject) -> Unit) {
-        thread {
-            try {
-                val url = URL("${BuildConfig.API_BASE_URL}$path")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "DELETE"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("X-App-Key", BuildConfig.APP_ADMIN_KEY)
-                conn.setRequestProperty("Authorization", "Bearer $authToken")
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
-
-                val code = conn.responseCode
-                val response = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
-                runOnUiThread { onDone(code, JSONObject(response)) }
-            } catch (e: Exception) {
-                runOnUiThread { onDone(500, JSONObject().put("error", e.message ?: "error")) }
-            }
+        request("/api/status", "GET", null, withAuth = false) { code, _ ->
+            _uiState.update { it.copy(serverText = if (code in 200..299) "Servidor conectado" else "Servidor error HTTP $code") }
         }
     }
 
     private fun loadSummary() {
-        authorizedGet("/api/admin/usuarios") { c1, usersRaw ->
-            if (c1 !in 200..299) {
-                binding.txtSummary.text = "Resumen: error usuarios"
-                return@authorizedGet
-            }
-            val users = JSONArray(usersRaw)
-            authorizedGet("/api/admin/tarjetas") { c2, cardsRaw ->
-                if (c2 !in 200..299) {
-                    binding.txtSummary.text = "Resumen: error tarjetas"
-                    return@authorizedGet
+        authorizedGet("/api/admin/usuarios") { c1, uRaw ->
+            if (c1 !in 200..299) return@authorizedGet
+            val users = JSONArray(uRaw)
+            authorizedGet("/api/admin/tarjetas") { c2, tRaw ->
+                if (c2 !in 200..299) return@authorizedGet
+                val cards = JSONArray(tRaw)
+                authorizedGet("/api/admin/notificaciones") { c3, nRaw ->
+                    val count = if (c3 in 200..299) JSONArray(nRaw).length() else 0
+                    _uiState.update { it.copy(summary = "Usuarios: ${users.length()} | Tarjetas: ${cards.length()} | Notificaciones: $count", unreadNotif = count) }
                 }
-                val cards = JSONArray(cardsRaw)
-                authorizedGet("/api/admin/notificaciones") { c3, notifRaw ->
-                    val notifCount = if (c3 in 200..299) JSONArray(notifRaw).length() else -1
-                    binding.txtSummary.text = "Usuarios: ${users.length()} | Tarjetas: ${cards.length()} | Notificaciones: $notifCount"
-                }
-            }
-        }
-    }
-
-    private fun createUser() {
-        val user = binding.newUser.text.toString().trim()
-        val pass = binding.newPass.text.toString()
-        val saldo = binding.newSaldo.text.toString().ifBlank { "0" }.toDoubleOrNull() ?: 0.0
-        val body = JSONObject().put("usuario", user).put("password", pass).put("saldo", saldo)
-        postJson("/api/admin/usuarios", body) { code, json ->
-            binding.txtData.text = if (code in 200..299) "Usuario creado: ${json.optString("usuario")}" else "Error crear usuario: ${json.optString("error")}" 
-            if (code in 200..299) loadSummary()
-        }
-    }
-
-    private fun addCard() {
-        val body = JSONObject()
-            .put("alias", binding.cardAlias.text.toString().trim())
-            .put("numero", binding.cardNumber.text.toString().trim())
-            .put("mes", binding.cardMes.text.toString().trim())
-            .put("anio", binding.cardAnio.text.toString().trim())
-            .put("cvv", binding.cardCvv.text.toString().trim())
-
-        postJson("/api/admin/tarjetas", body) { code, json ->
-            binding.txtData.text = if (code in 200..299) "Tarjeta agregada. ID=${json.optInt("id")}" else "Error tarjeta: ${json.optString("error")}"
-            if (code in 200..299) {
-                binding.cardAlias.text?.clear()
-                binding.cardNumber.text?.clear()
-                binding.cardMes.text?.clear()
-                binding.cardAnio.text?.clear()
-                binding.cardCvv.text?.clear()
-                Snackbar.make(binding.rootLayout, "Tarjeta agregada", Snackbar.LENGTH_SHORT).show()
-                loadSummary()
-                loadCards()
-            }
-        }
-    }
-
-    private fun updateMe() {
-        val body = JSONObject()
-        val newUser = binding.meUser.text.toString().trim()
-        val newPass = binding.mePass.text.toString()
-        if (newUser.isNotBlank()) body.put("usuario", newUser)
-        if (newPass.isNotBlank()) body.put("password", newPass)
-        if (body.length() == 0) {
-            binding.txtData.text = "Nada para actualizar."
-            return
-        }
-
-        patchJson("/api/admin/me", body) { code, json ->
-            if (code in 200..299) {
-                val finalUser = json.optJSONObject("admin")?.optString("usuario") ?: binding.inputUser.text.toString()
-                val finalPass = if (newPass.isNotBlank()) newPass else binding.inputPass.text.toString()
-                prefs.edit().putString("user", finalUser).putString("pass", finalPass).apply()
-                binding.inputUser.setText(finalUser)
-                binding.inputPass.setText(finalPass)
-                binding.txtData.text = "Credenciales admin actualizadas."
-            } else {
-                binding.txtData.text = "Error actualizar perfil: ${json.optString("error")}" 
             }
         }
     }
 
     private fun loadUsers() {
         authorizedGet("/api/admin/usuarios") { code, raw ->
-            if (code !in 200..299) {
-                binding.txtData.text = "Error usuarios: $raw"
-                return@authorizedGet
-            }
+            if (code !in 200..299) return@authorizedGet
             val arr = JSONArray(raw)
-            renderUsers(arr)
-            binding.txtData.text = "Usuarios cargados: ${arr.length()}"
-        }
-    }
-
-    private fun renderUsers(arr: JSONArray) {
-        binding.usersContainer.removeAllViews()
-        if (arr.length() == 0) {
-            val empty = TextView(this).apply { text = "No hay usuarios." }
-            binding.usersContainer.addView(empty)
-            return
-        }
-
-        for (i in 0 until arr.length()) {
-            val u = arr.getJSONObject(i)
-            val userId = u.optInt("id")
-            val username = u.optString("usuario")
-            val saldo = u.optDouble("saldo")
-            val activo = u.optInt("activo") == 1
-
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(20, 16, 20, 16)
-            }
-            val title = TextView(this).apply {
-                text = "$username (ID $userId)"
-                textSize = 16f
-            }
-            val meta = TextView(this).apply {
-                text = "Saldo: $saldo | Activo: ${if (activo) "Sí" else "No"}"
-            }
-            val actions = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            val btnSaldo = Button(this).apply {
-                text = "Saldo +/-"
-                setOnClickListener { promptSaldoDelta(userId, username) }
-            }
-            val btnEdit = Button(this).apply {
-                text = "Editar"
-                setOnClickListener { promptEditUser(u) }
-            }
-            val btnDelete = Button(this).apply {
-                text = "Eliminar"
-                setOnClickListener {
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Eliminar usuario")
-                        .setMessage("¿Eliminar a $username?")
-                        .setPositiveButton("Eliminar") { _, _ -> deleteUser(userId, username) }
-                        .setNegativeButton("Cancelar", null)
-                        .show()
-                }
-            }
-
-            actions.addView(btnSaldo)
-            actions.addView(btnEdit)
-            actions.addView(btnDelete)
-            card.addView(title)
-            card.addView(meta)
-            card.addView(actions)
-            binding.usersContainer.addView(card)
-        }
-    }
-
-    private fun promptSaldoDelta(userId: Int, username: String) {
-        val input = EditText(this).apply { hint = "Ej: 100 o -50" }
-        AlertDialog.Builder(this)
-            .setTitle("Ajustar saldo de $username")
-            .setView(input)
-            .setPositiveButton("Aplicar") { _, _ ->
-                val delta = input.text.toString().trim().toDoubleOrNull()
-                if (delta == null || delta == 0.0) {
-                    binding.txtData.text = "Delta inválido para $username"
-                    return@setPositiveButton
-                }
-                patchJson("/api/admin/usuarios/$userId/saldo", JSONObject().put("delta", delta)) { code, json ->
-                    if (code in 200..299) {
-                        binding.txtData.text = "Saldo actualizado para $username: ${json.optDouble("saldo")}"
-                        loadUsers()
-                        loadSummary()
-                    } else {
-                        binding.txtData.text = "Error saldo $username: ${json.optString("error")}"
-                    }
-                }
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
-    private fun promptEditUser(user: JSONObject) {
-        val userId = user.optInt("id")
-        val currentUser = user.optString("usuario")
-        val currentSaldo = user.optDouble("saldo")
-        val currentActivo = user.optInt("activo") == 1
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 20, 32, 0)
-        }
-        val inputUser = EditText(this).apply {
-            hint = "Usuario"
-            setText(currentUser)
-        }
-        val inputPass = EditText(this).apply {
-            hint = "Nueva password (opcional)"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-        }
-        val inputSaldo = EditText(this).apply {
-            hint = "Saldo absoluto"
-            setText(currentSaldo.toString())
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
-        }
-        val inputActivo = EditText(this).apply {
-            hint = "Activo 1 o 0"
-            setText(if (currentActivo) "1" else "0")
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-        }
-        container.addView(inputUser)
-        container.addView(inputPass)
-        container.addView(inputSaldo)
-        container.addView(inputActivo)
-
-        AlertDialog.Builder(this)
-            .setTitle("Editar usuario")
-            .setView(container)
-            .setPositiveButton("Guardar") { _, _ ->
-                val body = JSONObject()
-                body.put("usuario", inputUser.text.toString().trim())
-                val pass = inputPass.text.toString()
-                if (pass.isNotBlank()) body.put("password", pass)
-                body.put("saldo", inputSaldo.text.toString().trim().toDoubleOrNull() ?: currentSaldo)
-                body.put("activo", if (inputActivo.text.toString().trim() == "1") 1 else 0)
-
-                patchJson("/api/admin/usuarios/$userId", body) { code, json ->
-                    if (code in 200..299) {
-                        binding.txtData.text = "Usuario actualizado: ${json.optJSONObject("usuario")?.optString("usuario", currentUser)}"
-                        loadUsers()
-                        loadSummary()
-                    } else {
-                        binding.txtData.text = "Error al editar usuario: ${json.optString("error")}"
-                    }
-                }
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
-    private fun deleteUser(userId: Int, username: String) {
-        deleteJson("/api/admin/usuarios/$userId") { code, json ->
-            if (code in 200..299) {
-                binding.txtData.text = "Usuario eliminado: $username"
-                loadUsers()
-                loadSummary()
-            } else {
-                binding.txtData.text = "Error eliminando $username: ${json.optString("error")}"
+            _uiState.update {
+                it.copy(users = (0 until arr.length()).map { idx ->
+                    val o = arr.getJSONObject(idx)
+                    AdminUser(o.optInt("id"), o.optString("usuario"), o.optDouble("saldo"), o.optInt("activo") == 1)
+                })
             }
         }
     }
 
     private fun loadCards() {
         authorizedGet("/api/admin/tarjetas") { code, raw ->
-            if (code !in 200..299) {
-                binding.txtData.text = "Error tarjetas: $raw"
-                return@authorizedGet
-            }
+            if (code !in 200..299) return@authorizedGet
             val arr = JSONArray(raw)
-            renderCards(arr)
-            binding.txtData.text = "Tarjetas cargadas: ${arr.length()}"
-        }
-    }
-
-    private fun renderCards(arr: JSONArray) {
-        binding.cardsContainer.removeAllViews()
-        if (arr.length() == 0) {
-            val empty = TextView(this).apply { text = "No hay tarjetas." }
-            binding.cardsContainer.addView(empty)
-            return
-        }
-
-        for (i in 0 until arr.length()) {
-            val t = arr.getJSONObject(i)
-            val cardId = t.optInt("id")
-            val alias = t.optString("alias", "").ifBlank { "Sin alias" }
-            val numero = t.optString("numero")
-            val activa = t.optInt("activa") == 1
-            val ignorada = t.optInt("ignorada") == 1
-
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(24, 20, 24, 20)
-                setBackgroundColor(0xFFF2F5FF.toInt())
-            }
-            val title = TextView(this).apply {
-                text = "$alias (ID $cardId)"
-                textSize = 18f
-            }
-            val estado = when {
-                ignorada -> "Ignorada"
-                activa -> "Activa"
-                else -> "Inactiva"
-            }
-            val meta = TextView(this).apply {
-                val ultUso = t.optString("ultimo_uso", "N/D")
-                val ultEstado = t.optString("ultimo_estado", "-")
-                val ultServicio = t.optString("ultimo_servicio", "-")
-                text = "$numero | Últ. uso: $ultUso | Estado: $ultEstado | Servicio: $ultServicio"
-            }
-            val metrics = TextView(this).apply {
-                val metricas = t.optJSONArray("metricas")
-                val metricsText = if (metricas == null || metricas.length() == 0) {
-                    "Sin métricas de uso todavía"
-                } else {
-                    (0 until metricas.length()).joinToString(" | ") { idx ->
-                        val m = metricas.getJSONObject(idx)
-                        "${m.optString("servicio")}: i=${m.optInt("intentos")} ok=${m.optInt("exitos")} f=${m.optInt("fallos")} fc=${m.optInt("fallos_consecutivos")}"
+            _uiState.update {
+                it.copy(cards = (0 until arr.length()).map { idx ->
+                    val o = arr.getJSONObject(idx)
+                    val metricas = o.optJSONArray("metricas")
+                    val sum = if (metricas == null || metricas.length() == 0) "Sin métricas" else {
+                        (0 until metricas.length()).joinToString(" · ") { mi ->
+                            val m = metricas.getJSONObject(mi)
+                            "✓ ${m.optInt("exitos")} ✗ ${m.optInt("fallos")} c:${m.optInt("fallos_consecutivos")}"
+                        }
                     }
-                }
-                text = "Mes/Año: ${t.optString("mes")}/${t.optString("anio")} • $metricsText"
-            }
-            val statusChip = Chip(this).apply {
-                text = estado
-                isCheckable = false
-                isClickable = false
-                setChipBackgroundColorResource(if (estado == "Activa") android.R.color.holo_green_light else if (estado == "Ignorada") android.R.color.holo_orange_light else android.R.color.holo_red_light)
-            }
-            val actions = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            val btnToggle = Button(this).apply {
-                text = if (activa) "Deshabilitar" else "Habilitar"
-                isEnabled = !ignorada
-                setOnClickListener { patchCardActiva(cardId, !activa, alias) }
-            }
-            val btnDelete = Button(this).apply {
-                text = "Eliminar"
-                setOnClickListener {
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Eliminar tarjeta")
-                        .setMessage("¿Eliminar la tarjeta $alias ($numero)?")
-                        .setPositiveButton("Eliminar") { _, _ -> deleteCard(cardId, alias) }
-                        .setNegativeButton("Cancelar", null)
-                        .show()
-                }
-            }
-
-            actions.addView(btnToggle)
-            actions.addView(btnDelete)
-            card.addView(title)
-            card.addView(meta)
-            card.addView(metrics)
-            card.addView(statusChip)
-            card.addView(actions)
-            binding.cardsContainer.addView(card)
-        }
-    }
-
-    private fun patchCardActiva(cardId: Int, activa: Boolean, alias: String) {
-        patchJson("/api/admin/tarjetas/$cardId/activa", JSONObject().put("activa", if (activa) 1 else 0)) { code, json ->
-            if (code in 200..299) {
-                binding.txtData.text = "Tarjeta ${if (activa) "habilitada" else "deshabilitada"}: $alias"
-                loadCards()
-            } else {
-                binding.txtData.text = "Error tarjeta $alias: ${json.optString("error")}"
-            }
-        }
-    }
-
-    private fun deleteCard(cardId: Int, alias: String) {
-        deleteJson("/api/admin/tarjetas/$cardId") { code, json ->
-            if (code in 200..299) {
-                binding.txtData.text = "Tarjeta eliminada: $alias"
-                loadCards()
-                loadSummary()
-            } else {
-                binding.txtData.text = "Error al eliminar tarjeta $alias: ${json.optString("error")}"
+                    val estado = when {
+                        o.optInt("ignorada") == 1 -> "BLOQUEADA"
+                        o.optInt("activa") == 1 -> "ACTIVA"
+                        else -> "INACTIVA"
+                    }
+                    AdminCard(o.optInt("id"), o.optString("alias", "Sin alias"), o.optString("numero"), estado, o.optString("ultimo_uso", "Sin uso aún"), sum)
+                })
             }
         }
     }
 
     private fun loadHistory() {
         authorizedGet("/api/admin/historial") { code, raw ->
-            if (code !in 200..299) {
-                binding.txtData.text = "Error historial: $raw"
-                return@authorizedGet
-            }
-            val arr = JSONArray(raw)
-            val lines = mutableListOf("Historial (${arr.length()}):")
-            for (i in 0 until minOf(arr.length(), 30)) {
-                val h = arr.getJSONObject(i)
-                lines.add("- ${h.optString("fecha")} | ${h.optString("servicio")} | ${h.optString("estado")}")
-            }
-            binding.txtData.text = lines.joinToString("\n")
-        }
-    }
-
-    private fun loadNotifications() {
-        authorizedGet("/api/admin/notificaciones") { code, raw ->
-            if (code !in 200..299) {
-                binding.txtData.text = "Error notificaciones: $raw"
-                return@authorizedGet
-            }
-            val arr = JSONArray(raw)
-            val lines = mutableListOf("Notificaciones (${arr.length()}):")
-            for (i in 0 until minOf(arr.length(), 30)) {
-                val n = arr.getJSONObject(i)
-                lines.add("- ${n.optString("creada")} | ${n.optString("mensaje")}")
-            }
-            binding.txtData.text = lines.joinToString("\n")
-        }
-    }
-
-    private fun pollNotificationsSilently() {
-        authorizedGet("/api/admin/notificaciones") { code, raw ->
             if (code !in 200..299) return@authorizedGet
             val arr = JSONArray(raw)
-            if (arr.length() == 0) return@authorizedGet
-            val latest = arr.getJSONObject(0)
-            val id = latest.optInt("id", 0)
-            if (id > lastNotifId) {
-                lastNotifId = id
-                sendLocalNotification("Admin Recargas", latest.optString("mensaje", "Nueva notificación"))
+            _uiState.update {
+                it.copy(history = (0 until arr.length()).map { idx ->
+                    val o = arr.getJSONObject(idx)
+                    AdminHist(o.optInt("id"), o.optString("servicio"), o.optString("referencia"), o.optDouble("monto"), o.optString("estado"), o.optString("fecha"))
+                })
             }
         }
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("admin_channel", "Admin Recargas", NotificationManager.IMPORTANCE_DEFAULT)
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
+    private fun token() = _uiState.value.token
+
+    private fun authorizedGet(path: String, onDone: (Int, String) -> Unit) = request(path, "GET", null, true, onDone)
+    private fun postJson(path: String, body: JSONObject, withAuth: Boolean = true, onDone: (Int, JSONObject) -> Unit) =
+        request(path, "POST", body.toString(), withAuth) { c, raw -> onDone(c, parseJson(raw)) }
+    private fun patchJson(path: String, body: JSONObject, onDone: (Int, JSONObject) -> Unit) =
+        request(path, "PATCH", body.toString(), true) { c, raw -> onDone(c, parseJson(raw)) }
+    private fun deleteJson(path: String, onDone: (Int, JSONObject) -> Unit) =
+        request(path, "DELETE", null, true) { c, raw -> onDone(c, parseJson(raw)) }
+
+    private fun request(path: String, method: String, body: String?, withAuth: Boolean = true, onDone: (Int, String) -> Unit) {
+        val tk = token()
+        thread {
+            try {
+                val conn = URL("${BuildConfig.API_BASE_URL}$path").openConnection() as HttpURLConnection
+                conn.requestMethod = method
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("X-App-Key", BuildConfig.APP_ADMIN_KEY)
+                if (withAuth && tk != null) conn.setRequestProperty("Authorization", "Bearer $tk")
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                if (body != null) {
+                    conn.doOutput = true
+                    OutputStreamWriter(conn.outputStream).use { it.write(body) }
+                }
+                val code = conn.responseCode
+                val text = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
+                viewModelScope.launch { onDone(code, text) }
+            } catch (e: Exception) {
+                viewModelScope.launch { onDone(500, "{\"error\":\"${e.message}\"}") }
+            }
         }
     }
 
-    private fun requestNotifPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= 33 && ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
-        }
+    private fun parseJson(raw: String): JSONObject = try { JSONObject(raw) } catch (_: Exception) { JSONObject() }
+}
+
+@Composable
+fun AdminApp(state: AdminUiState, vm: AdminViewModel) {
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(state.snackbar) {
+        state.snackbar?.let { snackbarHostState.showSnackbar(it); vm.clearSnackbar() }
     }
 
-    private fun sendLocalNotification(title: String, body: String) {
-        if (Build.VERSION.SDK_INT >= 33 && ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
-        val builder = NotificationCompat.Builder(this, "admin_channel")
-            .setSmallIcon(android.R.drawable.stat_notify_more)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-        NotificationManagerCompat.from(this).notify((System.currentTimeMillis() % Int.MAX_VALUE).toInt(), builder.build())
+    if (!state.isLoggedIn) {
+        LoginScreen(state, vm)
+        return
     }
+
+    Scaffold(snackbarHost = { SnackbarHost(snackbarHostState) }) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D27))) {
+                Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                    Text("Admin Recargas", color = Color(0xFFF1F3F9), style = MaterialTheme.typography.titleLarge)
+                    Text(state.summary, color = Color(0xFF8B92A9))
+                }
+            }
+            TabRow(selectedTabIndex = state.tab.ordinal) {
+                AdminTab.values().forEach { tab ->
+                    Tab(selected = state.tab == tab, onClick = { vm.setTab(tab) }, text = { Text(tab.name) }, icon = {
+                        Icon(when (tab) {
+                            AdminTab.Crear -> Icons.Default.AccountCircle
+                            AdminTab.Usuarios -> Icons.Default.People
+                            AdminTab.Tarjetas -> Icons.Default.CreditCard
+                            AdminTab.Historial -> Icons.Default.History
+                        }, null)
+                    })
+                }
+            }
+            when (state.tab) {
+                AdminTab.Crear -> CreateTab(state, vm)
+                AdminTab.Usuarios -> UsersTab(state)
+                AdminTab.Tarjetas -> CardsTab(state, vm)
+                AdminTab.Historial -> HistoryTab(state, vm)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = vm::refreshAll) { Text("Actualizar") }
+                TextButton(onClick = vm::logout) { Text("Salir") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(state: AdminUiState, vm: AdminViewModel) {
+    Column(
+        Modifier.fillMaxSize().background(Color(0xFF0F1117)).padding(20.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(Icons.Default.Lock, null, tint = Color(0xFF4F6EF7), modifier = Modifier.size(64.dp))
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Spacer(Modifier.size(8.dp).background(if (state.serverText.contains("conectado")) Color(0xFF22C55E) else Color(0xFFEF4444), CircleShape))
+            Spacer(Modifier.size(8.dp))
+            Text(state.serverText, color = Color(0xFF8B92A9))
+        }
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(value = state.user, onValueChange = vm::updateUser, label = { Text("Usuario") }, leadingIcon = { Icon(Icons.Default.AccountCircle, null) }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = state.pass, onValueChange = vm::updatePass, label = { Text("Contraseña") }, visualTransformation = PasswordVisualTransformation(), leadingIcon = { Icon(Icons.Default.Lock, null) }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        Button(onClick = vm::login, modifier = Modifier.fillMaxWidth().height(52.dp), enabled = !state.loading) {
+            if (state.loading) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp) else Text("Ingresar")
+        }
+    }
+}
+
+@Composable
+private fun CreateTab(state: AdminUiState, vm: AdminViewModel) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item { Text("Crear usuario", color = Color(0xFFF1F3F9)) }
+        item { OutlinedTextField(value = state.newUser, onValueChange = vm::updateCreateUser, label = { Text("Usuario") }, modifier = Modifier.fillMaxWidth()) }
+        item { OutlinedTextField(value = state.newPass, onValueChange = vm::updateCreatePass, label = { Text("Password") }, modifier = Modifier.fillMaxWidth()) }
+        item { OutlinedTextField(value = state.newSaldo, onValueChange = vm::updateCreateSaldo, label = { Text("Saldo") }, modifier = Modifier.fillMaxWidth()) }
+        item { Button(onClick = vm::createUser, modifier = Modifier.fillMaxWidth()) { Text("Crear") } }
+    }
+}
+
+@Composable
+private fun UsersTab(state: AdminUiState) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        items(state.users) { u ->
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D27))) {
+                Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                    Text(u.usuario, color = Color(0xFFF1F3F9))
+                    Text("Saldo: ${u.saldo}", color = if (u.saldo > 0) Color(0xFF22C55E) else Color(0xFF8B92A9))
+                    AssistChip(onClick = {}, label = { Text(if (u.activo) "ACTIVO" else "INACTIVO") }, enabled = false)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CardsTab(state: AdminUiState, vm: AdminViewModel) {
+    var deleteId by remember { mutableStateOf<Int?>(null) }
+    if (deleteId != null) {
+        AlertDialog(onDismissRequest = { deleteId = null }, confirmButton = {
+            TextButton(onClick = { vm.deleteCard(deleteId!!); deleteId = null }) { Text("Eliminar") }
+        }, dismissButton = { TextButton(onClick = { deleteId = null }) { Text("Cancelar") } }, title = { Text("Confirmar") }, text = { Text("¿Eliminar tarjeta?") })
+    }
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item { Text("Agregar tarjeta", color = Color(0xFFF1F3F9)) }
+        item { OutlinedTextField(value = state.cardAlias, onValueChange = vm::updateCardAlias, label = { Text("Alias") }, modifier = Modifier.fillMaxWidth()) }
+        item { OutlinedTextField(value = state.cardNumero, onValueChange = vm::updateCardNumero, label = { Text("Número") }, modifier = Modifier.fillMaxWidth()) }
+        item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(value = state.cardMes, onValueChange = vm::updateCardMes, label = { Text("Mes") }, modifier = Modifier.weight(1f))
+            OutlinedTextField(value = state.cardAnio, onValueChange = vm::updateCardAnio, label = { Text("Año") }, modifier = Modifier.weight(1f))
+            OutlinedTextField(value = state.cardCvv, onValueChange = vm::updateCardCvv, label = { Text("CVV") }, modifier = Modifier.weight(1f))
+        }}
+        item { Button(onClick = vm::addCard, modifier = Modifier.fillMaxWidth()) { Text("Agregar tarjeta ✓") } }
+        items(state.cards) { c ->
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D27)), shape = RoundedCornerShape(16.dp)) {
+                Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("${c.alias} ${c.numero}", color = Color(0xFFF1F3F9))
+                    Text("Último uso: ${c.ultimoUso}", color = Color(0xFF8B92A9))
+                    Text(c.metricas, color = Color(0xFF8B92A9))
+                    AssistChip(onClick = {}, label = { Text(c.estado) }, enabled = false)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = { vm.toggleCard(c.id, c.estado != "ACTIVA") }) { Text(if (c.estado == "ACTIVA") "Deshabilitar" else "Habilitar") }
+                        TextButton(onClick = { deleteId = c.id }) { Text("Eliminar") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryTab(state: AdminUiState, vm: AdminViewModel) {
+    val filtered = state.history.filter {
+        when (state.historyFilter) {
+            "ok" -> it.estado.contains("ok", true)
+            "fallo" -> it.estado.contains("fallo", true)
+            else -> true
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("todos", "ok", "fallo").forEach { f ->
+                FilterChip(selected = state.historyFilter == f, onClick = { vm.setHistoryFilter(f) }, label = { Text(f) })
+            }
+        }
+        if (filtered.isEmpty()) {
+            Text("Sin historial", color = Color(0xFF8B92A9))
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(filtered) { h ->
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D27))) {
+                        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                            Text("${h.servicio} - ${h.monto}", color = Color(0xFFF1F3F9))
+                            Text("${h.referencia} | ${h.fecha}", color = Color(0xFF8B92A9))
+                            AssistChip(onClick = {}, label = { Text(h.estado) }, enabled = false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdminTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = androidx.compose.material3.darkColorScheme(
+            background = Color(0xFF0F1117),
+            surface = Color(0xFF1A1D27),
+            surfaceVariant = Color(0xFF222536),
+            primary = Color(0xFF4F6EF7),
+            secondary = Color(0xFF06B6D4),
+            error = Color(0xFFEF4444),
+            onBackground = Color(0xFFF1F3F9),
+            onSurface = Color(0xFFF1F3F9)
+        ),
+        content = content
+    )
 }
