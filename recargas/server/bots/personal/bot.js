@@ -59,9 +59,10 @@ async function recargar(numero, monto, tarjetas) {
     console.log('Personal: intentando tarjeta ' + (i + 1) + '...')
     const resultado = await intentarConTarjeta(numero, tarjetas[i], monto)
     console.log('Tarjeta ' + (i + 1) + ':', resultado)
-    if (resultado.ok) return { ...resultado, tarjeta_idx: i }
+    if (resultado.ok) return { ok: true, mensaje: resultado.mensaje, tarjeta_idx: i }
+    resultado.tarjeta_idx = i
   }
-  return { ok: false, mensaje: 'Servicio no disponible' }
+  return { ok: false, mensaje: 'Servicio no disponible', tarjeta_idx: 0 }
 }
 
 module.exports = { recargar }
