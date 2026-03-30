@@ -89,6 +89,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_notif_admin ON notificaciones_admin(admin_id, leida);
 `)
 
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all()
+  const exists = columns.some((col) => col.name === column)
+  if (!exists) {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
+  }
+}
+
+ensureColumn('tarjetas', 'ultimo_uso', 'TEXT')
+ensureColumn('tarjetas', 'ultimo_estado', 'TEXT')
+ensureColumn('tarjetas', 'ultimo_servicio', 'TEXT')
+
 const bootstrapUser = process.env.BOOTSTRAP_ADMIN_USER
 const bootstrapPass = process.env.BOOTSTRAP_ADMIN_PASS
 const hasAnyAdmin = db.prepare('SELECT id FROM admins LIMIT 1').get()

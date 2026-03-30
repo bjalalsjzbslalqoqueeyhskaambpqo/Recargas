@@ -9,10 +9,20 @@ if (bootstrapFile.exists()) {
     bootstrapFile.withInputStream { bootstrap.load(it) }
 }
 
-def apiBaseUrl = bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
-def appKey = bootstrap.getProperty('APP_ADMIN_KEY', 'REPLACE_APP_KEY')
-def defaultUser = bootstrap.getProperty('DEFAULT_ADMIN_USER', 'admin')
-def defaultPass = bootstrap.getProperty('DEFAULT_ADMIN_PASSWORD', 'admin123456')
+def firstNonBlank(String... values) {
+    for (value in values) {
+        if (value != null) {
+            def normalized = value.trim()
+            if (!normalized.isEmpty()) return normalized
+        }
+    }
+    return null
+}
+
+def apiBaseUrl = firstNonBlank(System.getenv('API_BASE_URL'), bootstrap.getProperty('API_BASE_URL'), 'http://127.0.0.1:3000')
+def appKey = firstNonBlank(System.getenv('APP_ADMIN_KEY'), bootstrap.getProperty('APP_ADMIN_KEY'), 'REPLACE_APP_KEY')
+def defaultUser = firstNonBlank(System.getenv('DEFAULT_ADMIN_USER'), bootstrap.getProperty('DEFAULT_ADMIN_USER'), 'admin')
+def defaultPass = firstNonBlank(System.getenv('DEFAULT_ADMIN_PASSWORD'), bootstrap.getProperty('DEFAULT_ADMIN_PASSWORD'), 'admin123456')
 
 android {
     namespace 'com.recargas.admin'
@@ -20,7 +30,7 @@ android {
 
     defaultConfig {
         applicationId 'com.recargas.admin'
-        minSdk 24
+        minSdk 26
         targetSdk 34
         versionCode 1
         versionName '1.0.0'
@@ -35,7 +45,8 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
@@ -51,13 +62,31 @@ android {
 
     buildFeatures {
         buildConfig true
-        viewBinding true
+        compose true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.14'
     }
 }
 
 dependencies {
+    def composeBom = platform('androidx.compose:compose-bom:2024.09.03')
+
     implementation 'androidx.core:core-ktx:1.13.1'
-    implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
-    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7'
+    implementation 'androidx.activity:activity-compose:1.9.2'
+    implementation 'androidx.navigation:navigation-compose:2.8.2'
+    implementation composeBom
+
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.material3:material3"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7"
+    implementation 'androidx.compose.material:material-icons-extended'
+
+    debugImplementation 'androidx.compose.ui:ui-tooling'
 }
