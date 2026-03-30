@@ -59,9 +59,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.googlefonts.Font as GoogleFontEntry
-import androidx.compose.ui.text.googlefonts.GoogleFont
-import androidx.compose.ui.text.googlefonts.GoogleFont.Provider
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -372,13 +369,7 @@ private fun HistoryScreen(state: ClientUiState, padding: PaddingValues) {
 
 @Composable
 fun ClientTheme(content: @Composable () -> Unit) {
-    val provider = Provider(
-        providerAuthority = "com.google.android.gms.fonts",
-        providerPackage = "com.google.android.gms",
-        certificates = androidx.compose.ui.R.array.com_google_android_gms_fonts_certs
-    )
-    val nunito = GoogleFont("Nunito")
-    val fontFamily = FontFamily(GoogleFontEntry(googleFont = nunito, fontProvider = provider))
+    val fontFamily = FontFamily.SansSerif
     MaterialTheme(
         colorScheme = androidx.compose.material3.darkColorScheme(
             primary = Color(0xFFB388FF),
