@@ -1,14 +1,63 @@
-name: client-app-build-disabled
+name: client-android-build
 
 on:
   workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - 'recargas/client-android-app/**'
+      - 'recargas/server/**'
+      - '.github/workflows/client-app-build.yml'
 
 jobs:
-  client-build-disabled:
+  build-client-apk:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Client build disabled
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Crear archivos locales de entorno cliente
+        working-directory: recargas/client-android-app
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          APP_CLIENT_KEY: ${{ secrets.APP_CLIENT_KEY }}
+          DEFAULT_CLIENT_USER: ${{ secrets.DEFAULT_CLIENT_USER }}
         run: |
-          echo "La compilación del cliente está deshabilitada en CI."
-          echo "Se compila únicamente la app de administración en admin-android-build.yml."
+          mkdir -p local
+
+          cat > local/bootstrap.properties <<DATA
+          API_BASE_URL=${API_BASE_URL:-http://127.0.0.1:3000}
+          APP_CLIENT_KEY=${APP_CLIENT_KEY:-REPLACE_APP_KEY}
+          DEFAULT_CLIENT_USER=${DEFAULT_CLIENT_USER:-cliente_demo}
+          DATA
+
+          cat > local.properties <<DATA
+          sdk.dir=$ANDROID_SDK_ROOT
+          DATA
+
+      - name: Instalar dependencias Android requeridas
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Build release APK cliente
+        run: gradle -p recargas/client-android-app assembleRelease
+
+      - name: Upload client APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-release-apk
+          path: recargas/client-android-app/app/build/outputs/apk/release/*.apk

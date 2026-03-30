@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Cliente Recargas"
+        android:textSize="22sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/txtServer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Servidor: comprobando..." />
+
+    <LinearLayout
+        android:id="@+id/loginPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="8dp">
+
+        <EditText
+            android:id="@+id/inputUser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Usuario cliente" />
+
+        <EditText
+            android:id="@+id/inputPass"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="Password"
+            android:inputType="textPassword" />
+
+        <Button
+            android:id="@+id/btnLogin"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Entrar" />
+
+        <TextView
+            android:id="@+id/txtLoginMsg"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Estado: listo"
+            android:layout_marginTop="6dp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/appPanel"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:visibility="gone"
+        android:layout_marginTop="8dp">
+
+        <TextView android:id="@+id/txtWelcome" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Hola" android:textStyle="bold"/>
+        <TextView android:id="@+id/txtSaldo" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Saldo"/>
+
+        <Spinner android:id="@+id/spServicio" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+        <Spinner android:id="@+id/spMonto" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
+
+        <EditText
+            android:id="@+id/inputReferencia"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:hint="Referencia"
+            android:inputType="text" />
+
+        <Button android:id="@+id/btnRecargar" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Recargar" android:layout_marginTop="8dp"/>
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+            <Button android:id="@+id/btnRefresh" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Actualizar"/>
+            <Button android:id="@+id/btnLogout" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Salir"/>
+        </LinearLayout>
+
+        <TextView android:id="@+id/txtResult" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Resultado" android:layout_marginTop="6dp"/>
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Historial" android:textStyle="bold" android:layout_marginTop="8dp"/>
+        <TextView android:id="@+id/txtHistorial" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Sin datos"/>
+    </LinearLayout>
+</LinearLayout>

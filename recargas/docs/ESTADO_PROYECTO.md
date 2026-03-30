@@ -32,17 +32,18 @@
 - El pipeline genera APK release firmado y publica artefactos.
 
 ### Cliente actual
-- Existe **cliente web básico** en `recargas/client-app`.
-- CI del cliente web: `.github/workflows/client-app-build.yml` (deshabilitado para compilación, solo manual/informativo).
-- El pipeline activo de compilación ahora es el de administración (`admin-android-build.yml`).
+- Existe cliente web básico en `recargas/client-app` (referencia rápida para API).
+- Existe app Android cliente en `recargas/client-android-app` compilable en CI.
+- CI cliente Android: `.github/workflows/client-app-build.yml`.
+- CI admin Android: `.github/workflows/admin-android-build.yml`.
 
 ---
 
 ## 2) Qué NO está terminado (pendiente real)
 
 ### App de cliente “de verdad” (nativa)
-- No hay app Android/iOS cliente final lista para distribución.
-- El cliente actual es web estático (MVP operativo), no app móvil compilada de producción.
+- Ya existe base Android cliente compilable en CI (`recargas/client-android-app`).
+- Aún falta madurarla para distribución productiva (UX final, pruebas completas, hardening y publicación).
 
 ### Calidad/producción
 - Falta suite de tests automática (unit/integration/e2e).
