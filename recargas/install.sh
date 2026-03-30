@@ -90,7 +90,8 @@ if [[ -n "$REPO_URL" ]]; then
     git clone "$REPO_URL" "$TARGET_DIR"
   fi
 else
-  if [[ -f "$SCRIPT_DIR/index.js" && -f "$SCRIPT_DIR/db.js" && -f "$SCRIPT_DIR/package.json" ]]; then
+  # Estructura esperada: script en raíz del proyecto junto a package.json y carpeta server/
+  if [[ -f "$SCRIPT_DIR/package.json" && -f "$SCRIPT_DIR/server/index.js" && -f "$SCRIPT_DIR/server/db.js" ]]; then
     if command -v rsync &>/dev/null; then
       rsync -a --delete \
         --exclude '.git' \
@@ -101,13 +102,13 @@ else
     fi
     ok "Archivos copiados desde $SCRIPT_DIR"
   else
-    fail "No se encontraron index.js, db.js y package.json en $SCRIPT_DIR. Coloca el script en la misma carpeta que el proyecto."
+    fail "No se encontraron package.json, server/index.js y server/db.js en $SCRIPT_DIR. Coloca install.sh en la raíz del proyecto."
   fi
 fi
 
-[[ -f "$TARGET_DIR/index.js"    ]] || fail "Falta index.js en $TARGET_DIR"
-[[ -f "$TARGET_DIR/db.js"       ]] || fail "Falta db.js en $TARGET_DIR"
-[[ -f "$TARGET_DIR/package.json" ]] || fail "Falta package.json en $TARGET_DIR"
+[[ -f "$TARGET_DIR/package.json"    ]] || fail "Falta package.json en $TARGET_DIR"
+[[ -f "$TARGET_DIR/server/index.js" ]] || fail "Falta server/index.js en $TARGET_DIR"
+[[ -f "$TARGET_DIR/server/db.js"    ]] || fail "Falta server/db.js en $TARGET_DIR"
 
 echo "[2/6] Generando credenciales y configuración"
 ENV_FILE="$TARGET_DIR/.env"
@@ -145,6 +146,10 @@ cd "$TARGET_DIR"
 npm install --omit=dev
 ok "npm install completado"
 
+echo "  Instalando navegador Chromium para Playwright..."
+npx playwright install chromium --with-deps 2>&1 | tail -5
+ok "Playwright/Chromium listo"
+
 echo "[4/6] Configurando systemd"
 if command -v systemctl &>/dev/null; then
 
@@ -156,7 +161,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$TARGET_DIR
-ExecStart=/usr/bin/node $TARGET_DIR/index.js
+ExecStart=/usr/bin/node $TARGET_DIR/server/index.js
 Restart=always
 RestartSec=3
 EnvironmentFile=$ENV_FILE
@@ -164,8 +169,8 @@ User=root
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=$TARGET_DIR
-ProtectHome=true
+ReadWritePaths=$TARGET_DIR /tmp /root/.cache
+ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target
@@ -182,7 +187,7 @@ SERVICE
 
 else
   log "systemctl no disponible."
-  echo "[5/6] Arranque manual: cd $TARGET_DIR && node index.js"
+  echo "[5/6] Arranque manual: cd $TARGET_DIR && node server/index.js"
 fi
 
 echo ""
