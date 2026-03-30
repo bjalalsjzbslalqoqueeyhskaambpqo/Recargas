@@ -8,20 +8,21 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
 
   try {
     await page.goto('https://www.movistar.com.ar/recarga-con-tarjeta-de-credito')
-    await page.waitForSelector('#ani')
-    await page.click('#ani')
-    await page.type('#ani', numero, { delay: 200 })
+
+    const inputAni = page.locator('#ani')
+    await inputAni.waitFor({ state: 'visible', timeout: 15000 })
+    await inputAni.click()
+    await inputAni.type(numero, { delay: 200 })
     await page.keyboard.press('Tab')
-    await page.waitForSelector('.pnt-mensaje-valido', { timeout: 15000 })
-    await page.waitForTimeout(5000)
+    await page.locator('.pnt-mensaje-valido').waitFor({ state: 'visible', timeout: 15000 })
 
     const frame = page.frame({ name: 'my_frame' })
-    const tieneCampos = await frame.locator('#numerotarjeta').count()
-    if (!tieneCampos) {
+    if (!frame) {
       await browser.close()
-      return { ok: false, mensaje: 'iframe no cargo' }
+      return { ok: false, mensaje: 'iframe no cargó' }
     }
 
+    await frame.locator('#numerotarjeta').waitFor({ state: 'visible', timeout: 10000 })
     await frame.fill('#numerotarjeta', tarjeta.numero)
     await frame.fill('#mes', tarjeta.mes)
     await frame.fill('#anio', tarjeta.anio)
@@ -32,8 +33,8 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
       () => window.location.href.includes('tokenDatosRecarga'),
       { timeout: 20000 }
     )
-    await page.waitForTimeout(3000)
 
+    await page.locator('select.pnt-js-combo-importe-recarga').waitFor({ state: 'visible', timeout: 10000 })
     await page.evaluate((m) => {
       const select = document.querySelector('select.pnt-js-combo-importe-recarga')
       if (select) {
@@ -42,13 +43,13 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
       }
     }, monto)
 
-    await page.waitForTimeout(500)
-    await page.click('.pnt-js-btn-recargar')
+    await page.locator('.pnt-js-btn-recargar').waitFor({ state: 'visible', timeout: 5000 })
+    await page.locator('.pnt-js-btn-recargar').click()
 
     try {
       await page.waitForFunction(() => {
-        const texto = document.body.innerText
-        return !texto.includes('Procesando') && !texto.includes('aguarda')
+        const t = document.body.innerText
+        return !t.includes('Procesando') && !t.includes('aguarda')
       }, { timeout: 20000 })
     } catch(e) {}
 
@@ -57,9 +58,6 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
 
     if (texto.includes('Listo') || texto.includes('recargaste') || texto.includes('exitosa')) {
       return { ok: true, mensaje: 'Recarga exitosa' }
-    }
-    if (texto.includes('Procesando') || texto.includes('aguarda')) {
-      return { ok: false, mensaje: 'Timeout' }
     }
     return { ok: false, mensaje: 'Tarjeta rechazada' }
 
