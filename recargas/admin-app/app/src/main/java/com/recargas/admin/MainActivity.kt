@@ -19,6 +19,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import com.google.android.material.chip.Chip
+import com.google.android.material.snackbar.Snackbar
 import com.recargas.admin.databinding.ActivityMainBinding
 import org.json.JSONArray
 import org.json.JSONObject
@@ -296,8 +298,17 @@ class MainActivity : AppCompatActivity() {
             .put("cvv", binding.cardCvv.text.toString().trim())
 
         postJson("/api/admin/tarjetas", body) { code, json ->
-            binding.txtData.text = if (code in 200..299) "Tarjeta agregada. ID=${json.optInt("id")}" else "Error tarjeta: ${json.optString("error")}" 
-            if (code in 200..299) loadSummary()
+            binding.txtData.text = if (code in 200..299) "Tarjeta agregada. ID=${json.optInt("id")}" else "Error tarjeta: ${json.optString("error")}"
+            if (code in 200..299) {
+                binding.cardAlias.text?.clear()
+                binding.cardNumber.text?.clear()
+                binding.cardMes.text?.clear()
+                binding.cardAnio.text?.clear()
+                binding.cardCvv.text?.clear()
+                Snackbar.make(binding.rootLayout, "Tarjeta agregada", Snackbar.LENGTH_SHORT).show()
+                loadSummary()
+                loadCards()
+            }
         }
     }
 
@@ -528,13 +539,22 @@ class MainActivity : AppCompatActivity() {
                 text = "$alias (ID $cardId)"
                 textSize = 16f
             }
+            val estado = when {
+                ignorada -> "Ignorada"
+                activa -> "Activa"
+                else -> "Inactiva"
+            }
             val meta = TextView(this).apply {
-                val estado = when {
-                    ignorada -> "Ignorada"
-                    activa -> "Activa"
-                    else -> "Inactiva"
-                }
-                text = "$numero | Estado: $estado"
+                text = "$numero | Últ. uso: ${t.optString("updated_at", "N/D")}" 
+            }
+            val metrics = TextView(this).apply {
+                text = "ID: $cardId  •  Mes/Año: ${t.optString("mes")}/${t.optString("anio")}" 
+            }
+            val statusChip = Chip(this).apply {
+                text = estado
+                isCheckable = false
+                isClickable = false
+                setChipBackgroundColorResource(if (estado == "Activa") android.R.color.holo_green_light else if (estado == "Ignorada") android.R.color.holo_orange_light else android.R.color.holo_red_light)
             }
             val actions = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -560,6 +580,8 @@ class MainActivity : AppCompatActivity() {
             actions.addView(btnDelete)
             card.addView(title)
             card.addView(meta)
+            card.addView(metrics)
+            card.addView(statusChip)
             card.addView(actions)
             binding.cardsContainer.addView(card)
         }

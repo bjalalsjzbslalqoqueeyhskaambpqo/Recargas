@@ -17,11 +17,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
+      - name: Setup JDK
+        uses: actions/setup-java@v3
         with:
-          distribution: temurin
           java-version: '17'
+          distribution: 'temurin'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -106,13 +106,8 @@ jobs:
           key_password=$STORE_PASS
           DATA
 
-      - name: Build signed release APK cliente
-        run: |
-          gradle -p recargas/client-android-app assembleRelease \
-            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
-            -Pandroid.injected.signing.store.password="$STORE_PASS" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$STORE_PASS"
+      - name: Build APK
+        run: cd recargas/client-android-app && ./gradlew assembleRelease
 
       - name: Upload client signed APK
         uses: actions/upload-artifact@v4
