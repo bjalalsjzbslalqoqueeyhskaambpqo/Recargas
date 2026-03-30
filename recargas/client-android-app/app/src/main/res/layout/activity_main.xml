@@ -66,18 +66,50 @@
         <TextView android:id="@+id/txtWelcome" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Hola" android:textStyle="bold"/>
         <TextView android:id="@+id/txtSaldo" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Saldo"/>
 
-        <Spinner android:id="@+id/spServicio" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
-        <Spinner android:id="@+id/spMonto" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp"/>
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Servicio seleccionado: Recargas" />
 
-        <EditText
-            android:id="@+id/inputReferencia"
+        <Button
+            android:id="@+id/btnSelectOperator"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
-            android:hint="Referencia"
-            android:inputType="text" />
+            android:text="Seleccionar operador" />
 
-        <Button android:id="@+id/btnRecargar" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Recargar" android:layout_marginTop="8dp"/>
+        <TextView
+            android:id="@+id/txtOperadorSeleccionado"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="Operador: no seleccionado" />
+
+        <Spinner
+            android:id="@+id/spMonto"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:visibility="gone" />
+
+        <EditText
+            android:id="@+id/inputTelefono"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:hint="Número de teléfono (10 dígitos)"
+            android:inputType="number"
+            android:maxLength="10"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnRecargar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Recargar"
+            android:visibility="gone" />
 
         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
             <Button android:id="@+id/btnRefresh" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Actualizar"/>

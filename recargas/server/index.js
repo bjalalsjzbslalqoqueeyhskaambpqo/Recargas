@@ -246,42 +246,66 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
 
   const user = db.prepare('SELECT id, saldo, activo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)
   if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
-  if (Number(user.saldo) < monto) return res.status(400).json({ error: 'Saldo insuficiente.' })
-
-  const tarjetas = db.prepare(
-    `SELECT id, numero, mes, anio, cvv
-     FROM tarjetas
-     WHERE admin_id = ? AND activa = 1 AND ignorada = 0
-     ORDER BY id ASC`
-  ).all(req.userAuth.admin_id)
-  if (tarjetas.length === 0) return res.status(400).json({ error: 'No hay tarjetas activas disponibles.' })
-
-  let resultado
   try {
-    resultado = await bot.procesar({ referencia, monto, tarjetas })
-  } catch (error) {
-    resultado = { ok: false, mensaje: error.message || 'Error al procesar recarga.' }
+    db.prepare('INSERT INTO recarga_locks (usuario_id) VALUES (?)').run(req.userAuth.id)
+  } catch {
+    return res.status(409).json({ error: 'Ya tienes una recarga en proceso. Espera a que termine.' })
   }
 
-  const ok = Boolean(resultado?.ok)
-  const mensaje = String(resultado?.mensaje || (ok ? 'Recarga exitosa' : 'No se pudo completar la recarga')).slice(0, 280)
+  let tarjetas = []
+  try {
+    const saldoActual = Number(
+      db.prepare('SELECT saldo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)?.saldo || 0
+    )
+    if (saldoActual < monto) return res.status(400).json({ error: 'Saldo insuficiente.' })
 
-  db.transaction(() => {
-    if (ok) {
-      db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
+    tarjetas = db.prepare(
+      `SELECT id, numero, mes, anio, cvv
+       FROM tarjetas
+       WHERE admin_id = ? AND activa = 1 AND ignorada = 0
+       ORDER BY id ASC`
+    ).all(req.userAuth.admin_id)
+    if (tarjetas.length === 0) return res.status(400).json({ error: 'No hay tarjetas activas disponibles.' })
+
+    let resultado
+    try {
+      resultado = await bot.procesar({ referencia, monto, tarjetas })
+    } catch {
+      resultado = { ok: false, mensaje: 'No se pudo completar la recarga. Comuníquese con el administrador.' }
     }
-    db.prepare(
-      `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje)
-  })()
 
-  if (Number.isInteger(resultado?.tarjeta_idx)) {
-    const card = tarjetas[resultado.tarjeta_idx]
-    if (card) registerCardResult(card.id, req.userAuth.admin_id, servicio, ok, mensaje)
+    const ok = Boolean(resultado?.ok)
+    const mensaje = ok
+      ? String(resultado?.mensaje || 'Recarga exitosa').slice(0, 280)
+      : 'No se pudo completar la recarga. Comuníquese con el administrador.'
+
+    const txResult = db.transaction(() => {
+      const current = db.prepare('SELECT saldo FROM usuarios WHERE id = ? AND admin_id = ?').get(req.userAuth.id, req.userAuth.admin_id)
+      if (!current) {
+        throw new Error('Usuario no encontrado.')
+      }
+      if (ok && Number(current.saldo) < monto) {
+        throw new Error('Saldo insuficiente al confirmar la recarga.')
+      }
+      if (ok) {
+        db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
+      }
+      db.prepare(
+        `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje)
+      return { ok, mensaje }
+    })()
+
+    if (Number.isInteger(resultado?.tarjeta_idx)) {
+      const card = tarjetas[resultado.tarjeta_idx]
+      if (card) registerCardResult(card.id, req.userAuth.admin_id, servicio, ok, txResult.mensaje)
+    }
+
+    return res.status(txResult.ok ? 200 : 502).json(txResult)
+  } finally {
+    db.prepare('DELETE FROM recarga_locks WHERE usuario_id = ?').run(req.userAuth.id)
   }
-
-  return res.status(ok ? 200 : 502).json({ ok, mensaje })
 })
 
 app.get('/api/admin/perfil', authAdmin, (req, res) => {

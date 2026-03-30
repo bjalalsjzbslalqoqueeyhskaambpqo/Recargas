@@ -3,6 +3,7 @@ package com.recargas.client
 import android.os.Bundle
 import android.view.View
 import android.widget.ArrayAdapter
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.recargas.client.databinding.ActivityMainBinding
 import org.json.JSONArray
@@ -18,6 +19,8 @@ class MainActivity : AppCompatActivity() {
     private var authToken: String? = null
     private val prefs by lazy { getSharedPreferences("client_prefs", MODE_PRIVATE) }
     private var servicios = JSONArray()
+    private var selectedServiceIndex = -1
+    @Volatile private var isRecargaInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,24 +39,21 @@ class MainActivity : AppCompatActivity() {
         binding.btnLogin.setOnClickListener { doLogin() }
         binding.btnRefresh.setOnClickListener { loadMeServiciosHistorial() }
         binding.btnRecargar.setOnClickListener { doRecargar() }
+        binding.btnSelectOperator.setOnClickListener { openOperatorSelector() }
         binding.btnLogout.setOnClickListener {
             authToken = null
             prefs.edit().remove("token").apply()
             showApp(false)
         }
-
-        binding.spServicio.setOnItemSelectedListener(object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
-                setMontos(position)
-            }
-
-            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
-        })
     }
 
     private fun showApp(show: Boolean) {
         binding.loginPanel.visibility = if (show) View.GONE else View.VISIBLE
         binding.appPanel.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) {
+            selectedServiceIndex = -1
+            updateRecargaFormVisibility()
+        }
     }
 
     private fun checkServer() {
@@ -100,9 +100,15 @@ class MainActivity : AppCompatActivity() {
                     binding.txtResult.text = "Error servicios"; return@getJsonArray
                 }
                 servicios = srv
-                val nombres = (0 until srv.length()).map { idx -> srv.getJSONObject(idx).optString("nombre", "servicio") }
-                binding.spServicio.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, nombres)
-                if (srv.length() > 0) setMontos(0)
+                if (srv.length() == 0) {
+                    selectedServiceIndex = -1
+                    binding.txtOperadorSeleccionado.text = "Operador: no disponible"
+                } else if (selectedServiceIndex !in 0 until srv.length()) {
+                    selectedServiceIndex = -1
+                    binding.txtOperadorSeleccionado.text = "Operador: no seleccionado"
+                }
+                if (selectedServiceIndex in 0 until srv.length()) setMontos(selectedServiceIndex)
+                updateRecargaFormVisibility()
 
                 getJsonArray("/api/client/historial") { c3, hist ->
                     if (c3 !in 200..299) {
@@ -128,24 +134,64 @@ class MainActivity : AppCompatActivity() {
         binding.spMonto.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
     }
 
+    private fun updateRecargaFormVisibility() {
+        val visible = selectedServiceIndex in 0 until servicios.length()
+        binding.spMonto.visibility = if (visible) View.VISIBLE else View.GONE
+        binding.inputTelefono.visibility = if (visible) View.VISIBLE else View.GONE
+        binding.btnRecargar.visibility = if (visible) View.VISIBLE else View.GONE
+        binding.btnRecargar.isEnabled = visible && !isRecargaInProgress
+    }
+
+    private fun openOperatorSelector() {
+        if (servicios.length() == 0) {
+            binding.txtResult.text = "No hay operadores disponibles por ahora."
+            return
+        }
+        val nombres = (0 until servicios.length()).map { idx -> servicios.getJSONObject(idx).optString("nombre", "Operador") }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Seleccionar operador")
+            .setItems(nombres) { _, which ->
+                selectedServiceIndex = which
+                binding.txtOperadorSeleccionado.text = "Operador: ${nombres[which]}"
+                setMontos(which)
+                updateRecargaFormVisibility()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
     private fun doRecargar() {
-        val serviceIndex = binding.spServicio.selectedItemPosition
-        if (serviceIndex < 0 || serviceIndex >= servicios.length()) return
+        if (isRecargaInProgress) return
+        val serviceIndex = selectedServiceIndex
+        if (serviceIndex < 0 || serviceIndex >= servicios.length()) {
+            binding.txtResult.text = "Selecciona un operador antes de recargar."
+            return
+        }
         val serviceId = servicios.getJSONObject(serviceIndex).optString("id")
         val monto = binding.spMonto.selectedItem?.toString()?.toDoubleOrNull() ?: 0.0
-        val referencia = binding.inputReferencia.text.toString().trim()
+        val referencia = binding.inputTelefono.text.toString().trim()
+        if (!Regex("^\\d{10}$").matches(referencia)) {
+            binding.txtResult.text = "Ingresa un número de teléfono válido de 10 dígitos."
+            return
+        }
 
         val payload = JSONObject()
             .put("servicio", serviceId)
             .put("monto", monto)
             .put("referencia", referencia)
 
+        isRecargaInProgress = true
+        binding.btnRecargar.isEnabled = false
+        binding.btnRecargar.text = "Procesando..."
         postJson("/api/client/recargar", payload) { code, out ->
             binding.txtResult.text = if (code in 200..299) {
                 "OK: ${out.optString("mensaje", "recarga enviada")}"
             } else {
                 "Error: ${out.optString("error", "falló")}"
             }
+            isRecargaInProgress = false
+            binding.btnRecargar.isEnabled = true
+            binding.btnRecargar.text = "Recargar"
             loadMeServiciosHistorial()
         }
     }

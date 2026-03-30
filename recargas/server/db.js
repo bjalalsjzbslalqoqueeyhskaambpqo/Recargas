@@ -77,6 +77,12 @@ db.exec(`
     FOREIGN KEY(admin_id) REFERENCES admins(id)
   );
 
+  CREATE TABLE IF NOT EXISTS recarga_locks (
+    usuario_id INTEGER PRIMARY KEY,
+    iniciado TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_usuarios_admin ON usuarios(admin_id);
   CREATE INDEX IF NOT EXISTS idx_historial_admin ON historial(admin_id);
   CREATE INDEX IF NOT EXISTS idx_tarjetas_admin ON tarjetas(admin_id);
