@@ -65,9 +65,28 @@ import androidx.lifecycle.ViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 data class Servicio(val id: String, val nombre: String, val disponible: Boolean, val montos: List<Double>)
-data class Movimiento(val servicio: String, val monto: Double, val referencia: String, val fecha: String, val estado: String)
+data class Movimiento(
+    val servicio: String,
+    val monto: Double,
+    val referencia: String,
+    val fecha: String,
+    val estado: String,
+    val mensaje: String = ""
+)
+
+data class UltimaRecarga(
+    val servicio: String,
+    val monto: Double,
+    val referencia: String,
+    val fechaLocal: String,
+    val estado: String,
+    val mensaje: String,
+    val pendiente: Boolean
+)
 
 data class ClientUiState(
     val isLoggedIn: Boolean = false,
@@ -87,6 +106,7 @@ data class ClientUiState(
     val phoneValid: Boolean = false,
     val processingRecarga: Boolean = false,
     val movimientos: List<Movimiento> = emptyList(),
+    val ultimaRecarga: UltimaRecarga? = null,
     val snackbarMessage: String? = null,
     val snackbarSuccess: Boolean = true,
 )
@@ -151,25 +171,40 @@ class ClientViewModel(
             _uiState.update { it.copy(snackbarMessage = "Número inválido (10 dígitos)", snackbarSuccess = false) }
             return
         }
-        _uiState.update { it.copy(processingRecarga = true) }
+        val fechaLocal = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        val pendiente = UltimaRecarga(
+            servicio = servicio.nombre,
+            monto = monto,
+            referencia = state.phone,
+            fechaLocal = fechaLocal,
+            estado = "procesando",
+            mensaje = "Esperando confirmación del servidor...",
+            pendiente = true
+        )
+        _uiState.update { it.copy(processingRecarga = true, ultimaRecarga = pendiente) }
         repository.recargar(token, servicio.id, monto, state.phone) { code, json ->
             val ok = code in 200..299
             _uiState.update {
                 it.copy(
-                    processingRecarga = false,
                     snackbarMessage = if (ok) json.optString("mensaje", "Recarga enviada") else json.optString("error", "Error de red en recarga"),
-                    snackbarSuccess = ok
+                    snackbarSuccess = ok,
+                    ultimaRecarga = (it.ultimaRecarga ?: pendiente).copy(
+                        estado = if (ok) "ok" else "fallo",
+                        mensaje = if (ok) json.optString("mensaje", "Recarga realizada") else json.optString("error", "Recarga fallida"),
+                        pendiente = false
+                    )
                 )
             }
-            refreshData()
+            refreshData { _uiState.update { ui -> ui.copy(processingRecarga = false) } }
         }
     }
 
-    fun refreshData() {
+    fun refreshData(onComplete: (() -> Unit)? = null) {
         val token = _uiState.value.token ?: return
         repository.me(token) { c1, me ->
             if (c1 !in 200..299) {
                 _uiState.update { it.copy(snackbarMessage = me.optString("error", "No se pudo cargar perfil"), snackbarSuccess = false) }
+                onComplete?.invoke()
                 return@me
             }
             _uiState.update {
@@ -193,7 +228,10 @@ class ClientViewModel(
                 _uiState.update { it.copy(servicios = list, selectedServicio = it.selectedServicio ?: list.firstOrNull(), selectedMonto = it.selectedMonto ?: list.firstOrNull()?.montos?.firstOrNull()) }
             }
             repository.historial(token) { c3, hist ->
-                if (c3 !in 200..299) return@historial
+                if (c3 !in 200..299) {
+                    onComplete?.invoke()
+                    return@historial
+                }
                 val movs = (0 until hist.length()).map { i ->
                     val h = hist.getJSONObject(i)
                     Movimiento(
@@ -201,10 +239,27 @@ class ClientViewModel(
                         monto = h.optDouble("monto", 0.0),
                         referencia = h.optString("referencia"),
                         fecha = h.optString("fecha"),
-                        estado = h.optString("estado")
+                        estado = h.optString("estado"),
+                        mensaje = h.optString("mensaje", "")
                     )
                 }
-                _uiState.update { it.copy(movimientos = movs) }
+                _uiState.update {
+                    it.copy(
+                        movimientos = movs,
+                        ultimaRecarga = movs.firstOrNull()?.let { last ->
+                            UltimaRecarga(
+                                servicio = last.servicio,
+                                monto = last.monto,
+                                referencia = last.referencia,
+                                fechaLocal = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")),
+                                estado = last.estado,
+                                mensaje = last.mensaje.ifBlank { "Estado actualizado desde servidor" },
+                                pendiente = false
+                            )
+                        } ?: it.ultimaRecarga
+                    )
+                }
+                onComplete?.invoke()
             }
         }
     }
@@ -295,6 +350,23 @@ private fun HomeScreen(state: ClientUiState, viewModel: ClientViewModel, padding
                 }
             }
             Button(onClick = { showOperators = true }, enabled = !state.processingRecarga, modifier = Modifier.fillMaxWidth()) { Text("Seleccionar operador") }
+            state.ultimaRecarga?.let { last ->
+                Surface(shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Última recarga", style = MaterialTheme.typography.titleMedium)
+                        Text("Operador: ${last.servicio}")
+                        Text("Monto: ${last.monto}")
+                        Text("Número: ${last.referencia}")
+                        Text("Hora local: ${last.fechaLocal}")
+                        AssistChip(
+                            onClick = {},
+                            label = { Text(if (last.pendiente) "procesando" else last.estado) },
+                            enabled = false
+                        )
+                        if (last.mensaje.isNotBlank()) Text(last.mensaje)
+                    }
+                }
+            }
             val montos = state.selectedServicio?.montos ?: emptyList()
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 montos.forEach { monto ->
@@ -315,8 +387,8 @@ private fun HomeScreen(state: ClientUiState, viewModel: ClientViewModel, padding
                 if (state.processingRecarga) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 else Text("Recargar")
             }
-            TextButton(onClick = viewModel::refreshData) { Text("Actualizar") }
-            TextButton(onClick = viewModel::logout) { Text("Salir") }
+            TextButton(onClick = viewModel::refreshData, enabled = !state.processingRecarga) { Text("Actualizar") }
+            TextButton(onClick = viewModel::logout, enabled = !state.processingRecarga) { Text("Salir") }
         }
         if (showOperators) {
             ModalBottomSheet(onDismissRequest = { showOperators = false }, dragHandle = { BottomSheetDefaults.DragHandle() }) {
