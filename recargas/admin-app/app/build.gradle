@@ -9,10 +9,20 @@ if (bootstrapFile.exists()) {
     bootstrapFile.withInputStream { bootstrap.load(it) }
 }
 
-def apiBaseUrl = bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
-def appKey = bootstrap.getProperty('APP_ADMIN_KEY', 'REPLACE_APP_KEY')
-def defaultUser = bootstrap.getProperty('DEFAULT_ADMIN_USER', 'admin')
-def defaultPass = bootstrap.getProperty('DEFAULT_ADMIN_PASSWORD', 'admin123456')
+def firstNonBlank(String... values) {
+    for (value in values) {
+        if (value != null) {
+            def normalized = value.trim()
+            if (!normalized.isEmpty()) return normalized
+        }
+    }
+    return null
+}
+
+def apiBaseUrl = firstNonBlank(System.getenv('API_BASE_URL'), bootstrap.getProperty('API_BASE_URL'), 'http://127.0.0.1:3000')
+def appKey = firstNonBlank(System.getenv('APP_ADMIN_KEY'), bootstrap.getProperty('APP_ADMIN_KEY'), 'REPLACE_APP_KEY')
+def defaultUser = firstNonBlank(System.getenv('DEFAULT_ADMIN_USER'), bootstrap.getProperty('DEFAULT_ADMIN_USER'), 'admin')
+def defaultPass = firstNonBlank(System.getenv('DEFAULT_ADMIN_PASSWORD'), bootstrap.getProperty('DEFAULT_ADMIN_PASSWORD'), 'admin123456')
 
 android {
     namespace 'com.recargas.admin'

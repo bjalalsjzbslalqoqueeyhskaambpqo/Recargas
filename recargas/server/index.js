@@ -17,6 +17,8 @@ const HOST = process.env.BIND_HOST || '0.0.0.0'
 const SECRET = process.env.SECRET
 const APP_ADMIN_KEY = process.env.APP_ADMIN_KEY
 const APP_CLIENT_KEY = process.env.APP_CLIENT_KEY || APP_ADMIN_KEY
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Asuncion'
+const HISTORIAL_MAX_ROWS = Number(process.env.HISTORIAL_MAX_ROWS || 5000)
 
 if (!SECRET || SECRET.length < 32) {
   throw new Error('Debes definir SECRET con al menos 32 caracteres en variables de entorno.')
@@ -131,36 +133,42 @@ function getCardMetrics(cardId) {
   return db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ?').all(cardId)
 }
 
-function maybeIgnoreCard(cardId, adminId) {
-  const metrics = getCardMetrics(cardId)
-  const totalConsecutiveFails = metrics.reduce((acc, row) => acc + Number(row.fallos_consecutivos || 0), 0)
-  const maxServiceConsecutive = metrics.reduce((acc, row) => Math.max(acc, Number(row.fallos_consecutivos || 0)), 0)
-  const totalSuccess = metrics.reduce((acc, row) => acc + Number(row.exitos || 0), 0)
+function nowLocalSql() {
+  const formatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  })
+  const parts = formatter.formatToParts(new Date()).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value
+    return acc
+  }, {})
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
 
-  let reason = ''
-  if (totalConsecutiveFails >= 5) {
-    reason = 'Ignorada automáticamente por 5 fallos consecutivos acumulados.'
-  } else if (totalSuccess >= 1 && maxServiceConsecutive >= 4) {
-    reason = 'Ignorada automáticamente: venía aprobando y luego acumuló 4 fallos consecutivos en un servicio.'
-  }
-  if (!reason) return
-
-  const card = db.prepare('SELECT ignorada, alias, numero FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, adminId)
-  if (!card || Number(card.ignorada) === 1) return
-
-  db.prepare('UPDATE tarjetas SET activa = 0, ignorada = 1, motivo_ignorada = ? WHERE id = ?').run(reason, cardId)
-  const masked = String(card.numero).slice(-4)
-  const msg = `${reason} Tarjeta ${card.alias || ''} ****${masked}`.trim()
-  db.prepare('INSERT INTO notificaciones_admin (admin_id, tipo, mensaje) VALUES (?, ?, ?)').run(adminId, 'tarjeta_ignorada', msg)
+function pruneHistorial(adminId) {
+  db.prepare(
+    `DELETE FROM historial
+     WHERE admin_id = ?
+       AND id NOT IN (
+         SELECT id FROM historial WHERE admin_id = ? ORDER BY id DESC LIMIT ?
+       )`
+  ).run(adminId, adminId, HISTORIAL_MAX_ROWS)
 }
 
 function registerCardResult(cardId, adminId, servicio, ok, detalle) {
   const row = db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ? AND servicio = ?').get(cardId, servicio)
+  const nextConsecutiveFails = ok ? 0 : (row ? Number(row.fallos_consecutivos) + 1 : 1)
   if (!row) {
     db.prepare(
       `INSERT INTO tarjeta_metricas (tarjeta_id, servicio, intentos, exitos, fallos, fallos_consecutivos)
        VALUES (?, ?, 1, ?, ?, ?)`
-    ).run(cardId, servicio, ok ? 1 : 0, ok ? 0 : 1, ok ? 0 : 1)
+    ).run(cardId, servicio, ok ? 1 : 0, ok ? 0 : 1, nextConsecutiveFails)
   } else {
     db.prepare(
       `UPDATE tarjeta_metricas
@@ -170,14 +178,29 @@ function registerCardResult(cardId, adminId, servicio, ok, detalle) {
            fallos_consecutivos = ?,
            actualizado = datetime('now')
        WHERE id = ?`
-    ).run(ok ? 1 : 0, ok ? 0 : 1, ok ? 0 : Number(row.fallos_consecutivos) + 1, row.id)
+    ).run(ok ? 1 : 0, ok ? 0 : 1, nextConsecutiveFails, row.id)
   }
+  db.prepare(
+    `UPDATE tarjetas
+     SET ultimo_uso = ?,
+         ultimo_estado = ?,
+         ultimo_servicio = ?
+     WHERE id = ?`
+  ).run(nowLocalSql(), ok ? 'ok' : 'fallo', servicio, cardId)
   if (detalle) {
     db.prepare(
-      `INSERT INTO historial (admin_id, servicio, estado, mensaje) VALUES (?, ?, ?, ?)`
-    ).run(adminId, servicio, ok ? 'ok_tarjeta' : 'fallo_tarjeta', String(detalle).slice(0, 280))
+      `INSERT INTO historial (admin_id, servicio, estado, mensaje, fecha) VALUES (?, ?, ?, ?, ?)`
+    ).run(adminId, servicio, ok ? 'ok_tarjeta' : 'fallo_tarjeta', String(detalle).slice(0, 280), nowLocalSql())
+    pruneHistorial(adminId)
   }
-  maybeIgnoreCard(cardId, adminId)
+  if (!ok && nextConsecutiveFails === 5) {
+    const card = db.prepare('SELECT alias, numero FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, adminId)
+    if (card) {
+      const masked = String(card.numero).slice(-4)
+      const msg = `Tarjeta ${card.alias || ''} ****${masked} quedó bloqueada para ${servicio} por 5 fallos consecutivos.`.trim()
+      db.prepare('INSERT INTO notificaciones_admin (admin_id, tipo, mensaje, creada) VALUES (?, ?, ?, ?)').run(adminId, 'tarjeta_bloqueada_servicio', msg, nowLocalSql())
+    }
+  }
 }
 
 app.get('/api/status', (_req, res) => {
@@ -277,11 +300,13 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
     if (saldoActual < monto) return res.status(400).json({ error: 'Saldo insuficiente.' })
 
     const tarjetas = db.prepare(
-      `SELECT id, numero, mes, anio, cvv
-       FROM tarjetas
-       WHERE admin_id = ? AND activa = 1 AND ignorada = 0
-       ORDER BY id ASC`
-    ).all(req.userAuth.admin_id)
+      `SELECT t.id, t.numero, t.mes, t.anio, t.cvv
+       FROM tarjetas t
+       LEFT JOIN tarjeta_metricas m ON m.tarjeta_id = t.id AND m.servicio = ?
+       WHERE t.admin_id = ? AND t.activa = 1 AND t.ignorada = 0
+         AND COALESCE(m.fallos_consecutivos, 0) < 5
+       ORDER BY t.id ASC`
+    ).all(servicio, req.userAuth.admin_id)
     if (tarjetas.length === 0) return res.status(400).json({ error: 'No hay tarjetas activas disponibles.' })
 
     let resultado
@@ -302,9 +327,10 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
       if (ok && Number(current.saldo) < monto) throw new Error('Saldo insuficiente al confirmar la recarga.')
       if (ok) db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
       db.prepare(
-        `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje)
+        `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje, fecha)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje, nowLocalSql())
+      pruneHistorial(req.userAuth.admin_id)
       return { ok, mensaje }
     })()
 
@@ -440,11 +466,20 @@ app.get('/api/admin/historial', authAdmin, (req, res) => {
 })
 
 app.get('/api/admin/tarjetas', authAdmin, (req, res) => {
-  const cards = db.prepare('SELECT id, alias, numero, mes, anio, activa, ignorada, motivo_ignorada, creada FROM tarjetas WHERE admin_id = ? ORDER BY id DESC').all(req.admin.id)
+  const cards = db.prepare('SELECT id, alias, numero, mes, anio, activa, ignorada, motivo_ignorada, creada, ultimo_uso, ultimo_estado, ultimo_servicio FROM tarjetas WHERE admin_id = ? ORDER BY id DESC').all(req.admin.id)
   res.json(cards.map(card => ({
     ...card,
+    ultimo_uso: card.ultimo_uso || 'Sin uso',
+    ultimo_estado: card.ultimo_estado || 'sin_datos',
+    ultimo_servicio: card.ultimo_servicio || '-',
     numero: `**** **** **** ${String(card.numero).slice(-4)}`,
-    metricas: getCardMetrics(card.id)
+    metricas: getCardMetrics(card.id).map((m) => ({
+      servicio: m.servicio || '-',
+      intentos: Number(m.intentos || 0),
+      exitos: Number(m.exitos || 0),
+      fallos: Number(m.fallos || 0),
+      fallos_consecutivos: Number(m.fallos_consecutivos || 0)
+    }))
   })))
 })
 
@@ -503,8 +538,4 @@ app.use((err, _req, res, _next) => {
 
 http.createServer(app).listen(PORT, HOST, () => {
   console.log(`API admin escuchando en http://${HOST}:${PORT}`)
-  console.log(`Bots cargados: ${Object.keys(bots).join(', ') || 'ninguno'}`)
-  if (botLoadResult.errors.length > 0) {
-    console.warn('Errores al cargar bots:', botLoadResult.errors)
-  }
 })
