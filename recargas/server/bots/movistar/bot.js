@@ -44,22 +44,22 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
     }, monto)
 
     await page.locator('.pnt-js-btn-recargar').waitFor({ state: 'visible', timeout: 5000 })
-    await page.locator('.pnt-js-btn-recargar').click()
 
-    try {
-      await page.waitForFunction(() => {
-        const t = document.body.innerText
-        return !t.includes('Procesando') && !t.includes('aguarda')
-      }, { timeout: 20000 })
-    } catch(e) {}
+    const [response] = await Promise.all([
+      page.waitForResponse(
+        res => res.url().includes('cargarCredito') && res.request().method() === 'GET',
+        { timeout: 25000 }
+      ),
+      page.locator('.pnt-js-btn-recargar').click()
+    ])
 
-    const texto = await page.evaluate(() => document.body.innerText)
+    const data = await response.json()
     await browser.close()
 
-    if (texto.includes('Listo') || texto.includes('recargaste') || texto.includes('exitosa')) {
+    if (!data.isError) {
       return { ok: true, mensaje: 'Recarga exitosa' }
     }
-    return { ok: false, mensaje: 'Tarjeta rechazada' }
+    return { ok: false, mensaje: data.mensaje || 'Tarjeta rechazada' }
 
   } catch(e) {
     await browser.close()
