@@ -185,6 +185,36 @@ class AdminViewModel(private val prefs: SharedPreferences) : ViewModel() {
         }
     }
 
+    fun updateUserData(userId: Int, usuario: String, password: String?, saldo: Double, activo: Boolean) {
+        val body = JSONObject()
+            .put("usuario", usuario)
+            .put("saldo", saldo)
+            .put("activo", if (activo) 1 else 0)
+        if (!password.isNullOrBlank()) body.put("password", password)
+        patchJson("/api/admin/usuarios/$userId", body) { code, json ->
+            _uiState.update { it.copy(snackbar = if (code in 200..299) "Usuario actualizado" else json.optString("error", "Error al actualizar usuario")) }
+            if (code in 200..299) loadUsers()
+        }
+    }
+
+    fun adjustUserSaldo(userId: Int, delta: Double) {
+        patchJson("/api/admin/usuarios/$userId/saldo", JSONObject().put("delta", delta)) { code, json ->
+            _uiState.update {
+                it.copy(
+                    snackbar = if (code in 200..299) "Saldo actualizado" else json.optString("error", "Error al actualizar saldo")
+                )
+            }
+            if (code in 200..299) loadUsers()
+        }
+    }
+
+    fun deleteUser(userId: Int) {
+        deleteJson("/api/admin/usuarios/$userId") { code, json ->
+            _uiState.update { it.copy(snackbar = if (code in 200..299) "Usuario eliminado" else json.optString("error", "Error al eliminar usuario")) }
+            if (code in 200..299) loadUsers()
+        }
+    }
+
     fun addCard() {
         val s = _uiState.value
         val body = JSONObject().put("alias", s.cardAlias).put("numero", s.cardNumero).put("mes", s.cardMes).put("anio", s.cardAnio).put("cvv", s.cardCvv)
@@ -356,7 +386,7 @@ fun AdminApp(state: AdminUiState, vm: AdminViewModel) {
             }
             when (state.tab) {
                 AdminTab.Crear -> CreateTab(state, vm)
-                AdminTab.Usuarios -> UsersTab(state)
+                AdminTab.Usuarios -> UsersTab(state, vm)
                 AdminTab.Tarjetas -> CardsTab(state, vm)
                 AdminTab.Historial -> HistoryTab(state, vm)
             }
@@ -405,7 +435,60 @@ private fun CreateTab(state: AdminUiState, vm: AdminViewModel) {
 }
 
 @Composable
-private fun UsersTab(state: AdminUiState) {
+private fun UsersTab(state: AdminUiState, vm: AdminViewModel) {
+    var editUser by remember { mutableStateOf<AdminUser?>(null) }
+    var deleteUser by remember { mutableStateOf<AdminUser?>(null) }
+
+    if (editUser != null) {
+        var usuario by remember(editUser) { mutableStateOf(editUser!!.usuario) }
+        var saldo by remember(editUser) { mutableStateOf(editUser!!.saldo.toString()) }
+        var password by remember(editUser) { mutableStateOf("") }
+        var activo by remember(editUser) { mutableStateOf(editUser!!.activo) }
+        AlertDialog(
+            onDismissRequest = { editUser = null },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.updateUserData(
+                        userId = editUser!!.id,
+                        usuario = usuario,
+                        password = password.ifBlank { null },
+                        saldo = saldo.toDoubleOrNull() ?: editUser!!.saldo,
+                        activo = activo
+                    )
+                    editUser = null
+                }) { Text("Guardar") }
+            },
+            dismissButton = { TextButton(onClick = { editUser = null }) { Text("Cancelar") } },
+            title = { Text("Editar usuario") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = usuario, onValueChange = { usuario = it }, label = { Text("Usuario") })
+                    OutlinedTextField(value = saldo, onValueChange = { saldo = it }, label = { Text("Saldo") })
+                    OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Nueva contraseña (opcional)") })
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(if (activo) "Activo" else "Inactivo")
+                        TextButton(onClick = { activo = !activo }) { Text("Cambiar") }
+                    }
+                }
+            }
+        )
+    }
+
+    if (deleteUser != null) {
+        AlertDialog(
+            onDismissRequest = { deleteUser = null },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteUser(deleteUser!!.id)
+                    deleteUser = null
+                }) { Text("Eliminar") }
+            },
+            dismissButton = { TextButton(onClick = { deleteUser = null }) { Text("Cancelar") } },
+            title = { Text("Eliminar usuario") },
+            text = { Text("¿Seguro que deseas eliminar a ${deleteUser!!.usuario}?") }
+        )
+    }
+
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         items(state.users) { u ->
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1D27))) {
@@ -413,6 +496,12 @@ private fun UsersTab(state: AdminUiState) {
                     Text(u.usuario, color = Color(0xFFF1F3F9))
                     Text("Saldo: ${u.saldo}", color = if (u.saldo > 0) Color(0xFF22C55E) else Color(0xFF8B92A9))
                     AssistChip(onClick = {}, label = { Text(if (u.activo) "ACTIVO" else "INACTIVO") }, enabled = false)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = { vm.adjustUserSaldo(u.id, 50.0) }) { Text("+50") }
+                        TextButton(onClick = { vm.adjustUserSaldo(u.id, -50.0) }) { Text("-50") }
+                        TextButton(onClick = { editUser = u }) { Text("Editar") }
+                        TextButton(onClick = { deleteUser = u }) { Text("Eliminar") }
+                    }
                 }
             }
         }
