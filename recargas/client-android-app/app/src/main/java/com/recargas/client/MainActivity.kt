@@ -1,5 +1,3 @@
-xception) { JSONArray() }
-}
 package com.recargas.client
 
 import android.os.Bundle
@@ -216,7 +214,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnRecargar.isEnabled = false
         binding.btnSelectOperator.isEnabled = false
         binding.btnRecargar.text = "Procesando..."
-        binding.txtResult.text = "Procesando recarga, esto puede tardar hasta 2 minutos max..."
+        binding.txtResult.text = "Procesando recarga, esto puede tardar hasta 2 minutos..."
 
         postJson("/api/client/recargar", payload, readTimeoutMs = 120_000) { code, out ->
             binding.txtResult.text = if (code in 200..299) {
