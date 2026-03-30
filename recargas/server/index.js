@@ -17,6 +17,8 @@ const HOST = process.env.BIND_HOST || '0.0.0.0'
 const SECRET = process.env.SECRET
 const APP_ADMIN_KEY = process.env.APP_ADMIN_KEY
 const APP_CLIENT_KEY = process.env.APP_CLIENT_KEY || APP_ADMIN_KEY
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Asuncion'
+const HISTORIAL_MAX_ROWS = Number(process.env.HISTORIAL_MAX_ROWS || 5000)
 
 if (!SECRET || SECRET.length < 32) {
   throw new Error('Debes definir SECRET con al menos 32 caracteres en variables de entorno.')
@@ -131,6 +133,34 @@ function getCardMetrics(cardId) {
   return db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ?').all(cardId)
 }
 
+function nowLocalSql() {
+  const formatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  })
+  const parts = formatter.formatToParts(new Date()).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value
+    return acc
+  }, {})
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
+
+function pruneHistorial(adminId) {
+  db.prepare(
+    `DELETE FROM historial
+     WHERE admin_id = ?
+       AND id NOT IN (
+         SELECT id FROM historial WHERE admin_id = ? ORDER BY id DESC LIMIT ?
+       )`
+  ).run(adminId, adminId, HISTORIAL_MAX_ROWS)
+}
+
 function registerCardResult(cardId, adminId, servicio, ok, detalle) {
   const row = db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ? AND servicio = ?').get(cardId, servicio)
   const nextConsecutiveFails = ok ? 0 : (row ? Number(row.fallos_consecutivos) + 1 : 1)
@@ -152,22 +182,23 @@ function registerCardResult(cardId, adminId, servicio, ok, detalle) {
   }
   db.prepare(
     `UPDATE tarjetas
-     SET ultimo_uso = datetime('now'),
+     SET ultimo_uso = ?,
          ultimo_estado = ?,
          ultimo_servicio = ?
      WHERE id = ?`
-  ).run(ok ? 'ok' : 'fallo', servicio, cardId)
+  ).run(nowLocalSql(), ok ? 'ok' : 'fallo', servicio, cardId)
   if (detalle) {
     db.prepare(
-      `INSERT INTO historial (admin_id, servicio, estado, mensaje) VALUES (?, ?, ?, ?)`
-    ).run(adminId, servicio, ok ? 'ok_tarjeta' : 'fallo_tarjeta', String(detalle).slice(0, 280))
+      `INSERT INTO historial (admin_id, servicio, estado, mensaje, fecha) VALUES (?, ?, ?, ?, ?)`
+    ).run(adminId, servicio, ok ? 'ok_tarjeta' : 'fallo_tarjeta', String(detalle).slice(0, 280), nowLocalSql())
+    pruneHistorial(adminId)
   }
   if (!ok && nextConsecutiveFails === 5) {
     const card = db.prepare('SELECT alias, numero FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, adminId)
     if (card) {
       const masked = String(card.numero).slice(-4)
       const msg = `Tarjeta ${card.alias || ''} ****${masked} quedó bloqueada para ${servicio} por 5 fallos consecutivos.`.trim()
-      db.prepare('INSERT INTO notificaciones_admin (admin_id, tipo, mensaje) VALUES (?, ?, ?)').run(adminId, 'tarjeta_bloqueada_servicio', msg)
+      db.prepare('INSERT INTO notificaciones_admin (admin_id, tipo, mensaje, creada) VALUES (?, ?, ?, ?)').run(adminId, 'tarjeta_bloqueada_servicio', msg, nowLocalSql())
     }
   }
 }
@@ -296,9 +327,10 @@ app.post('/api/client/recargar', authUser, async (req, res) => {
       if (ok && Number(current.saldo) < monto) throw new Error('Saldo insuficiente al confirmar la recarga.')
       if (ok) db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(monto, req.userAuth.id)
       db.prepare(
-        `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje)
+        `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje, fecha)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(req.userAuth.id, req.userAuth.admin_id, servicio, referencia, monto, ok ? 'ok' : 'fallo', mensaje, nowLocalSql())
+      pruneHistorial(req.userAuth.admin_id)
       return { ok, mensaje }
     })()
 
@@ -497,8 +529,4 @@ app.use((err, _req, res, _next) => {
 
 http.createServer(app).listen(PORT, HOST, () => {
   console.log(`API admin escuchando en http://${HOST}:${PORT}`)
-  console.log(`Bots cargados: ${Object.keys(bots).join(', ') || 'ninguno'}`)
-  if (botLoadResult.errors.length > 0) {
-    console.warn('Errores al cargar bots:', botLoadResult.errors)
-  }
 })

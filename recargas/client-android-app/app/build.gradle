@@ -50,10 +50,6 @@ def defaultClientUser = firstNonBlank(
     bootstrap.getProperty('DEFAULT_CLIENT_USER'),
     'cliente_demo'
 )
-def configSource = bootstrapInfo.loadedFrom != null ? bootstrapInfo.loadedFrom.absolutePath : 'defaults/env'
-
-println("[client-app] Config source: ${configSource}")
-println("[client-app] API_BASE_URL: ${apiBaseUrl}")
 
 android {
     namespace 'com.recargas.client'
