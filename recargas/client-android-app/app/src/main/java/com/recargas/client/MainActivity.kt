@@ -1,3 +1,5 @@
+xception) { JSONArray() }
+}
 package com.recargas.client
 
 import android.os.Bundle
@@ -21,6 +23,7 @@ class MainActivity : AppCompatActivity() {
     private var servicios = JSONArray()
     private var selectedServiceIndex = -1
     @Volatile private var isRecargaInProgress = false
+
     private fun fallbackServicios(): JSONArray {
         val movistar = JSONObject()
             .put("id", "movistar")
@@ -74,8 +77,12 @@ class MainActivity : AppCompatActivity() {
             try {
                 val conn = URL("${BuildConfig.API_BASE_URL}/api/status").openConnection() as HttpURLConnection
                 conn.requestMethod = "GET"
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
                 val code = conn.responseCode
-                runOnUiThread { binding.txtServer.text = if (code in 200..299) "Servidor: conectado" else "Servidor: error HTTP $code" }
+                runOnUiThread {
+                    binding.txtServer.text = if (code in 200..299) "Servidor: conectado" else "Servidor: error HTTP $code"
+                }
             } catch (e: Exception) {
                 runOnUiThread { binding.txtServer.text = "Servidor: sin conexión (${e.message})" }
             }
@@ -103,10 +110,11 @@ class MainActivity : AppCompatActivity() {
     private fun loadMeServiciosHistorial() {
         getJson("/api/client/me") { code, me ->
             if (code !in 200..299) {
-                binding.txtResult.text = "Error perfil: ${me.optString("error")}"; return@getJson
+                binding.txtResult.text = "Error perfil: ${me.optString("error")}"
+                return@getJson
             }
             binding.txtWelcome.text = "Hola, ${me.optString("usuario", "cliente")}"
-            binding.txtSaldo.text = "Saldo: \$${"%.2f".format(me.optDouble("saldo", 0.0))}"
+            binding.txtSaldo.text = "Saldo: \$${" %.2f".format(me.optDouble("saldo", 0.0))}"
 
             getJsonArray("/api/client/servicios") { c2, srv ->
                 servicios = if (c2 in 200..299 && srv.length() > 0) srv else fallbackServicios()
@@ -125,7 +133,8 @@ class MainActivity : AppCompatActivity() {
 
                 getJsonArray("/api/client/historial") { c3, hist ->
                     if (c3 !in 200..299) {
-                        binding.txtHistorial.text = "No disponible"; return@getJsonArray
+                        binding.txtHistorial.text = "No disponible"
+                        return@getJsonArray
                     }
                     binding.txtHistorial.text = if (hist.length() == 0) "Sin movimientos" else {
                         buildString {
@@ -205,8 +214,11 @@ class MainActivity : AppCompatActivity() {
 
         isRecargaInProgress = true
         binding.btnRecargar.isEnabled = false
+        binding.btnSelectOperator.isEnabled = false
         binding.btnRecargar.text = "Procesando..."
-        postJson("/api/client/recargar", payload) { code, out ->
+        binding.txtResult.text = "Procesando recarga, esto puede tardar hasta 2 minutos max..."
+
+        postJson("/api/client/recargar", payload, readTimeoutMs = 120_000) { code, out ->
             binding.txtResult.text = if (code in 200..299) {
                 "OK: ${out.optString("mensaje", "recarga enviada")}"
             } else {
@@ -214,30 +226,41 @@ class MainActivity : AppCompatActivity() {
             }
             isRecargaInProgress = false
             binding.btnRecargar.isEnabled = true
+            binding.btnSelectOperator.isEnabled = true
             binding.btnRecargar.text = "Recargar"
             loadMeServiciosHistorial()
         }
     }
 
     private fun getJson(path: String, onDone: (Int, JSONObject) -> Unit) {
-        request(path, "GET", null) { code, raw ->
-            onDone(code, parseJson(raw))
-        }
+        request(path, "GET", null) { code, raw -> onDone(code, parseJson(raw)) }
     }
 
     private fun getJsonArray(path: String, onDone: (Int, JSONArray) -> Unit) {
-        request(path, "GET", null) { code, raw ->
-            onDone(code, parseArray(raw))
-        }
+        request(path, "GET", null) { code, raw -> onDone(code, parseArray(raw)) }
     }
 
-    private fun postJson(path: String, body: JSONObject, withAuth: Boolean = true, onDone: (Int, JSONObject) -> Unit) {
-        request(path, "POST", body.toString(), withAuth) { code, raw ->
+    private fun postJson(
+        path: String,
+        body: JSONObject,
+        withAuth: Boolean = true,
+        readTimeoutMs: Int = 8000,
+        onDone: (Int, JSONObject) -> Unit
+    ) {
+        request(path, "POST", body.toString(), withAuth, readTimeoutMs = readTimeoutMs) { code, raw ->
             onDone(code, parseJson(raw))
         }
     }
 
-    private fun request(path: String, method: String, body: String?, withAuth: Boolean = true, onDone: (Int, String) -> Unit) {
+    private fun request(
+        path: String,
+        method: String,
+        body: String?,
+        withAuth: Boolean = true,
+        connectTimeoutMs: Int = 8000,
+        readTimeoutMs: Int = 8000,
+        onDone: (Int, String) -> Unit
+    ) {
         val token = authToken
         thread {
             try {
@@ -247,8 +270,8 @@ class MainActivity : AppCompatActivity() {
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.setRequestProperty("X-App-Key", BuildConfig.APP_CLIENT_KEY)
                 if (withAuth && token != null) conn.setRequestProperty("Authorization", "Bearer $token")
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
+                conn.connectTimeout = connectTimeoutMs
+                conn.readTimeout = readTimeoutMs
 
                 if (body != null) {
                     conn.doOutput = true
@@ -256,7 +279,8 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val code = conn.responseCode
-                val text = (if (code in 200..299) conn.inputStream else conn.errorStream).bufferedReader().use(BufferedReader::readText)
+                val text = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    .bufferedReader().use(BufferedReader::readText)
                 runOnUiThread { onDone(code, text) }
             } catch (e: Exception) {
                 runOnUiThread { onDone(500, "{\"error\":\"${e.message}\"}") }
