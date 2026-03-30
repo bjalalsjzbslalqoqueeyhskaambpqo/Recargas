@@ -219,7 +219,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$TARGET_DIR
-ExecStart=/usr/bin/env npm start
+ExecStart=/usr/bin/env node server/index.js
+Environment=HOME=$TARGET_DIR
 Restart=always
 RestartSec=3
 EnvironmentFile=$ENV_FILE
@@ -245,7 +246,7 @@ SERVICE
 else
   log "systemctl no disponible."
   echo "[5/6] Arranque manual:"
-  echo "  cd $TARGET_DIR && sudo npm start"
+  echo "  cd $TARGET_DIR && sudo node server/index.js"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
