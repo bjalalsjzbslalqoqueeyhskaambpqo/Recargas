@@ -2,6 +2,7 @@ package com.recargas.client
 
 import android.content.SharedPreferences
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -382,7 +383,16 @@ private fun HomeScreen(state: ClientUiState, viewModel: ClientViewModel, padding
             }
             Button(onClick = { showOperators = true }, enabled = !state.processingRecarga, modifier = Modifier.fillMaxWidth()) { Text("Seleccionar operador") }
             state.ultimaRecarga?.let { last ->
-                Surface(shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
+                val statusColor = when {
+                    last.pendiente -> Color(0xFFFFB300)
+                    last.estado.equals("ok", true) -> Color(0xFF43A047)
+                    else -> Color(0xFFE53935)
+                }
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    tonalElevation = 4.dp,
+                    modifier = Modifier.fillMaxWidth().border(1.dp, statusColor.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                ) {
                     Column(Modifier.padding(12.dp)) {
                         Text("Última recarga", style = MaterialTheme.typography.titleMedium)
                         Text("Operador: ${last.servicio}")
@@ -425,7 +435,26 @@ private fun HomeScreen(state: ClientUiState, viewModel: ClientViewModel, padding
             ModalBottomSheet(onDismissRequest = { showOperators = false }, dragHandle = { BottomSheetDefaults.DragHandle() }) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     state.servicios.forEach { srv ->
-                        AssistChip(onClick = { viewModel.selectServicio(srv); showOperators = false }, label = { Text(srv.nombre) }, leadingIcon = { Icon(Icons.Default.Phone, null) })
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            tonalElevation = 3.dp,
+                            modifier = Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Phone, null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(srv.nombre)
+                                }
+                                Button(onClick = { viewModel.selectServicio(srv); showOperators = false }) {
+                                    Text("Usar")
+                                }
+                            }
+                        }
                     }
                 }
             }

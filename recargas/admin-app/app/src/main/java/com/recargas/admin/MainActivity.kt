@@ -545,7 +545,10 @@ class MainActivity : AppCompatActivity() {
                 else -> "Inactiva"
             }
             val meta = TextView(this).apply {
-                text = "$numero | Últ. uso: ${t.optString("updated_at", "N/D")}" 
+                val ultUso = t.optString("ultimo_uso", "N/D")
+                val ultEstado = t.optString("ultimo_estado", "-")
+                val ultServicio = t.optString("ultimo_servicio", "-")
+                text = "$numero | Últ. uso: $ultUso | Estado: $ultEstado | Servicio: $ultServicio"
             }
             val metrics = TextView(this).apply {
                 text = "ID: $cardId  •  Mes/Año: ${t.optString("mes")}/${t.optString("anio")}" 
