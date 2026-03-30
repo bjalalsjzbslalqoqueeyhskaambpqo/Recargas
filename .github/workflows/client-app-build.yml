@@ -106,8 +106,13 @@ jobs:
           key_password=$STORE_PASS
           DATA
 
-      - name: Build APK
-        run: gradle -p recargas/client-android-app assembleRelease
+      - name: Build signed APK
+        run: |
+          gradle -p recargas/client-android-app assembleRelease \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$STORE_PASS" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$STORE_PASS"
 
       - name: Upload client signed APK
         uses: actions/upload-artifact@v4
