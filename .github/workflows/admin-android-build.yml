@@ -29,7 +29,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Crear archivos locales de entorno
+      - name: Crear/actualizar bootstrap local admin
         working-directory: recargas/admin-app
         env:
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
@@ -38,17 +38,41 @@ jobs:
           DEFAULT_ADMIN_PASSWORD: ${{ secrets.DEFAULT_ADMIN_PASSWORD }}
         run: |
           mkdir -p local
+          BOOTSTRAP_FILE="local/bootstrap.properties"
 
-          cat > local/bootstrap.properties <<DATA
-          API_BASE_URL=${API_BASE_URL:-http://127.0.0.1:3000}
-          APP_ADMIN_KEY=${APP_ADMIN_KEY:-REPLACE_APP_KEY}
-          DEFAULT_ADMIN_USER=${DEFAULT_ADMIN_USER:-admin}
-          DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-admin123456}
-          DATA
+          if [ ! -f "$BOOTSTRAP_FILE" ]; then
+            printf '%s\n' \
+              'API_BASE_URL=http://127.0.0.1:3000' \
+              'APP_ADMIN_KEY=REPLACE_APP_KEY' \
+              'DEFAULT_ADMIN_USER=admin' \
+              'DEFAULT_ADMIN_PASSWORD=admin123456' \
+              > "$BOOTSTRAP_FILE"
+          fi
 
-          cat > local.properties <<DATA
-          sdk.dir=$ANDROID_SDK_ROOT
-          DATA
+          set_prop() {
+            key="$1"
+            value="$2"
+            if [ -z "$value" ]; then
+              return
+            fi
+
+            if grep -q "^${key}=" "$BOOTSTRAP_FILE"; then
+              sed -i "s#^${key}=.*#${key}=${value}#" "$BOOTSTRAP_FILE"
+            else
+              printf '%s=%s\n' "$key" "$value" >> "$BOOTSTRAP_FILE"
+            fi
+          }
+
+          # Solo sobreescribir con secretos si realmente existen.
+          set_prop "API_BASE_URL" "$API_BASE_URL"
+          set_prop "APP_ADMIN_KEY" "$APP_ADMIN_KEY"
+          set_prop "DEFAULT_ADMIN_USER" "$DEFAULT_ADMIN_USER"
+          set_prop "DEFAULT_ADMIN_PASSWORD" "$DEFAULT_ADMIN_PASSWORD"
+
+          echo "bootstrap usado:"
+          cat "$BOOTSTRAP_FILE"
+
+          printf '%s\n' "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
       - name: Instalar dependencias Android requeridas
         run: |
