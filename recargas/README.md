@@ -1,5 +1,7 @@
 # Recargas - Admin API + App Android Admin
 
+> Estado consolidado del proyecto (incluye qué está hecho vs pendiente de cliente nativo): `docs/ESTADO_PROYECTO.md`.
+
 ## Instalación del servidor (ahora sí despliega API)
 Ejecuta:
 
