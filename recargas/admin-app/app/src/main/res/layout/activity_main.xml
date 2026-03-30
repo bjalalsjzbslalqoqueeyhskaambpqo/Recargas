@@ -145,6 +145,12 @@
                     <EditText android:id="@+id/cardCvv" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="CVV" />
                     <Button android:id="@+id/btnAddCard" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Agregar tarjeta" />
                     <Button android:id="@+id/btnTarjetas" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Ver tarjetas" />
+                    <LinearLayout
+                        android:id="@+id/cardsContainer"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:layout_marginTop="8dp" />
                 </LinearLayout>
 
                 <LinearLayout

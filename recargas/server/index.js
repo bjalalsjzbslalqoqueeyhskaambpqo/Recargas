@@ -214,8 +214,11 @@ app.get('/api/client/me', authUser, (req, res) => {
 })
 
 app.get('/api/client/servicios', authUser, (req, res) => {
-  const disponibles = CATALOGO_SERVICIOS.filter((item) => Boolean(bots[item.id]))
-  res.json(disponibles)
+  const catalogo = CATALOGO_SERVICIOS.map((item) => ({
+    ...item,
+    disponible: Boolean(bots[item.id])
+  }))
+  res.json(catalogo)
 })
 
 app.get('/api/client/historial', authUser, (req, res) => {

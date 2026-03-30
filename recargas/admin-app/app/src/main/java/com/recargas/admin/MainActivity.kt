@@ -499,12 +499,92 @@ class MainActivity : AppCompatActivity() {
                 return@authorizedGet
             }
             val arr = JSONArray(raw)
-            val lines = mutableListOf("Tarjetas (${arr.length()}):")
-            for (i in 0 until minOf(arr.length(), 20)) {
-                val t = arr.getJSONObject(i)
-                lines.add("- ${t.optString("numero")} | activa=${t.optInt("activa")} | ignorada=${t.optInt("ignorada")}")
+            renderCards(arr)
+            binding.txtData.text = "Tarjetas cargadas: ${arr.length()}"
+        }
+    }
+
+    private fun renderCards(arr: JSONArray) {
+        binding.cardsContainer.removeAllViews()
+        if (arr.length() == 0) {
+            val empty = TextView(this).apply { text = "No hay tarjetas." }
+            binding.cardsContainer.addView(empty)
+            return
+        }
+
+        for (i in 0 until arr.length()) {
+            val t = arr.getJSONObject(i)
+            val cardId = t.optInt("id")
+            val alias = t.optString("alias", "").ifBlank { "Sin alias" }
+            val numero = t.optString("numero")
+            val activa = t.optInt("activa") == 1
+            val ignorada = t.optInt("ignorada") == 1
+
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(20, 16, 20, 16)
             }
-            binding.txtData.text = lines.joinToString("\n")
+            val title = TextView(this).apply {
+                text = "$alias (ID $cardId)"
+                textSize = 16f
+            }
+            val meta = TextView(this).apply {
+                val estado = when {
+                    ignorada -> "Ignorada"
+                    activa -> "Activa"
+                    else -> "Inactiva"
+                }
+                text = "$numero | Estado: $estado"
+            }
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            val btnToggle = Button(this).apply {
+                text = if (activa) "Deshabilitar" else "Habilitar"
+                isEnabled = !ignorada
+                setOnClickListener { patchCardActiva(cardId, !activa, alias) }
+            }
+            val btnDelete = Button(this).apply {
+                text = "Eliminar"
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Eliminar tarjeta")
+                        .setMessage("¿Eliminar la tarjeta $alias ($numero)?")
+                        .setPositiveButton("Eliminar") { _, _ -> deleteCard(cardId, alias) }
+                        .setNegativeButton("Cancelar", null)
+                        .show()
+                }
+            }
+
+            actions.addView(btnToggle)
+            actions.addView(btnDelete)
+            card.addView(title)
+            card.addView(meta)
+            card.addView(actions)
+            binding.cardsContainer.addView(card)
+        }
+    }
+
+    private fun patchCardActiva(cardId: Int, activa: Boolean, alias: String) {
+        patchJson("/api/admin/tarjetas/$cardId/activa", JSONObject().put("activa", if (activa) 1 else 0)) { code, json ->
+            if (code in 200..299) {
+                binding.txtData.text = "Tarjeta ${if (activa) "habilitada" else "deshabilitada"}: $alias"
+                loadCards()
+            } else {
+                binding.txtData.text = "Error tarjeta $alias: ${json.optString("error")}"
+            }
+        }
+    }
+
+    private fun deleteCard(cardId: Int, alias: String) {
+        deleteJson("/api/admin/tarjetas/$cardId") { code, json ->
+            if (code in 200..299) {
+                binding.txtData.text = "Tarjeta eliminada: $alias"
+                loadCards()
+                loadSummary()
+            } else {
+                binding.txtData.text = "Error al eliminar tarjeta $alias: ${json.optString("error")}"
+            }
         }
     }
 
