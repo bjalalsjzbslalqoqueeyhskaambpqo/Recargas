@@ -1,0 +1,63 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+def bootstrapFile = file("$rootDir/local/bootstrap.properties")
+def bootstrap = new Properties()
+if (bootstrapFile.exists()) {
+    bootstrapFile.withInputStream { bootstrap.load(it) }
+}
+
+def apiBaseUrl = bootstrap.getProperty('API_BASE_URL', 'http://127.0.0.1:3000')
+def appKey = bootstrap.getProperty('APP_ADMIN_KEY', 'REPLACE_APP_KEY')
+def defaultUser = bootstrap.getProperty('DEFAULT_ADMIN_USER', 'admin')
+def defaultPass = bootstrap.getProperty('DEFAULT_ADMIN_PASSWORD', 'admin123456')
+
+android {
+    namespace 'com.recargas.admin'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.recargas.admin'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+
+        buildConfigField 'String', 'API_BASE_URL', '"' + apiBaseUrl + '"'
+        buildConfigField 'String', 'APP_ADMIN_KEY', '"' + appKey + '"'
+        buildConfigField 'String', 'DEFAULT_ADMIN_USER', '"' + defaultUser + '"'
+        buildConfigField 'String', 'DEFAULT_ADMIN_PASSWORD', '"' + defaultPass + '"'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        buildConfig true
+        viewBinding true
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+}

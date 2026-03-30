@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Admin Recargas"
+        android:textSize="22sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/txtServer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Servidor: comprobando..." />
+
+    <LinearLayout
+        android:id="@+id/loginPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="10dp">
+
+        <EditText
+            android:id="@+id/inputUser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Usuario admin" />
+
+        <EditText
+            android:id="@+id/inputPass"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="Password admin"
+            android:inputType="textPassword" />
+
+        <Button
+            android:id="@+id/btnLogin"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Ingresar" />
+
+        <TextView
+            android:id="@+id/txtStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Estado: listo" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/dashboardPanel"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:visibility="gone"
+        android:layout_marginTop="10dp">
+
+        <TextView
+            android:id="@+id/txtWelcome"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Bienvenido" />
+
+        <TextView
+            android:id="@+id/txtSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Resumen" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btnSecCreate" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Crear" />
+                <Button android:id="@+id/btnSecUsers" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Usuarios" />
+                <Button android:id="@+id/btnSecCards" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Tarjetas" />
+                <Button android:id="@+id/btnSecHistory" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Historial" />
+                <Button android:id="@+id/btnSecNotif" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Notifs" />
+                <Button android:id="@+id/btnSecSettings" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Ajustes" />
+            </LinearLayout>
+        </HorizontalScrollView>
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:layout_marginTop="8dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:id="@+id/secCreateUser"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Crear usuario" />
+                    <EditText android:id="@+id/newUser" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Usuario" />
+                    <EditText android:id="@+id/newPass" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Password" android:inputType="textPassword" />
+                    <EditText android:id="@+id/newSaldo" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Saldo inicial" android:inputType="numberDecimal" />
+                    <Button android:id="@+id/btnCreateUser" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Crear usuario" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/secUsers"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+                    <Button android:id="@+id/btnReloadUsers" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Recargar usuarios" />
+                    <LinearLayout android:id="@+id/usersContainer" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/secCards"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+                    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Agregar tarjeta" />
+                    <EditText android:id="@+id/cardAlias" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Alias" />
+                    <EditText android:id="@+id/cardNumber" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Número" />
+                    <EditText android:id="@+id/cardMes" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Mes" />
+                    <EditText android:id="@+id/cardAnio" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Año" />
+                    <EditText android:id="@+id/cardCvv" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="CVV" />
+                    <Button android:id="@+id/btnAddCard" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Agregar tarjeta" />
+                    <Button android:id="@+id/btnTarjetas" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Ver tarjetas" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/secHistory"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+                    <Button android:id="@+id/btnHistorial" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Ver historial" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/secNotif"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+                    <Button android:id="@+id/btnNotif" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Ver notificaciones" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/secSettings"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+                    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Actualizar mis credenciales" />
+                    <EditText android:id="@+id/meUser" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Nuevo usuario (opcional)" />
+                    <EditText android:id="@+id/mePass" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Nueva password (opcional)" android:inputType="textPassword" />
+                    <Button android:id="@+id/btnUpdateMe" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Guardar mis credenciales" />
+                    <Button android:id="@+id/btnRefresh" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Actualizar resumen" />
+                    <Button android:id="@+id/btnLogout" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Salir" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/txtData"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="Datos..." />
+            </LinearLayout>
+        </ScrollView>
+    </LinearLayout>
+</LinearLayout>
