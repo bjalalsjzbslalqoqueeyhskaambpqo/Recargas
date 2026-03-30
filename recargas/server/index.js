@@ -27,6 +27,7 @@ if (!APP_ADMIN_KEY || APP_ADMIN_KEY.length < 24) {
 app.disable('x-powered-by')
 app.use(helmet())
 app.use(express.json({ limit: '20kb' }))
+app.use('/client', express.static(path.join(__dirname, '../client-app')))
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -215,6 +216,17 @@ app.get('/api/client/servicios', authUser, (_req, res) => {
     montos: Array.isArray(bot.montos) ? bot.montos : []
   }))
   res.json(servicios)
+})
+
+app.get('/api/client/historial', authUser, (req, res) => {
+  const rows = db.prepare(
+    `SELECT id, servicio, referencia, monto, estado, mensaje, fecha
+     FROM historial
+     WHERE usuario_id = ?
+     ORDER BY id DESC
+     LIMIT 50`
+  ).all(req.userAuth.id)
+  res.json(rows)
 })
 
 app.post('/api/client/recargar', authUser, async (req, res) => {

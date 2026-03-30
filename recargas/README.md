@@ -51,6 +51,21 @@ DEFAULT_ADMIN_PASSWORD=...
 - `GET /api/admin/notificaciones`
 - `PATCH /api/admin/notificaciones/:id/leida`
 
+## API Cliente
+- `POST /api/client/login` (requiere header `X-App-Key`)
+- `GET /api/client/me`
+- `GET /api/client/servicios`
+- `GET /api/client/historial`
+- `POST /api/client/recargar`
+
+## Cliente web básico (nuevo)
+- Ruta estática servida por la API: `GET /client`
+- Archivos en `recargas/client-app/` (`index.html`, `app.js`, `styles.css`)
+- Usa los endpoints `/api/client/*` para login, consulta de saldo, servicios y recargas.
+- Por defecto lee:
+  - `API_BASE`: `location.origin`
+  - `APP_KEY`: `localStorage.app_key` (si no existe usa `dev-change-me`)
+
 ## App Android Admin
 - usa `admin-app/local/bootstrap.properties`
 - prueba conexión a `/api/status`
