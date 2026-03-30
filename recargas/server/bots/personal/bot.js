@@ -9,24 +9,29 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
 
   try {
     await page.goto('https://recargas.personal.com.ar/phone')
-    await page.waitForSelector('input[placeholder*="1153394581"]', { timeout: 15000 })
-    await page.type('input[placeholder*="1153394581"]', numero, { delay: 150 })
-    await page.click('button[type="submit"]')
+
+    const inputNumero = page.locator('input[placeholder*="1153394581"]')
+    await inputNumero.waitFor({ state: 'visible', timeout: 15000 })
+    await inputNumero.type(numero, { delay: 150 })
+    await page.locator('button[type="submit"]').click()
     await page.waitForURL('**/pay/amount**', { timeout: 15000 })
 
     await page.getByText('$' + Number(monto).toLocaleString('es-AR')).first().click()
-    await page.waitForSelector('#number', { timeout: 10000 })
 
-    await page.fill('#number', tarjeta.numero)
-    await page.click('button:has-text("Siguiente")')
-    await page.waitForSelector('#expiry', { timeout: 10000 })
+    const inputNumeroTarjeta = page.locator('#number')
+    await inputNumeroTarjeta.waitFor({ state: 'visible', timeout: 10000 })
+    await inputNumeroTarjeta.fill(tarjeta.numero)
+    await page.locator('button:has-text("Siguiente")').click()
 
-    await page.fill('#expiry', tarjeta.mes + '/' + tarjeta.anio)
-    await page.click('button:has-text("Siguiente")')
-    await page.waitForSelector('#cvc', { timeout: 10000 })
+    const inputExpiry = page.locator('#expiry')
+    await inputExpiry.waitFor({ state: 'visible', timeout: 10000 })
+    await inputExpiry.fill(tarjeta.mes + '/' + tarjeta.anio)
+    await page.locator('button:has-text("Siguiente")').click()
 
-    await page.fill('#cvc', tarjeta.cvv)
-    await page.click('button:has-text("Confirmar")')
+    const inputCvc = page.locator('#cvc')
+    await inputCvc.waitFor({ state: 'visible', timeout: 10000 })
+    await inputCvc.fill(tarjeta.cvv)
+    await page.locator('button:has-text("Confirmar")').click()
 
     await page.waitForFunction(() => {
       const t = document.body.innerText
@@ -37,7 +42,7 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
 
     const textoPago = await page.evaluate(() => document.body.innerText)
     if (textoPago.includes('Confirmar el pago') || textoPago.includes('Pagar')) {
-      await page.click('button:has-text("Pagar")')
+      await page.locator('button:has-text("Pagar")').click()
       await page.waitForFunction(() => {
         const t = document.body.innerText
         return t.includes('exitosa') || t.includes('aprobada') || t.includes('Gracias') ||
