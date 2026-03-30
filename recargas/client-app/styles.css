@@ -1,0 +1,29 @@
+:root { color-scheme: dark; }
+body {
+  margin: 0;
+  font-family: Inter, system-ui, Arial, sans-serif;
+  background: #0b1220;
+  color: #e7ecf5;
+}
+.wrap { max-width: 560px; margin: 0 auto; padding: 20px; }
+.card {
+  background: #111a2c;
+  border: 1px solid #26344f;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.hidden { display: none; }
+input, select, button {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #334766;
+  background: #0f1727;
+  color: #e7ecf5;
+}
+button { background: #1f4acc; border-color: #2b59e0; cursor: pointer; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.muted { color: #9fb0cb; }
+ul { padding-left: 18px; }
