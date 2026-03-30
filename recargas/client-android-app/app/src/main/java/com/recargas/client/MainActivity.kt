@@ -220,7 +220,7 @@ class MainActivity : AppCompatActivity() {
             binding.txtResult.text = if (code in 200..299) {
                 "OK: ${out.optString("mensaje", "recarga enviada")}"
             } else {
-                "Error: ${out.optString("error", "falló")}"
+                "Error: ${out.optString("error", out.optString("mensaje", "falló"))}"
             }
             isRecargaInProgress = false
             binding.btnRecargar.isEnabled = true
