@@ -6,7 +6,7 @@ const fs = require('fs')
 const path = require('path')
 const rateLimit = require('express-rate-limit')
 const helmet = require('helmet')
-require('dotenv').config({ path: path.join(__dirname, '../.env') })
+require('dotenv').config({ path: path.join(__dirname, '.env') })
 const db = require('./db')
 
 const app = express()
@@ -31,14 +31,13 @@ if (!APP_CLIENT_KEY || APP_CLIENT_KEY.length < 24) {
 app.disable('x-powered-by')
 app.use(helmet())
 app.use(express.json({ limit: '20kb' }))
-app.use('/client', express.static(path.join(__dirname, '../client-app')))
+app.use('/client', express.static(path.join(__dirname, 'client-app')))
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Demasiados intentos de login.' }
 })
-
 
 function requireAdminAppKey(req, res, next) {
   const appKey = req.headers['x-app-key']
@@ -59,7 +58,6 @@ function requireClientAppKey(req, res, next) {
 function authAdmin(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1]
   if (!token) return res.status(401).json({ error: 'Sin token.' })
-
   try {
     const data = jwt.verify(token, SECRET)
     if (data.rol !== 'admin') return res.status(403).json({ error: 'No autorizado.' })
@@ -73,7 +71,6 @@ function authAdmin(req, res, next) {
 function authUser(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1]
   if (!token) return res.status(401).json({ error: 'Sin token.' })
-
   try {
     const data = jwt.verify(token, SECRET)
     if (data.rol !== 'usuario') return res.status(403).json({ error: 'No autorizado.' })
@@ -96,7 +93,6 @@ function validatePassword(value) {
 function loadBots() {
   const baseDir = path.join(__dirname, 'bots')
   if (!fs.existsSync(baseDir)) return {}
-
   const services = {}
   for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
@@ -130,7 +126,6 @@ function maybeIgnoreCard(cardId, adminId) {
   } else if (totalSuccess >= 1 && maxServiceConsecutive >= 4) {
     reason = 'Ignorada automáticamente: venía aprobando y luego acumuló 4 fallos consecutivos en un servicio.'
   }
-
   if (!reason) return
 
   const card = db.prepare('SELECT ignorada, alias, numero FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, adminId)
@@ -144,7 +139,6 @@ function maybeIgnoreCard(cardId, adminId) {
 
 function registerCardResult(cardId, adminId, servicio, ok, detalle) {
   const row = db.prepare('SELECT * FROM tarjeta_metricas WHERE tarjeta_id = ? AND servicio = ?').get(cardId, servicio)
-
   if (!row) {
     db.prepare(
       `INSERT INTO tarjeta_metricas (tarjeta_id, servicio, intentos, exitos, fallos, fallos_consecutivos)
@@ -161,14 +155,11 @@ function registerCardResult(cardId, adminId, servicio, ok, detalle) {
        WHERE id = ?`
     ).run(ok ? 1 : 0, ok ? 0 : 1, ok ? 0 : Number(row.fallos_consecutivos) + 1, row.id)
   }
-
   if (detalle) {
     db.prepare(
-      `INSERT INTO historial (admin_id, servicio, estado, mensaje)
-       VALUES (?, ?, ?, ?)`
+      `INSERT INTO historial (admin_id, servicio, estado, mensaje) VALUES (?, ?, ?, ?)`
     ).run(adminId, servicio, ok ? 'ok_tarjeta' : 'fallo_tarjeta', String(detalle).slice(0, 280))
   }
-
   maybeIgnoreCard(cardId, adminId)
 }
 
@@ -184,13 +175,10 @@ app.post('/api/admin/login', loginLimiter, async (req, res) => {
   if (!validateUsername(usuario) || typeof password !== 'string') {
     return res.status(400).json({ error: 'Credenciales inválidas.' })
   }
-
   const admin = db.prepare('SELECT * FROM admins WHERE usuario = ? AND activo = 1').get(usuario)
   if (!admin) return res.status(401).json({ error: 'Credenciales inválidas.' })
-
   const ok = await bcrypt.compare(password, admin.password)
   if (!ok) return res.status(401).json({ error: 'Credenciales inválidas.' })
-
   const token = jwt.sign({ id: admin.id, usuario: admin.usuario, rol: 'admin' }, SECRET, { expiresIn: '12h' })
   res.json({ token })
 })
@@ -200,128 +188,27 @@ app.post('/api/client/login', loginLimiter, async (req, res) => {
   if (!validateUsername(usuario) || typeof password !== 'string') {
     return res.status(400).json({ error: 'Credenciales inválidas.' })
   }
-
   const user = db.prepare('SELECT id, admin_id, usuario, password, activo FROM usuarios WHERE usuario = ?').get(usuario)
   if (!user || Number(user.activo) !== 1) return res.status(401).json({ error: 'Credenciales inválidas.' })
-
   const ok = await bcrypt.compare(password, user.password)
   if (!ok) return res.status(401).json({ error: 'Credenciales inválidas.' })
-
-  const token = jwt.sign(
-    { id: user.id, admin_id: user.admin_id, usuario: user.usuario, rol: 'usuario' },
-    SECRET,
-    { expiresIn: '12h' }
-  )
+  const token = jwt.sign({ id: user.id, admin_id: user.admin_id, usuario: user.usuario, rol: 'usuario' }, SECRET, { expiresIn: '12h' })
   res.json({ token })
 })
 
-app.get('/api/client/me', authUser, (req, res) => {
-  const user = db.prepare('SELECT id, admin_id, usuario, saldo, activo, creado FROM usuarios WHERE id = ?').get(req.userAuth.id)
-  if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
-  res.json(user)
-})
-
-app.get('/api/client/servicios', authUser, (_req, res) => {
-  const servicios = Object.entries(bots).map(([id, bot]) => ({
-    id,
-    nombre: bot.nombre || id,
-    montos: Array.isArray(bot.montos) ? bot.montos : []
-  }))
-  res.json(servicios)
-})
-
-app.get('/api/client/historial', authUser, (req, res) => {
-  const rows = db.prepare(
-    `SELECT id, servicio, referencia, monto, estado, mensaje, fecha
-     FROM historial
-     WHERE usuario_id = ?
-     ORDER BY id DESC
-     LIMIT 50`
-  ).all(req.userAuth.id)
-  res.json(rows)
-})
-
-app.post('/api/client/recargar', authUser, async (req, res) => {
-  const { servicio, referencia, monto } = req.body || {}
-  const bot = bots[servicio]
-  if (!bot) return res.status(400).json({ error: 'Servicio no soportado.' })
-
-  const parsedMonto = Number(monto)
-  if (!Number.isFinite(parsedMonto) || parsedMonto <= 0) {
-    return res.status(400).json({ error: 'Monto inválido.' })
-  }
-  if (Array.isArray(bot.montos) && bot.montos.length > 0 && !bot.montos.includes(parsedMonto)) {
-    return res.status(400).json({ error: 'Monto no permitido para este servicio.' })
-  }
-  if (typeof referencia !== 'string' || !bot.validarReferencia?.(referencia.trim())) {
-    return res.status(400).json({ error: 'Referencia inválida para este servicio.' })
-  }
-
-  const user = db.prepare('SELECT id, admin_id, usuario, saldo, activo FROM usuarios WHERE id = ?').get(req.userAuth.id)
-  if (!user || Number(user.activo) !== 1) return res.status(404).json({ error: 'Usuario no encontrado.' })
-  if (Number(user.saldo) < parsedMonto) return res.status(400).json({ error: 'Saldo insuficiente.' })
-
-  const card = db.prepare(
-    'SELECT id FROM tarjetas WHERE admin_id = ? AND activa = 1 AND ignorada = 0 ORDER BY id ASC LIMIT 1'
-  ).get(user.admin_id)
-  if (!card) return res.status(400).json({ error: 'No hay tarjetas activas disponibles.' })
-
-  let result
-  try {
-    result = await bot.procesar({ referencia: referencia.trim(), monto: parsedMonto, usuario: user.usuario })
-  } catch {
-    result = { ok: false, mensaje: 'Error ejecutando bot.' }
-  }
-
-  const ok = Boolean(result?.ok)
-  const mensaje = String(result?.mensaje || (ok ? 'Operación exitosa.' : 'Operación fallida.')).slice(0, 280)
-
-  const saldoFinal = db.transaction(() => {
-    if (ok) db.prepare('UPDATE usuarios SET saldo = saldo - ? WHERE id = ?').run(parsedMonto, user.id)
-
-    db.prepare(
-      `INSERT INTO historial (usuario_id, admin_id, servicio, referencia, monto, estado, mensaje)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(user.id, user.admin_id, servicio, referencia.trim(), parsedMonto, ok ? 'ok' : 'fallo', mensaje)
-
-    const updated = db.prepare('SELECT saldo FROM usuarios WHERE id = ?').get(user.id)
-    return Number(updated?.saldo || 0)
-  })()
-
-  registerCardResult(card.id, user.admin_id, servicio, ok, `Cliente ${user.usuario}: ${mensaje}`)
-  if (!ok) {
-    db.prepare(
-      'INSERT INTO notificaciones_admin (admin_id, tipo, mensaje) VALUES (?, ?, ?)'
-    ).run(user.admin_id, 'recarga_fallida', `Falló recarga de ${user.usuario} (${servicio}): ${mensaje}`)
-  }
-
-  res.json({
-    ok,
-    servicio,
-    referencia: referencia.trim(),
-    monto: parsedMonto,
-    saldo: saldoFinal,
-    mensaje
-  })
-})
-
-
-app.get('/api/admin/me', authAdmin, (req, res) => {
+app.get('/api/admin/perfil', authAdmin, (req, res) => {
   const admin = db.prepare('SELECT id, usuario, activo, creado FROM admins WHERE id = ?').get(req.admin.id)
-  if (!admin) return res.status(404).json({ error: 'Admin no encontrado.' })
   res.json(admin)
 })
 
-app.patch('/api/admin/me', authAdmin, async (req, res) => {
+app.patch('/api/admin/perfil', authAdmin, async (req, res) => {
   const { usuario, password } = req.body || {}
-
   if (usuario !== undefined && !validateUsername(usuario)) {
     return res.status(400).json({ error: 'Usuario inválido.' })
   }
   if (password !== undefined && !validatePassword(password)) {
     return res.status(400).json({ error: 'Password inválida.' })
   }
-
   try {
     if (usuario !== undefined) {
       db.prepare('UPDATE admins SET usuario = ? WHERE id = ?').run(usuario, req.admin.id)
@@ -344,16 +231,13 @@ app.get('/api/admin/usuarios', authAdmin, (req, res) => {
 
 app.post('/api/admin/usuarios', authAdmin, async (req, res) => {
   const { usuario, password, saldo } = req.body || {}
-
   if (!validateUsername(usuario) || !validatePassword(password)) {
     return res.status(400).json({ error: 'Usuario o contraseña inválidos.' })
   }
-
   const initialSaldo = Number(saldo || 0)
   if (!Number.isFinite(initialSaldo) || initialSaldo < 0) {
     return res.status(400).json({ error: 'Saldo inicial inválido.' })
   }
-
   try {
     const hash = await bcrypt.hash(password, 12)
     const result = db.prepare('INSERT INTO usuarios (admin_id, usuario, password, saldo) VALUES (?, ?, ?, ?)').run(req.admin.id, usuario, hash, initialSaldo)
@@ -366,44 +250,22 @@ app.post('/api/admin/usuarios', authAdmin, async (req, res) => {
 app.patch('/api/admin/usuarios/:id', authAdmin, async (req, res) => {
   const userId = Number(req.params.id)
   const { usuario, password, saldo, activo } = req.body || {}
-
-  if (!Number.isInteger(userId) || userId <= 0) {
-    return res.status(400).json({ error: 'Usuario inválido.' })
-  }
-  if (usuario !== undefined && !validateUsername(usuario)) {
-    return res.status(400).json({ error: 'Usuario inválido.' })
-  }
-  if (password !== undefined && !validatePassword(password)) {
-    return res.status(400).json({ error: 'Password inválida.' })
-  }
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Usuario inválido.' })
+  if (usuario !== undefined && !validateUsername(usuario)) return res.status(400).json({ error: 'Usuario inválido.' })
+  if (password !== undefined && !validatePassword(password)) return res.status(400).json({ error: 'Password inválida.' })
   if (saldo !== undefined) {
     const parsedSaldo = Number(saldo)
-    if (!Number.isFinite(parsedSaldo) || parsedSaldo < 0) {
-      return res.status(400).json({ error: 'Saldo inválido.' })
-    }
+    if (!Number.isFinite(parsedSaldo) || parsedSaldo < 0) return res.status(400).json({ error: 'Saldo inválido.' })
   }
-  if (activo !== undefined && ![0, 1, true, false].includes(activo)) {
-    return res.status(400).json({ error: 'Activo inválido.' })
-  }
+  if (activo !== undefined && ![0, 1, true, false].includes(activo)) return res.status(400).json({ error: 'Activo inválido.' })
 
   const existing = db.prepare('SELECT id FROM usuarios WHERE id = ? AND admin_id = ?').get(userId, req.admin.id)
   if (!existing) return res.status(404).json({ error: 'Usuario no encontrado.' })
-
   try {
-    if (usuario !== undefined) {
-      db.prepare('UPDATE usuarios SET usuario = ? WHERE id = ?').run(usuario, userId)
-    }
-    if (password !== undefined) {
-      const hash = await bcrypt.hash(password, 12)
-      db.prepare('UPDATE usuarios SET password = ? WHERE id = ?').run(hash, userId)
-    }
-    if (saldo !== undefined) {
-      db.prepare('UPDATE usuarios SET saldo = ? WHERE id = ?').run(Number(saldo), userId)
-    }
-    if (activo !== undefined) {
-      db.prepare('UPDATE usuarios SET activo = ? WHERE id = ?').run(Number(activo ? 1 : 0), userId)
-    }
-
+    if (usuario  !== undefined) db.prepare('UPDATE usuarios SET usuario = ? WHERE id = ?').run(usuario, userId)
+    if (password !== undefined) { const hash = await bcrypt.hash(password, 12); db.prepare('UPDATE usuarios SET password = ? WHERE id = ?').run(hash, userId) }
+    if (saldo    !== undefined) db.prepare('UPDATE usuarios SET saldo = ? WHERE id = ?').run(Number(saldo), userId)
+    if (activo   !== undefined) db.prepare('UPDATE usuarios SET activo = ? WHERE id = ?').run(Number(activo ? 1 : 0), userId)
     const updated = db.prepare('SELECT id, usuario, saldo, activo, creado FROM usuarios WHERE id = ? AND admin_id = ?').get(userId, req.admin.id)
     return res.json({ ok: true, usuario: updated })
   } catch {
@@ -415,7 +277,6 @@ app.delete('/api/admin/usuarios/:id', authAdmin, (req, res) => {
   const userId = Number(req.params.id)
   const user = db.prepare('SELECT id FROM usuarios WHERE id = ? AND admin_id = ?').get(userId, req.admin.id)
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado.' })
-
   db.prepare('DELETE FROM usuarios WHERE id = ?').run(userId)
   res.json({ ok: true })
 })
@@ -423,18 +284,14 @@ app.delete('/api/admin/usuarios/:id', authAdmin, (req, res) => {
 app.patch('/api/admin/usuarios/:id/saldo', authAdmin, (req, res) => {
   const userId = Number(req.params.id)
   const delta = Number(req.body?.delta)
-
   if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Usuario inválido.' })
   if (!Number.isFinite(delta) || delta === 0) return res.status(400).json({ error: 'Delta inválido.' })
-
   const user = db.prepare('SELECT id FROM usuarios WHERE id = ? AND admin_id = ?').get(userId, req.admin.id)
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado.' })
-
   const newSaldo = db.transaction(() => {
     db.prepare('UPDATE usuarios SET saldo = saldo + ? WHERE id = ?').run(delta, userId)
     return db.prepare('SELECT saldo FROM usuarios WHERE id = ?').get(userId)?.saldo ?? 0
   })()
-
   res.json({ ok: true, saldo: Number(newSaldo) })
 })
 
@@ -444,42 +301,34 @@ app.get('/api/admin/historial', authAdmin, (req, res) => {
      FROM historial h
      LEFT JOIN usuarios u ON u.id = h.usuario_id
      WHERE h.admin_id = ?
-     ORDER BY h.id DESC
-     LIMIT 300`
+     ORDER BY h.id DESC LIMIT 300`
   ).all(req.admin.id)
-
   res.json(rows)
 })
 
 app.get('/api/admin/tarjetas', authAdmin, (req, res) => {
   const cards = db.prepare('SELECT id, alias, numero, mes, anio, activa, ignorada, motivo_ignorada, creada FROM tarjetas WHERE admin_id = ? ORDER BY id DESC').all(req.admin.id)
-  const withMetrics = cards.map(card => ({
+  res.json(cards.map(card => ({
     ...card,
     numero: `**** **** **** ${String(card.numero).slice(-4)}`,
     metricas: getCardMetrics(card.id)
-  }))
-  res.json(withMetrics)
+  })))
 })
 
 app.post('/api/admin/tarjetas', authAdmin, (req, res) => {
   const { alias, numero, mes, anio, cvv } = req.body || {}
   if (!numero || !mes || !anio || !cvv) return res.status(400).json({ error: 'Faltan datos.' })
-
   const result = db.prepare(
     'INSERT INTO tarjetas (admin_id, alias, numero, mes, anio, cvv) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(req.admin.id, alias || '', String(numero).trim(), String(mes).trim(), String(anio).trim(), String(cvv).trim())
-
   res.json({ id: Number(result.lastInsertRowid) })
 })
 
 app.patch('/api/admin/tarjetas/:id/activa', authAdmin, (req, res) => {
   const cardId = Number(req.params.id)
-  const activa = Number(req.body?.activa) ? 1 : 0
-
   const card = db.prepare('SELECT id FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, req.admin.id)
   if (!card) return res.status(404).json({ error: 'Tarjeta no encontrada.' })
-
-  db.prepare('UPDATE tarjetas SET activa = ? WHERE id = ?').run(activa, cardId)
+  db.prepare('UPDATE tarjetas SET activa = ? WHERE id = ?').run(Number(req.body?.activa) ? 1 : 0, cardId)
   res.json({ ok: true })
 })
 
@@ -487,7 +336,6 @@ app.delete('/api/admin/tarjetas/:id', authAdmin, (req, res) => {
   const cardId = Number(req.params.id)
   const card = db.prepare('SELECT id FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, req.admin.id)
   if (!card) return res.status(404).json({ error: 'Tarjeta no encontrada.' })
-
   db.prepare('DELETE FROM tarjeta_metricas WHERE tarjeta_id = ?').run(cardId)
   db.prepare('DELETE FROM tarjetas WHERE id = ?').run(cardId)
   res.json({ ok: true })
@@ -496,15 +344,10 @@ app.delete('/api/admin/tarjetas/:id', authAdmin, (req, res) => {
 app.post('/api/admin/tarjetas/:id/resultado', authAdmin, (req, res) => {
   const cardId = Number(req.params.id)
   const { servicio, ok, detalle } = req.body || {}
-
-  if (!servicio || typeof ok !== 'boolean') {
-    return res.status(400).json({ error: 'servicio y ok son requeridos.' })
-  }
-
+  if (!servicio || typeof ok !== 'boolean') return res.status(400).json({ error: 'servicio y ok son requeridos.' })
   const card = db.prepare('SELECT id, ignorada FROM tarjetas WHERE id = ? AND admin_id = ?').get(cardId, req.admin.id)
   if (!card) return res.status(404).json({ error: 'Tarjeta no encontrada.' })
   if (Number(card.ignorada) === 1) return res.status(400).json({ error: 'Tarjeta ya ignorada.' })
-
   registerCardResult(cardId, req.admin.id, servicio, ok, detalle)
   const updated = db.prepare('SELECT id, activa, ignorada, motivo_ignorada FROM tarjetas WHERE id = ?').get(cardId)
   res.json({ ok: true, tarjeta: updated })
@@ -516,8 +359,7 @@ app.get('/api/admin/notificaciones', authAdmin, (req, res) => {
 })
 
 app.patch('/api/admin/notificaciones/:id/leida', authAdmin, (req, res) => {
-  const notifId = Number(req.params.id)
-  db.prepare('UPDATE notificaciones_admin SET leida = 1 WHERE id = ? AND admin_id = ?').run(notifId, req.admin.id)
+  db.prepare('UPDATE notificaciones_admin SET leida = 1 WHERE id = ? AND admin_id = ?').run(Number(req.params.id), req.admin.id)
   res.json({ ok: true })
 })
 
