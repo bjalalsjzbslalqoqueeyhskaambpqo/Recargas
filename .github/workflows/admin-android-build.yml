@@ -6,6 +6,7 @@ on:
     branches: ['**']
     paths:
       - 'recargas/admin-app/**'
+      - 'recargas/server/**'
       - '.github/workflows/admin-android-build.yml'
 
 jobs:
@@ -28,6 +29,32 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Crear archivos locales de entorno
+        working-directory: recargas/admin-app
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          APP_ADMIN_KEY: ${{ secrets.APP_ADMIN_KEY }}
+          DEFAULT_ADMIN_USER: ${{ secrets.DEFAULT_ADMIN_USER }}
+          DEFAULT_ADMIN_PASSWORD: ${{ secrets.DEFAULT_ADMIN_PASSWORD }}
+        run: |
+          mkdir -p local
+
+          cat > local/bootstrap.properties <<DATA
+          API_BASE_URL=${API_BASE_URL:-http://127.0.0.1:3000}
+          APP_ADMIN_KEY=${APP_ADMIN_KEY:-REPLACE_APP_KEY}
+          DEFAULT_ADMIN_USER=${DEFAULT_ADMIN_USER:-admin}
+          DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-admin123456}
+          DATA
+
+          cat > local.properties <<DATA
+          sdk.dir=$ANDROID_SDK_ROOT
+          DATA
+
+      - name: Instalar dependencias Android requeridas
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
       - name: Generate signing keystore
         working-directory: recargas/admin-app
         run: |
@@ -35,7 +62,6 @@ jobs:
           KEYSTORE_FILE="$PWD/android-signing.jks"
           STORE_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
 
-          # En JKS usamos misma password de store y key para evitar padding/key mismatch.
           keytool -genkeypair \
             -v \
             -storetype JKS \

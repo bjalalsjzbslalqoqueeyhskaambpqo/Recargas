@@ -33,8 +33,8 @@
 
 ### Cliente actual
 - Existe **cliente web básico** en `recargas/client-app`.
-- CI dedicado: `.github/workflows/client-app-build.yml`.
-- El flujo actual del cliente en CI **no compila una app móvil nativa**; valida JS y empaqueta artefacto web estático.
+- CI del cliente web: `.github/workflows/client-app-build.yml` (deshabilitado para compilación, solo manual/informativo).
+- El pipeline activo de compilación ahora es el de administración (`admin-android-build.yml`).
 
 ---
 
