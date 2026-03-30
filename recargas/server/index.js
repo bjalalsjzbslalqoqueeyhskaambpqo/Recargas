@@ -17,7 +17,7 @@ const HOST = process.env.BIND_HOST || '0.0.0.0'
 const SECRET = process.env.SECRET
 const APP_ADMIN_KEY = process.env.APP_ADMIN_KEY
 const APP_CLIENT_KEY = process.env.APP_CLIENT_KEY || APP_ADMIN_KEY
-const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Asuncion'
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Argentina/Buenos_Aires'
 const HISTORIAL_MAX_ROWS = Number(process.env.HISTORIAL_MAX_ROWS || 5000)
 
 if (!SECRET || SECRET.length < 32) {
