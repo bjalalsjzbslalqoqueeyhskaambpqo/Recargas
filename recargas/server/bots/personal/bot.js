@@ -13,35 +13,37 @@ async function intentarConTarjeta(numero, tarjeta, monto) {
     await page.type('input[placeholder*="1153394581"]', numero, { delay: 150 })
     await page.click('button[type="submit"]')
     await page.waitForURL('**/pay/amount**', { timeout: 15000 })
-    await page.waitForTimeout(3000)
 
     await page.getByText('$' + Number(monto).toLocaleString('es-AR')).first().click()
-    await page.waitForTimeout(3000)
+    await page.waitForSelector('#number', { timeout: 10000 })
 
     await page.fill('#number', tarjeta.numero)
     await page.click('button:has-text("Siguiente")')
-    await page.waitForTimeout(2000)
+    await page.waitForSelector('#expiry', { timeout: 10000 })
 
     await page.fill('#expiry', tarjeta.mes + '/' + tarjeta.anio)
     await page.click('button:has-text("Siguiente")')
-    await page.waitForTimeout(2000)
+    await page.waitForSelector('#cvc', { timeout: 10000 })
 
     await page.fill('#cvc', tarjeta.cvv)
     await page.click('button:has-text("Confirmar")')
-    await page.waitForTimeout(3000)
+
+    await page.waitForFunction(() => {
+      const t = document.body.innerText
+      return t.includes('Confirmar el pago') || t.includes('Pagar') ||
+             t.includes('exitosa') || t.includes('aprobada') || t.includes('Gracias') ||
+             t.includes('No pudimos') || t.includes('rechazada') || t.includes('error')
+    }, { timeout: 30000 })
 
     const textoPago = await page.evaluate(() => document.body.innerText)
     if (textoPago.includes('Confirmar el pago') || textoPago.includes('Pagar')) {
       await page.click('button:has-text("Pagar")')
-    }
-
-    try {
       await page.waitForFunction(() => {
         const t = document.body.innerText
         return t.includes('exitosa') || t.includes('aprobada') || t.includes('Gracias') ||
                t.includes('No pudimos') || t.includes('rechazada') || t.includes('error')
-      }, { timeout: 25000 })
-    } catch(e) {}
+      }, { timeout: 30000 })
+    }
 
     const texto = await page.evaluate(() => document.body.innerText)
     await browser.close()
