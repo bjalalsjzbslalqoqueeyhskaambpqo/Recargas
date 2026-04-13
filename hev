@@ -198,6 +198,9 @@ const (
 	tPing  = 0x04
 	tPong  = 0x05
 
+	sidCtrlMin = uint32(0x40000000)
+	sidCtrlMax = uint32(0x7FFFFFFF)
+
 	maxStreams   = 4096
 	idleSecs     = 120
 	watchdogSecs = 30
@@ -205,7 +208,34 @@ const (
 	dialTimeout  = 3 * time.Second
 	writeTimeout = 3 * time.Second
 	maxPayload   = 16384
+
+	dnsTTL = 5 * time.Minute
 )
+
+type dnsEntry struct {
+	ips    []string
+	expiry int64
+}
+
+var dnsCache sync.Map
+
+func resolveHost(host string) (string, error) {
+	now := time.Now().Unix()
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(*dnsEntry)
+		if now < atomic.LoadInt64(&e.expiry) {
+			return e.ips[0], nil
+		}
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return "", err
+	}
+	entry := &dnsEntry{ips: addrs}
+	atomic.StoreInt64(&entry.expiry, time.Now().Add(dnsTTL).Unix())
+	dnsCache.Store(host, entry)
+	return addrs[0], nil
+}
 
 type userEntry struct {
 	name    string
@@ -306,9 +336,9 @@ var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPaylo
 var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
 
 func getFrame() []byte  { return *framePool.Get().(*[]byte) }
-func putFrame(b []byte) { p := &b; framePool.Put(p) }
+func putFrame(b []byte) { framePool.Put(&b) }
 func getHdr() []byte    { return *hdrPool.Get().(*[]byte) }
-func putHdr(b []byte)   { p := &b; hdrPool.Put(p) }
+func putHdr(b []byte)   { hdrPool.Put(&b) }
 
 type stream struct {
 	q      chan []byte
@@ -320,15 +350,22 @@ func (s *stream) tryClose() bool { return atomic.CompareAndSwapUint32(&s.closed,
 func (s *stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
 
 type mux struct {
-	conn    net.Conn
-	writeMu sync.Mutex
-	mu      sync.RWMutex
-	streams map[uint32]*stream
-	count   int32
+	conn     net.Conn
+	writeMu  sync.Mutex
+	mu       sync.RWMutex
+	streams  map[uint32]*stream
+	count    int32
+	dead     uint32
 }
 
 func newMux(conn net.Conn) *mux {
 	return &mux{conn: conn, streams: make(map[uint32]*stream, 128)}
+}
+
+func (m *mux) kill() {
+	if atomic.CompareAndSwapUint32(&m.dead, 0, 1) {
+		m.conn.Close()
+	}
 }
 
 func (m *mux) add(sid uint32, s *stream) bool {
@@ -379,7 +416,8 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	hdr := getHdr()
 	hdr[0] = t
 	binary.BigEndian.PutUint32(hdr[1:5], sid)
-	hdr[5] = 0; hdr[6] = 0
+	hdr[5] = 0
+	hdr[6] = 0
 	m.writeMu.Lock()
 	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	m.conn.Write(hdr)
@@ -388,18 +426,75 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	putHdr(hdr)
 }
 
+func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
+	if len(data) < 4 {
+		return "", 0, 0
+	}
+	if data[0] != 0x05 {
+		return "", 0, 0
+	}
+	switch data[3] {
+	case 0x01:
+		if len(data) < 10 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:8]).String()
+		port = binary.BigEndian.Uint16(data[8:10])
+		headerLen = 10
+	case 0x03:
+		if len(data) < 5 {
+			return "", 0, 0
+		}
+		l := int(data[4])
+		if len(data) < 5+l+2 {
+			return "", 0, 0
+		}
+		host = string(data[5 : 5+l])
+		port = binary.BigEndian.Uint16(data[5+l : 5+l+2])
+		headerLen = 5 + l + 2
+	case 0x04:
+		if len(data) < 22 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:20]).String()
+		port = binary.BigEndian.Uint16(data[20:22])
+		headerLen = 22
+	}
+	return
+}
+
 func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	defer func() {
 		if s.tryClose() {
 			m.del(sid)
 			m.sendHdr(tClose, sid)
-			for range s.q {}
+			for range s.q {
+			}
 		}
 	}()
 
-	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	target := hevAddr
+	if len(firstData) >= 10 && firstData[0] == 0x05 {
+		host, port, _ := parseSocks5Host(firstData)
+		if host != "" {
+			if port == 0 {
+				port = 80
+			}
+			resolved, err := resolveHost(host)
+			if err == nil {
+				target = fmt.Sprintf("%s:%d", resolved, port)
+			}
+		}
+	}
+
+	hev, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		return
+		if target != hevAddr {
+			hev, err = net.DialTimeout("tcp", hevAddr, dialTimeout)
+		}
+		if err != nil {
+			return
+		}
 	}
 	defer hev.Close()
 
@@ -449,6 +544,9 @@ func (m *mux) watchdog() {
 	ticker := time.NewTicker(watchdogSecs * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		if atomic.LoadUint32(&m.dead) == 1 {
+			return
+		}
 		now := time.Now().Unix()
 		m.mu.RLock()
 		toKill := make([]uint32, 0, 16)
@@ -495,6 +593,16 @@ func (m *mux) run() {
 			}
 			data = readBuf[:ln]
 		}
+
+		if ft == tPing {
+			m.sendHdr(tPong, sid)
+			continue
+		}
+
+		if ft == tPong || (sid >= sidCtrlMin && sid <= sidCtrlMax) {
+			continue
+		}
+
 		switch ft {
 		case tOpen:
 			s := &stream{q: make(chan []byte, queueSize), active: time.Now().Unix()}
@@ -531,9 +639,6 @@ func (m *mux) run() {
 				m.del(sid)
 				close(s.q)
 			}
-		case tPing:
-			m.sendHdr(tPong, 0)
-		case tPong:
 		}
 	}
 	m.mu.Lock()
@@ -545,6 +650,8 @@ func (m *mux) run() {
 	m.mu.Unlock()
 }
 
+var activeSessions sync.Map
+
 var (
 	actionNeedle     = []byte("action:")
 	internalIDNeedle = []byte("x-internal-id:")
@@ -554,16 +661,27 @@ var (
 )
 
 func indexBytes(s, sub []byte) int {
-	if len(sub) == 0 { return 0 }
-	if len(s) < len(sub) { return -1 }
+	if len(sub) == 0 {
+		return 0
+	}
+	if len(s) < len(sub) {
+		return -1
+	}
 	first := sub[0] | 0x20
 	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i]|0x20 != first { continue }
+		if s[i]|0x20 != first {
+			continue
+		}
 		match := true
 		for j := 1; j < len(sub); j++ {
-			if s[i+j]|0x20 != sub[j]|0x20 { match = false; break }
+			if s[i+j]|0x20 != sub[j]|0x20 {
+				match = false
+				break
+			}
 		}
-		if match { return i }
+		if match {
+			return i
+		}
 	}
 	return -1
 }
@@ -571,15 +689,25 @@ func indexBytes(s, sub []byte) int {
 func extractHeader(raw []byte, needle []byte) string {
 	start := 0
 	for i := 0; i < len(raw); i++ {
-		if raw[i] != '\n' { continue }
+		if raw[i] != '\n' {
+			continue
+		}
 		end := i
-		if end > start && raw[end-1] == '\r' { end-- }
+		if end > start && raw[end-1] == '\r' {
+			end--
+		}
 		line := raw[start:end]
 		start = i + 1
-		if len(line) <= len(needle) { continue }
-		if indexBytes(line[:len(needle)], needle) != 0 { continue }
+		if len(line) <= len(needle) {
+			continue
+		}
+		if indexBytes(line[:len(needle)], needle) != 0 {
+			continue
+		}
 		val := line[len(needle):]
-		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') { val = val[1:] }
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+			val = val[1:]
+		}
 		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
 			val = val[:len(val)-1]
 		}
@@ -591,7 +719,9 @@ func extractHeader(raw []byte, needle []byte) string {
 func handle(conn net.Conn) {
 	defer conn.Close()
 	tc, ok := conn.(*net.TCPConn)
-	if !ok { return }
+	if !ok {
+		return
+	}
 	tc.SetNoDelay(true)
 	tc.SetReadBuffer(65536)
 	tc.SetWriteBuffer(65536)
@@ -610,12 +740,16 @@ func handle(conn net.Conn) {
 				break
 			}
 		}
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 	}
 	conn.SetReadDeadline(time.Time{})
 
 	raw := buf[:n]
-	if extractHeader(raw, actionNeedle) != "tunnel" { return }
+	if extractHeader(raw, actionNeedle) != "tunnel" {
+		return
+	}
 
 	userID := extractHeader(raw, internalIDNeedle)
 	if userID == "" {
@@ -633,19 +767,31 @@ func handle(conn net.Conn) {
 		return
 	}
 
+	m := newMux(conn)
+
+	if prev, loaded := activeSessions.Swap(userID, m); loaded {
+		prev.(*mux).kill()
+	}
+
 	resp := fmt.Sprintf(
 		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
 		name, days,
 	)
 	conn.Write([]byte(resp))
-	newMux(conn).run()
+	m.run()
+
+	activeSessions.CompareAndDelete(userID, m)
 }
 
 func tuneListener(ln net.Listener) {
 	tc, ok := ln.(*net.TCPListener)
-	if !ok { return }
+	if !ok {
+		return
+	}
 	raw, err := tc.SyscallConn()
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	raw.Control(func(fd uintptr) {
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
@@ -659,15 +805,21 @@ func main() {
 	go func() {
 		t := time.NewTicker(cacheReload)
 		defer t.Stop()
-		for range t.C { cache.reload() }
+		for range t.C {
+			cache.reload()
+		}
 	}()
 	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 	tuneListener(ln)
 	log.Printf("btserver %s -> hev %s (cpus=%d)", listenAddr, hevAddr, runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		go handle(conn)
 	}
 }
