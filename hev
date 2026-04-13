@@ -1,0 +1,993 @@
+#!/bin/bash
+set -e
+GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+[ "$(id -u)" = "0" ] || die "Ejecutar como root"
+
+mkdir -p /opt/btserver
+cd /opt/btserver
+
+if command -v wget >/dev/null 2>&1; then
+    FETCH="wget -q --timeout=30 -O"
+elif command -v curl >/dev/null 2>&1; then
+    FETCH="curl -fsSL --connect-timeout 30 -o"
+else
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl disponible"
+    FETCH="wget -q --timeout=30 -O"
+fi
+
+GOPATH_BIN=/usr/local/go/bin/go
+export PATH=$PATH:/usr/local/go/bin
+
+_need_go=true
+if command -v go >/dev/null 2>&1 || [ -f "$GOPATH_BIN" ]; then
+    _ver=$(go version 2>/dev/null | grep -oE 'go[0-9]+\.[0-9]+' | head -1 | tr -d 'go')
+    _maj=$(echo "$_ver" | cut -d. -f1)
+    _min=$(echo "$_ver" | cut -d. -f2)
+    if [ "${_maj:-0}" -gt 1 ] || { [ "${_maj:-0}" -eq 1 ] && [ "${_min:-0}" -ge 18 ]; }; then
+        _need_go=false
+        info "Go ya presente y compatible: $(go version)"
+    else
+        info "Go $_ver demasiado viejo, actualizando..."
+    fi
+fi
+
+if [ "$_need_go" = "true" ]; then
+    info "Instalando Go 1.22..."
+    GO_TAR=/tmp/go.tar.gz
+    $FETCH "$GO_TAR" https://go.dev/dl/go1.22.4.linux-amd64.tar.gz \
+        || die "No se pudo descargar Go"
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf "$GO_TAR"
+    rm -f "$GO_TAR"
+    export PATH=/usr/local/go/bin:$PATH
+    hash -r 2>/dev/null || true
+fi
+
+export PATH=/usr/local/go/bin:$(echo $PATH | tr ":" "\n" | grep -v "^/usr/local/go/bin$" | tr "\n" ":")
+hash -r 2>/dev/null || true
+GO=/usr/local/go/bin/go
+[ -f "$GO" ] || GO=$(command -v go) || die "go no encontrado"
+info "Usando Go: $($GO version)"
+
+if [ -f /opt/btserver/token.txt ] && [ -s /opt/btserver/token.txt ]; then
+    PANEL_TOKEN=$(cat /opt/btserver/token.txt)
+    info "Token existente conservado."
+else
+    PANEL_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 64 || true)
+    echo "${PANEL_TOKEN}" > /opt/btserver/token.txt
+    chmod 600 /opt/btserver/token.txt
+    info "Nuevo token generado."
+fi
+
+PANEL_PORT=8090
+SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
+
+info "Deteniendo servicios existentes..."
+systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
+sleep 1
+
+info "Descargando hev-socks5-server..."
+$FETCH /tmp/hev-socks5-server.tmp \
+    https://github.com/heiher/hev-socks5-server/releases/latest/download/hev-socks5-server-linux-x86_64 \
+    || die "No se pudo descargar hev-socks5-server"
+mv -f /tmp/hev-socks5-server.tmp /opt/btserver/hev-socks5-server
+chmod +x /opt/btserver/hev-socks5-server
+info "hev-socks5-server OK"
+
+if ! command -v dnsmasq >/dev/null 2>&1; then
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq dnsmasq 2>/dev/null || info "dnsmasq no disponible"
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq python3 2>/dev/null || die "python3 no disponible"
+fi
+
+if command -v dnsmasq >/dev/null 2>&1; then
+    systemctl stop systemd-resolved 2>/dev/null || true
+    systemctl disable systemd-resolved 2>/dev/null || true
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf || true
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    mkdir -p /etc/dnsmasq.d
+    cat > /etc/dnsmasq.d/btserver.conf << 'DNSEOF'
+cache-size=10000
+no-negcache
+dns-forward-max=300
+server=8.8.8.8
+server=1.1.1.1
+listen-address=127.0.0.1
+bind-interfaces
+no-resolv
+DNSEOF
+    systemctl enable dnsmasq 2>/dev/null || true
+    systemctl restart dnsmasq 2>/dev/null && info "dnsmasq OK" || info "dnsmasq FALLO"
+fi
+
+NWORKERS=$(nproc 2>/dev/null || echo 4)
+info "HEV workers: $NWORKERS"
+
+cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
+main:
+  workers: ${NWORKERS}
+  port: 1080
+  listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+  udp-port: 1080
+  udp-listen-address: '127.0.0.1'
+dns:
+  port: 53
+  address: '127.0.0.1'
+  upstream: '8.8.8.8'
+misc:
+  log-file: stderr
+  log-level: warn
+YMLEOF
+
+info "Tuning TCP/kernel..."
+SYSCTL_CONF=/etc/sysctl.d/99-btserver.conf
+cat > "$SYSCTL_CONF" << 'SYSCTL'
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.tcp_rmem=4096 262144 16777216
+net.ipv4.tcp_wmem=4096 262144 16777216
+net.ipv4.tcp_notsent_lowat=4096
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=3
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=1000000
+net.ipv4.tcp_mem=786432 1048576 16777216
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+net.ipv4.tcp_low_latency=1
+SYSCTL
+
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -p "$SYSCTL_CONF" -q 2>/dev/null || true
+info "Sysctl aplicado"
+
+cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
+*    soft nofile 1000000
+*    hard nofile 1000000
+root soft nofile 1000000
+root hard nofile 1000000
+LIMITS
+
+info "Escribiendo btserver.go..."
+cat > /opt/btserver/btserver.go << 'GOEOF'
+package main
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+const (
+	hevAddr     = "127.0.0.1:1080"
+	listenAddr  = "0.0.0.0:80"
+	usersFile   = "/opt/btserver/users.txt"
+	cacheReload = 30 * time.Second
+
+	tOpen  = 0x01
+	tData  = 0x02
+	tClose = 0x03
+	tPing  = 0x04
+	tPong  = 0x05
+
+	maxStreams   = 4096
+	idleSecs     = 120
+	watchdogSecs = 30
+	queueSize    = 512
+	dialTimeout  = 3 * time.Second
+	writeTimeout = 3 * time.Second
+	maxPayload   = 16384
+)
+
+type userEntry struct {
+	name    string
+	expires time.Time
+}
+
+type userCache struct {
+	mu       sync.RWMutex
+	table    map[string]*userEntry
+	loadedAt time.Time
+}
+
+var cache = &userCache{table: make(map[string]*userEntry)}
+
+func (c *userCache) reload() {
+	f, err := os.Open(usersFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	t := make(map[string]*userEntry, 64)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		var id, name, exp string
+		n := 0
+		start := 0
+		for i := 0; i <= len(line); i++ {
+			if i == len(line) || line[i] == ':' {
+				part := line[start:i]
+				switch n {
+				case 0:
+					id = part
+				case 1:
+					name = part
+				case 2:
+					exp = part
+				}
+				n++
+				start = i + 1
+				if n == 3 {
+					break
+				}
+			}
+		}
+		if n < 3 || id == "" || name == "" || exp == "" {
+			continue
+		}
+		expires, err := time.ParseInLocation("2006-01-02", exp, time.Local)
+		if err != nil {
+			continue
+		}
+		expires = expires.Add(24*time.Hour - time.Second)
+		t[id] = &userEntry{name: name, expires: expires}
+	}
+	c.mu.Lock()
+	c.table = t
+	c.loadedAt = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *userCache) lookup(id string) (*userEntry, bool) {
+	c.mu.RLock()
+	needReload := time.Since(c.loadedAt) > cacheReload
+	e, ok := c.table[id]
+	c.mu.RUnlock()
+	if needReload {
+		go c.reload()
+	}
+	return e, ok
+}
+
+type authResult int
+
+const (
+	authOK       authResult = iota
+	authNotFound
+	authExpired
+)
+
+func checkAuth(id string) (string, int, authResult) {
+	e, ok := cache.lookup(id)
+	if !ok {
+		return "", 0, authNotFound
+	}
+	now := time.Now()
+	if now.After(e.expires) {
+		return e.name, 0, authExpired
+	}
+	days := int(e.expires.Sub(now).Hours()/24) + 1
+	return e.name, days, authOK
+}
+
+var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
+var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
+
+func getFrame() []byte  { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte) { p := &b; framePool.Put(p) }
+func getHdr() []byte    { return *hdrPool.Get().(*[]byte) }
+func putHdr(b []byte)   { p := &b; hdrPool.Put(p) }
+
+type stream struct {
+	q      chan []byte
+	active int64
+	closed uint32
+}
+
+func (s *stream) tryClose() bool { return atomic.CompareAndSwapUint32(&s.closed, 0, 1) }
+func (s *stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
+
+type mux struct {
+	conn    net.Conn
+	writeMu sync.Mutex
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   int32
+}
+
+func newMux(conn net.Conn) *mux {
+	return &mux{conn: conn, streams: make(map[uint32]*stream, 128)}
+}
+
+func (m *mux) add(sid uint32, s *stream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int(m.count) >= maxStreams {
+		return false
+	}
+	m.streams[sid] = s
+	atomic.AddInt32(&m.count, 1)
+	return true
+}
+
+func (m *mux) get(sid uint32) *stream {
+	m.mu.RLock()
+	s := m.streams[sid]
+	m.mu.RUnlock()
+	return s
+}
+
+func (m *mux) del(sid uint32) {
+	m.mu.Lock()
+	if _, ok := m.streams[sid]; ok {
+		delete(m.streams, sid)
+		atomic.AddInt32(&m.count, -1)
+	}
+	m.mu.Unlock()
+}
+
+func (m *mux) send(t byte, sid uint32, data []byte) {
+	ln := len(data)
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
+	if ln > 0 {
+		copy(buf[7:7+ln], data)
+	}
+	m.writeMu.Lock()
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(buf[:7+ln])
+	m.conn.SetWriteDeadline(time.Time{})
+	m.writeMu.Unlock()
+	putFrame(buf)
+}
+
+func (m *mux) sendHdr(t byte, sid uint32) {
+	hdr := getHdr()
+	hdr[0] = t
+	binary.BigEndian.PutUint32(hdr[1:5], sid)
+	hdr[5] = 0; hdr[6] = 0
+	m.writeMu.Lock()
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(hdr)
+	m.conn.SetWriteDeadline(time.Time{})
+	m.writeMu.Unlock()
+	putHdr(hdr)
+}
+
+func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
+	defer func() {
+		if s.tryClose() {
+			m.del(sid)
+			m.sendHdr(tClose, sid)
+			for range s.q {}
+		}
+	}()
+
+	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	if err != nil {
+		return
+	}
+	defer hev.Close()
+
+	tc := hev.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
+
+	if len(firstData) > 0 {
+		if _, err := hev.Write(firstData); err != nil {
+			return
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for d := range s.q {
+			if _, err := hev.Write(d); err != nil {
+				return
+			}
+			atomic.StoreInt64(&s.active, time.Now().Unix())
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := hev.Read(buf)
+			if n > 0 {
+				m.send(tData, sid, buf[:n])
+				atomic.StoreInt64(&s.active, time.Now().Unix())
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func (m *mux) watchdog() {
+	ticker := time.NewTicker(watchdogSecs * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now().Unix()
+		m.mu.RLock()
+		toKill := make([]uint32, 0, 16)
+		for sid, s := range m.streams {
+			if now-atomic.LoadInt64(&s.active) > idleSecs {
+				toKill = append(toKill, sid)
+			}
+		}
+		m.mu.RUnlock()
+		for _, sid := range toKill {
+			m.mu.Lock()
+			s, ok := m.streams[sid]
+			if ok {
+				delete(m.streams, sid)
+				atomic.AddInt32(&m.count, -1)
+			}
+			m.mu.Unlock()
+			if ok && s.tryClose() {
+				close(s.q)
+				m.sendHdr(tClose, sid)
+			}
+		}
+	}
+}
+
+func (m *mux) run() {
+	go m.watchdog()
+	hdr     := make([]byte, 7)
+	readBuf := make([]byte, maxPayload)
+	for {
+		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+			break
+		}
+		ft  := hdr[0]
+		sid := binary.BigEndian.Uint32(hdr[1:5])
+		ln  := binary.BigEndian.Uint16(hdr[5:7])
+		if int(ln) > maxPayload {
+			break
+		}
+		var data []byte
+		if ln > 0 {
+			if _, err := io.ReadFull(m.conn, readBuf[:ln]); err != nil {
+				break
+			}
+			data = readBuf[:ln]
+		}
+		switch ft {
+		case tOpen:
+			s := &stream{q: make(chan []byte, queueSize), active: time.Now().Unix()}
+			if !m.add(sid, s) {
+				m.sendHdr(tClose, sid)
+				continue
+			}
+			var first []byte
+			if ln > 0 {
+				first = make([]byte, ln)
+				copy(first, data)
+			}
+			go m.handleStream(sid, s, first)
+		case tData:
+			s := m.get(sid)
+			if s == nil || s.isClosed() {
+				continue
+			}
+			atomic.StoreInt64(&s.active, time.Now().Unix())
+			payload := make([]byte, ln)
+			copy(payload, data)
+			select {
+			case s.q <- payload:
+			default:
+				if s.tryClose() {
+					m.del(sid)
+					close(s.q)
+					m.sendHdr(tClose, sid)
+				}
+			}
+		case tClose:
+			s := m.get(sid)
+			if s != nil && s.tryClose() {
+				m.del(sid)
+				close(s.q)
+			}
+		case tPing:
+			m.sendHdr(tPong, 0)
+		case tPong:
+		}
+	}
+	m.mu.Lock()
+	for _, s := range m.streams {
+		if s.tryClose() {
+			close(s.q)
+		}
+	}
+	m.mu.Unlock()
+}
+
+var (
+	actionNeedle     = []byte("action:")
+	internalIDNeedle = []byte("x-internal-id:")
+	crlfcrlf         = []byte("\r\n\r\n")
+	resp403NotReg    = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n\r\nnot_registered")
+	resp403Expired   = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nexpired")
+)
+
+func indexBytes(s, sub []byte) int {
+	if len(sub) == 0 { return 0 }
+	if len(s) < len(sub) { return -1 }
+	first := sub[0] | 0x20
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i]|0x20 != first { continue }
+		match := true
+		for j := 1; j < len(sub); j++ {
+			if s[i+j]|0x20 != sub[j]|0x20 { match = false; break }
+		}
+		if match { return i }
+	}
+	return -1
+}
+
+func extractHeader(raw []byte, needle []byte) string {
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\n' { continue }
+		end := i
+		if end > start && raw[end-1] == '\r' { end-- }
+		line := raw[start:end]
+		start = i + 1
+		if len(line) <= len(needle) { continue }
+		if indexBytes(line[:len(needle)], needle) != 0 { continue }
+		val := line[len(needle):]
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') { val = val[1:] }
+		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+			val = val[:len(val)-1]
+		}
+		return string(val)
+	}
+	return ""
+}
+
+func handle(conn net.Conn) {
+	defer conn.Close()
+	tc, ok := conn.(*net.TCPConn)
+	if !ok { return }
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+
+	buf := make([]byte, 4096)
+	n := 0
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for n < len(buf) {
+		nr, err := conn.Read(buf[n:])
+		if nr > 0 {
+			n += nr
+			raw := buf[:n]
+			if indexBytes(raw, actionNeedle) >= 0 && indexBytes(raw, crlfcrlf) >= 0 {
+				break
+			}
+		}
+		if err != nil { return }
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	raw := buf[:n]
+	if extractHeader(raw, actionNeedle) != "tunnel" { return }
+
+	userID := extractHeader(raw, internalIDNeedle)
+	if userID == "" {
+		conn.Write(resp403NotReg)
+		return
+	}
+
+	name, days, result := checkAuth(userID)
+	switch result {
+	case authNotFound:
+		conn.Write(resp403NotReg)
+		return
+	case authExpired:
+		conn.Write(resp403Expired)
+		return
+	}
+
+	resp := fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
+		name, days,
+	)
+	conn.Write([]byte(resp))
+	newMux(conn).run()
+}
+
+func tuneListener(ln net.Listener) {
+	tc, ok := ln.(*net.TCPListener)
+	if !ok { return }
+	raw, err := tc.SyscallConn()
+	if err != nil { return }
+	raw.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+	})
+}
+
+func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	cache.reload()
+	go func() {
+		t := time.NewTicker(cacheReload)
+		defer t.Stop()
+		for range t.C { cache.reload() }
+	}()
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil { log.Fatal(err) }
+	tuneListener(ln)
+	log.Printf("btserver %s -> hev %s (cpus=%d)", listenAddr, hevAddr, runtime.NumCPU())
+	for {
+		conn, err := ln.Accept()
+		if err != nil { continue }
+		go handle(conn)
+	}
+}
+GOEOF
+
+info "Escribiendo panel.py..."
+cat > /opt/btserver/panel.py << PYEOF
+#!/usr/bin/env python3
+import json, time, os, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta, timezone
+
+USERS_FILE = Path("/opt/btserver/users.txt")
+TOKEN_FILE = Path("/opt/btserver/token.txt")
+PORT = ${PANEL_PORT}
+_lock = threading.Lock()
+
+def load_token():
+    return TOKEN_FILE.read_text().strip()
+
+def date_to_str(d):
+    return d.strftime("%Y-%m-%d")
+
+def str_to_date(s):
+    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
+
+def days_left(exp_str):
+    try:
+        exp = str_to_date(exp_str)
+        delta = (exp - datetime.now().date()).days + 1
+        return max(0, delta)
+    except:
+        return 0
+
+def is_active(exp_str):
+    return days_left(exp_str) > 0
+
+def load_users():
+    users = {}
+    if not USERS_FILE.exists():
+        return users
+    with open(USERS_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            uid, name, exp = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if uid:
+                users[uid] = {"name": name, "expires": exp}
+    return users
+
+def save_users(users):
+    lines = ["# formato: id:nombre:YYYY-MM-DD\n"]
+    for uid, data in sorted(users.items()):
+        lines.append(f"{uid}:{data['name']}:{data['expires']}\n")
+    with open(USERS_FILE, "w") as f:
+        f.writelines(lines)
+
+def json_resp(handler, code, data):
+    body = json.dumps(data, ensure_ascii=False).encode()
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
+
+    def auth(self):
+        return self.headers.get("X-Token", "").strip() == load_token()
+
+    def read_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0: return {}
+        try: return json.loads(self.rfile.read(length).decode())
+        except: return {}
+
+    def do_GET(self):
+        if not self.auth(): json_resp(self, 401, {"error": "unauthorized"}); return
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        params = parse_qs(parsed.query)
+
+        if path == "/clients":
+            with _lock:
+                users = load_users()
+            result = []
+            for uid, data in sorted(users.items()):
+                result.append({
+                    "id": uid,
+                    "name": data["name"],
+                    "expires": data["expires"],
+                    "days_left": days_left(data["expires"]),
+                    "active": is_active(data["expires"])
+                })
+            json_resp(self, 200, {"clients": result, "total": len(result)})
+            return
+
+        if path == "/client":
+            uid = params.get("id", [""])[0].strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+            if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+            data = users[uid]
+            json_resp(self, 200, {
+                "id": uid, "name": data["name"],
+                "expires": data["expires"],
+                "days_left": days_left(data["expires"]),
+                "active": is_active(data["expires"])
+            })
+            return
+
+        json_resp(self, 404, {"error": "ruta no encontrada"})
+
+    def do_POST(self):
+        if not self.auth(): json_resp(self, 401, {"error": "unauthorized"}); return
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        body = self.read_body()
+
+        if path == "/client/create":
+            uid  = str(body.get("id", "")).strip()
+            name = str(body.get("name", "sin-nombre")).strip() or "sin-nombre"
+            days = int(body.get("days", 30))
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            exp = date_to_str((datetime.now() + timedelta(days=max(days, 0))).date())
+            with _lock:
+                users = load_users()
+                users[uid] = {"name": name, "expires": exp}
+                save_users(users)
+            json_resp(self, 200, {"ok": True, "id": uid, "name": name, "expires": exp, "days": days})
+            return
+
+        if path == "/client/delete":
+            uid = str(body.get("id", "")).strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+                if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+                users.pop(uid)
+                save_users(users)
+            json_resp(self, 200, {"ok": True})
+            return
+
+        if path == "/client/update":
+            uid = str(body.get("id", "")).strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+                if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+                item = users[uid]
+                if "name" in body:
+                    item["name"] = str(body["name"]).strip() or "sin-nombre"
+                try:
+                    cur_exp = str_to_date(item["expires"])
+                except:
+                    cur_exp = datetime.now().date()
+                base = cur_exp if cur_exp > datetime.now().date() else datetime.now().date()
+                if "add_days" in body:
+                    item["expires"] = date_to_str(base + timedelta(days=max(int(body["add_days"]), 0)))
+                elif "sub_days" in body:
+                    item["expires"] = date_to_str(cur_exp - timedelta(days=max(int(body["sub_days"]), 0)))
+                elif "set_days" in body:
+                    item["expires"] = date_to_str((datetime.now() + timedelta(days=max(int(body["set_days"]), 0))).date())
+                elif "set_date" in body:
+                    item["expires"] = str(body["set_date"]).strip()
+                new_id = str(body.get("new_id", "")).strip()
+                if new_id and new_id != uid:
+                    users.pop(uid)
+                    users[new_id] = item
+                    uid = new_id
+                else:
+                    users[uid] = item
+                save_users(users)
+            json_resp(self, 200, {
+                "ok": True, "id": uid,
+                "name": item["name"],
+                "expires": item["expires"],
+                "days_left": days_left(item["expires"])
+            })
+            return
+
+        json_resp(self, 404, {"error": "ruta no encontrada"})
+
+if __name__ == "__main__":
+    print(f"panel api escuchando :{PORT}")
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+PYEOF
+chmod +x /opt/btserver/panel.py
+
+systemctl stop btserver btpanel 2>/dev/null || true
+sleep 1
+info "Compilando btserver..."
+export PATH=$PATH:/usr/local/go/bin
+export HOME=/root
+export GOPATH=/root/go
+export GOCACHE=/root/.cache/go-build
+export GOFLAGS="-trimpath"
+mkdir -p "$GOPATH" "$GOCACHE"
+
+cd /opt/btserver
+$GO build \
+    -ldflags="-s -w" \
+    -gcflags="all=-B" \
+    -o btserver btserver.go \
+    || die "Error compilando btserver.go"
+chmod +x /opt/btserver/btserver
+info "Compilado OK"
+
+if [ ! -f /opt/btserver/users.txt ]; then
+    printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+    info "users.txt creado"
+fi
+
+cat > /etc/systemd/system/hev-socks5.service << 'SVC'
+[Unit]
+Description=HEV Socks5
+After=network.target
+
+[Service]
+ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server.yml
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat > /etc/systemd/system/btserver.service << 'SVC'
+[Unit]
+Description=BlackTunnel Server
+After=network.target hev-socks5.service
+Requires=hev-socks5.service
+
+[Service]
+ExecStart=/opt/btserver/btserver
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+TasksMax=infinity
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat > /etc/systemd/system/btpanel.service << 'SVC'
+[Unit]
+Description=BlackTunnel Panel API
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/btserver/panel.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl daemon-reload
+systemctl enable hev-socks5 btserver btpanel
+
+info "Iniciando hev-socks5..."
+systemctl restart hev-socks5
+sleep 1
+
+info "Iniciando btserver..."
+systemctl restart btserver
+sleep 1
+
+info "Iniciando btpanel..."
+systemctl restart btpanel
+sleep 1
+
+info "Configurando QoS..."
+IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+if [ -n "$IFACE" ]; then
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 1: prio bands 3 \
+        priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 2ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 5ms interval 100ms
+    tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms interval 100ms
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 1 \
+        u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 2 \
+        u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 3 \
+        u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
+    info "QoS aplicado en $IFACE"
+else
+    info "No se detectó interfaz, QoS omitido"
+fi
+
+echo ""
+echo "================================================"
+echo "  INSTALACION COMPLETA"
+echo "================================================"
+echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
+echo "  TOKEN:      ${PANEL_TOKEN}"
+echo "================================================"
+echo ""
+info "Estado servicios:"
+systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
+echo ""
+info "Crear usuario: POST /client/create  {id, name, days}"
+info "Actualizar:    POST /client/update  {id, add_days/sub_days/set_days/set_date}"
+info "Eliminar:      POST /client/delete  {id}"
+info "Listar:        GET  /clients"
+info "Consultar:     GET  /client?id=xxx"
