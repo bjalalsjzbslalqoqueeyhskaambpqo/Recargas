@@ -67,7 +67,7 @@ PANEL_PORT=8090
 SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
 
 info "Deteniendo servicios existentes..."
-systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
+systemctl stop hev-socks5 hev-socks5-udp btserver btpanel 2>/dev/null || true
 sleep 1
 
 info "Descargando hev-socks5-server..."
@@ -119,8 +119,6 @@ main:
   port: 1080
   listen-address: '127.0.0.1'
   listen-ipv6-only: false
-  udp-port: 1080
-  udp-listen-address: '127.0.0.1'
 dns:
   port: 53
   address: '127.0.0.1'
@@ -130,21 +128,32 @@ misc:
   log-level: warn
 YMLEOF
 
+cat > /opt/btserver/hev-socks5-server-udp.yml << YMLEOF
+main:
+  workers: ${NWORKERS}
+  port: 1081
+  listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+  udp-port: 1081
+  udp-listen-address: '127.0.0.1'
+misc:
+  log-file: stderr
+  log-level: warn
+YMLEOF
+
 info "Tuning TCP/kernel..."
 SYSCTL_CONF=/etc/sysctl.d/99-btserver.conf
 cat > "$SYSCTL_CONF" << 'SYSCTL'
-# Red — 1 Gbps ilimitado, sin restricciones
 net.core.rmem_max=134217728
 net.core.wmem_max=134217728
-net.core.rmem_default=524288
-net.core.wmem_default=524288
-net.ipv4.tcp_rmem=4096 524288 134217728
-net.ipv4.tcp_wmem=4096 524288 134217728
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.tcp_rmem=4096 262144 134217728
+net.ipv4.tcp_wmem=4096 262144 134217728
 net.ipv4.tcp_notsent_lowat=4096
 net.core.somaxconn=4096
 net.ipv4.tcp_max_syn_backlog=4096
 net.core.netdev_max_backlog=16384
-# TCP eficiencia máxima
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=10
@@ -152,11 +161,9 @@ net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=3
 net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_mem=1048576 2097152 134217728
-# BBR + fq — máximo throughput, sin prioridades artificiales
+net.ipv4.tcp_mem=524288 1048576 134217728
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
-# Memoria
 vm.swappiness=5
 vm.dirty_ratio=40
 vm.dirty_background_ratio=10
@@ -181,6 +188,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"strconv"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -192,7 +200,8 @@ import (
 )
 
 const (
-	hevAddr     = "127.0.0.1:1080"
+	hevTCPAddr  = "127.0.0.1:1080"
+	hevUDPAddr  = "127.0.0.1:1081"
 	listenAddr  = "0.0.0.0:80"
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
@@ -311,10 +320,8 @@ func checkAuth(id string) (string, int, authResult) {
 	return e.name, days, authOK
 }
 
-var framePool   = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
-var hdrPool     = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
-var readPool    = sync.Pool{New: func() interface{} { b := make([]byte, maxPayload); return &b }}
-var payloadPool = sync.Pool{New: func() interface{} { b := make([]byte, maxPayload); return &b }}
+var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
+var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
 
 func getFrame() []byte  { return *framePool.Get().(*[]byte) }
 func putFrame(b []byte) { framePool.Put(&b) }
@@ -417,7 +424,7 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 		}
 	}()
 
-	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	hev, err := net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
 	if err != nil {
 		return
 	}
@@ -440,9 +447,7 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	go func() {
 		defer wg.Done()
 		for d := range s.q {
-			_, err := hev.Write(d)
-			payloadPool.Put(&d)
-			if err != nil {
+			if _, err := hev.Write(d); err != nil {
 				return
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
@@ -451,10 +456,8 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 
 	go func() {
 		defer wg.Done()
-		buf := *readPool.Get().(*[]byte)
-		defer readPool.Put(&buf)
+		buf := make([]byte, maxPayload)
 		for {
-			hev.SetReadDeadline(time.Now().Add(time.Duration(idleSecs+5) * time.Second))
 			n, err := hev.Read(buf)
 			if n > 0 {
 				m.send(tData, sid, buf[:n])
@@ -551,12 +554,11 @@ func (m *mux) run() {
 				continue
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
-			payload := (*payloadPool.Get().(*[]byte))[:ln]
+			payload := make([]byte, ln)
 			copy(payload, data)
 			select {
 			case s.q <- payload:
 			default:
-				payloadPool.Put(&payload)
 				if s.tryClose() {
 					m.del(sid)
 					close(s.q)
@@ -581,7 +583,7 @@ func (m *mux) run() {
 }
 
 // udpSession representa el túnel UDP de un usuario.
-// El cliente manda frames [2 bytes len][payload] por la conexión TCP,
+// El cliente manda datagramas crudos por la conexión TCP (sin framing),
 // el servidor los reenvía al hev-socks5-server via UDP y devuelve las respuestas.
 type udpSession struct {
 	conn   net.Conn
@@ -597,7 +599,7 @@ func (u *udpSession) kill() {
 func runUDPTunnel(conn net.Conn) {
 	defer conn.Close()
 
-	hevUDP, err := net.Dial("udp", hevAddr)
+	hevUDP, err := net.Dial("udp", hevUDPAddr)
 	if err != nil {
 		return
 	}
@@ -606,8 +608,6 @@ func runUDPTunnel(conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// cliente → hev: leer frames [2 bytes longitud][payload] del túnel TCP,
-	// reenviar cada datagrama a hev via UDP
 	go func() {
 		defer wg.Done()
 		lhdr := make([]byte, 2)
@@ -629,8 +629,6 @@ func runUDPTunnel(conn net.Conn) {
 		}
 	}()
 
-	// hev → cliente: leer datagramas UDP de hev, reenviar al cliente como
-	// frames [2 bytes longitud][payload] por el túnel TCP
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, maxPayload)
@@ -780,7 +778,6 @@ func handle(conn net.Conn) {
 	conn.Write([]byte(resp))
 
 	if action == "tunnel-udp" {
-		// Túnel UDP: frames [2 bytes len][payload] del cliente → datagramas UDP a hev
 		u := &udpSession{conn: conn}
 		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
 			prev.(*udpSession).kill()
@@ -798,7 +795,6 @@ func handle(conn net.Conn) {
 	}
 }
 
-
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	cache.reload()
@@ -813,7 +809,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("btserver %s -> hev %s (cpus=%d)", listenAddr, hevAddr, runtime.NumCPU())
+	log.Printf("btserver %s tcp->hev:%s udp->hev:%s (cpus=%d)", listenAddr, hevTCPAddr, hevUDPAddr, runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1042,7 +1038,7 @@ fi
 
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
-Description=HEV Socks5
+Description=HEV Socks5 TCP
 After=network.target
 
 [Service]
@@ -1056,11 +1052,27 @@ LimitNPROC=infinity
 WantedBy=multi-user.target
 SVC
 
+cat > /etc/systemd/system/hev-socks5-udp.service << 'SVC'
+[Unit]
+Description=HEV Socks5 UDP
+After=network.target
+
+[Service]
+ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server-udp.yml
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
 cat > /etc/systemd/system/btserver.service << 'SVC'
 [Unit]
 Description=BlackTunnel Server
-After=network.target hev-socks5.service
-Requires=hev-socks5.service
+After=network.target hev-socks5.service hev-socks5-udp.service
+Requires=hev-socks5.service hev-socks5-udp.service
 
 [Service]
 ExecStart=/opt/btserver/btserver
@@ -1092,10 +1104,11 @@ WantedBy=multi-user.target
 SVC
 
 systemctl daemon-reload
-systemctl enable hev-socks5 btserver btpanel
+systemctl enable hev-socks5 hev-socks5-udp btserver btpanel
 
 info "Iniciando hev-socks5..."
 systemctl restart hev-socks5
+systemctl restart hev-socks5-udp
 sleep 1
 
 info "Iniciando btserver..."
@@ -1116,16 +1129,10 @@ echo "  TOKEN:      ${PANEL_TOKEN}"
 echo "================================================"
 echo ""
 info "Estado servicios:"
-systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
-echo ""
-info "Recursos actuales:"
-free -h | awk '/^Mem:/{printf "  RAM: %s usado / %s total\n", $3, $2}'
-top -bn1 | awk '/^%Cpu/{printf "  CPU: %.1f%% en uso\n", 100-$8}'
+systemctl is-active hev-socks5 hev-socks5-udp btserver btpanel 2>/dev/null || true
 echo ""
 info "Crear usuario: POST /client/create  {id, name, days}"
 info "Actualizar:    POST /client/update  {id, add_days/sub_days/set_days/set_date}"
 info "Eliminar:      POST /client/delete  {id}"
 info "Listar:        GET  /clients"
 info "Consultar:     GET  /client?id=xxx"
-echo ""
-info "Monitor en tiempo real: watch -n2 'free -h && echo && ps aux --sort=-%mem | head -6'"
