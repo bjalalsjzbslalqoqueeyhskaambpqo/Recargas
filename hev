@@ -187,7 +187,8 @@ import (
 )
 
 const (
-	hevAddr     = "127.0.0.1:1080"
+	hevTCPAddr  = "127.0.0.1:1080"
+	hevUDPAddr  = "127.0.0.1:1080"
 	listenAddr  = "0.0.0.0:80"
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
@@ -350,12 +351,12 @@ func (s *stream) tryClose() bool { return atomic.CompareAndSwapUint32(&s.closed,
 func (s *stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
 
 type mux struct {
-	conn     net.Conn
-	writeMu  sync.Mutex
-	mu       sync.RWMutex
-	streams  map[uint32]*stream
-	count    int32
-	dead     uint32
+	conn    net.Conn
+	writeMu sync.Mutex
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   int32
+	dead    uint32
 }
 
 func newMux(conn net.Conn) *mux {
@@ -473,7 +474,7 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 		}
 	}()
 
-	target := hevAddr
+	target := hevTCPAddr
 	if len(firstData) >= 10 && firstData[0] == 0x05 {
 		host, port, _ := parseSocks5Host(firstData)
 		if host != "" {
@@ -489,8 +490,8 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 
 	hev, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		if target != hevAddr {
-			hev, err = net.DialTimeout("tcp", hevAddr, dialTimeout)
+		if target != hevTCPAddr {
+			hev, err = net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
 		}
 		if err != nil {
 			return
@@ -650,7 +651,70 @@ func (m *mux) run() {
 	m.mu.Unlock()
 }
 
-var activeSessions sync.Map
+// udpSession representa el túnel UDP de un usuario.
+// El cliente manda datagramas crudos por la conexión TCP (sin framing),
+// el servidor los reenvía al hev-socks5-server via UDP y devuelve las respuestas.
+type udpSession struct {
+	conn   net.Conn
+	dead   uint32
+}
+
+func (u *udpSession) kill() {
+	if atomic.CompareAndSwapUint32(&u.dead, 0, 1) {
+		u.conn.Close()
+	}
+}
+
+func runUDPTunnel(conn net.Conn) {
+	defer conn.Close()
+
+	hevUDP, err := net.Dial("udp", hevUDPAddr)
+	if err != nil {
+		return
+	}
+	defer hevUDP.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// cliente → hev: leer datagramas de la conexión TCP, reenviar a hev via UDP
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+				hevUDP.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// hev → cliente: leer respuestas UDP de hev, reenviar al cliente via TCP
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := hevUDP.Read(buf)
+			if n > 0 {
+				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				conn.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+var activeSessions    sync.Map
+var activeUDPSessions sync.Map
 
 var (
 	actionNeedle     = []byte("action:")
@@ -747,7 +811,10 @@ func handle(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 
 	raw := buf[:n]
-	if extractHeader(raw, actionNeedle) != "tunnel" {
+	action := extractHeader(raw, actionNeedle)
+
+	// Aceptar: "tunnel" (compatibilidad), "tunnel-tcp", "tunnel-udp"
+	if action != "tunnel" && action != "tunnel-tcp" && action != "tunnel-udp" {
 		return
 	}
 
@@ -767,20 +834,29 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	m := newMux(conn)
-
-	if prev, loaded := activeSessions.Swap(userID, m); loaded {
-		prev.(*mux).kill()
-	}
-
 	resp := fmt.Sprintf(
 		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
 		name, days,
 	)
 	conn.Write([]byte(resp))
-	m.run()
 
-	activeSessions.CompareAndDelete(userID, m)
+	if action == "tunnel-udp" {
+		// Túnel UDP: datagramas directos sin framing, relay a hev via UDP
+		u := &udpSession{conn: conn}
+		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
+			prev.(*udpSession).kill()
+		}
+		runUDPTunnel(conn)
+		activeUDPSessions.CompareAndDelete(userID, u)
+	} else {
+		// "tunnel" o "tunnel-tcp": mux TCP con framing
+		m := newMux(conn)
+		if prev, loaded := activeSessions.Swap(userID, m); loaded {
+			prev.(*mux).kill()
+		}
+		m.run()
+		activeSessions.CompareAndDelete(userID, m)
+	}
 }
 
 func tuneListener(ln net.Listener) {
@@ -814,7 +890,7 @@ func main() {
 		log.Fatal(err)
 	}
 	tuneListener(ln)
-	log.Printf("btserver %s -> hev %s (cpus=%d)", listenAddr, hevAddr, runtime.NumCPU())
+	log.Printf("btserver %s -> hev tcp:%s udp:%s (cpus=%d)", listenAddr, hevTCPAddr, hevUDPAddr, runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
