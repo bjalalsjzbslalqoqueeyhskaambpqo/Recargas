@@ -180,7 +180,6 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
-	"fmt"
 	"strconv"
 	"io"
 	"log"
@@ -408,33 +407,6 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	putHdr(hdr)
 }
 
-func socks5Handshake(conn net.Conn, req []byte) error {
-	// greeting
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return err
-	}
-	var buf [2]byte
-	if _, err := io.ReadFull(conn, buf[:]); err != nil {
-		return err
-	}
-	if buf[0] != 0x05 || buf[1] != 0x00 {
-		return fmt.Errorf("auth")
-	}
-	// CONNECT request (as received from HEV)
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
-	// read CONNECT reply (10 bytes minimum)
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return err
-	}
-	if reply[0] != 0x05 || reply[1] != 0x00 {
-		return fmt.Errorf("connect rejected: %d", reply[1])
-	}
-	return nil
-}
-
 func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	defer func() {
 		if s.tryClose() {
@@ -444,31 +416,6 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 			}
 		}
 	}()
-
-	if len(firstData) < 4 {
-		return
-	}
-
-	// Calcular tamaño del header SOCKS5 CONNECT
-	socksHdr := 0
-	switch firstData[3] {
-	case 0x01:
-		if len(firstData) < 10 { return }
-		socksHdr = 10
-	case 0x03:
-		if len(firstData) < 5 { return }
-		nl := int(firstData[4])
-		if len(firstData) < 5+nl+2 { return }
-		socksHdr = 5 + nl + 2
-	case 0x04:
-		if len(firstData) < 22 { return }
-		socksHdr = 22
-	default:
-		return
-	}
-
-	connectReq := firstData[:socksHdr]
-	appData    := firstData[socksHdr:]
 
 	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
 	if err != nil {
@@ -481,12 +428,8 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	tc.SetReadBuffer(65536)
 	tc.SetWriteBuffer(65536)
 
-	if err := socks5Handshake(hev, connectReq); err != nil {
-		return
-	}
-
-	if len(appData) > 0 {
-		if _, err := hev.Write(appData); err != nil {
+	if len(firstData) > 0 {
+		if _, err := hev.Write(firstData); err != nil {
 			return
 		}
 	}
