@@ -133,27 +133,33 @@ YMLEOF
 info "Tuning TCP/kernel..."
 SYSCTL_CONF=/etc/sysctl.d/99-btserver.conf
 cat > "$SYSCTL_CONF" << 'SYSCTL'
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
+# Buffers de red — VM alto rendimiento, 20 usuarios
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
 net.core.rmem_default=262144
 net.core.wmem_default=262144
-net.ipv4.tcp_rmem=4096 262144 16777216
-net.ipv4.tcp_wmem=4096 262144 16777216
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
 net.ipv4.tcp_notsent_lowat=4096
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=4096
+net.core.netdev_max_backlog=8192
+# TCP eficiencia
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=10
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=3
-net.core.somaxconn=65535
-net.ipv4.tcp_max_syn_backlog=65535
-net.core.netdev_max_backlog=65535
-fs.file-max=1000000
-net.ipv4.tcp_mem=786432 1048576 16777216
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mem=524288 1048576 33554432
+# Congestion control — BBR máximo rendimiento
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
-net.ipv4.tcp_low_latency=1
+# Memoria — anti-swap agresivo en VM
+vm.swappiness=5
+vm.dirty_ratio=40
+vm.dirty_background_ratio=10
 SYSCTL
 
 modprobe tcp_bbr 2>/dev/null || true
@@ -174,7 +180,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
-	"fmt"
+	"strconv"
 	"io"
 	"log"
 	"net"
@@ -182,13 +188,11 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 const (
-	hevTCPAddr  = "127.0.0.1:1080"
-	hevUDPAddr  = "127.0.0.1:1080"
+	hevAddr     = "127.0.0.1:1080"
 	listenAddr  = "0.0.0.0:80"
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
@@ -202,41 +206,15 @@ const (
 	sidCtrlMin = uint32(0x40000000)
 	sidCtrlMax = uint32(0x7FFFFFFF)
 
-	maxStreams   = 4096
-	idleSecs     = 120
-	watchdogSecs = 30
-	queueSize    = 512
+	maxStreams   = 128
+	idleSecs     = 45
+	watchdogSecs = 15
+	queueSize    = 32
 	dialTimeout  = 3 * time.Second
 	writeTimeout = 3 * time.Second
 	maxPayload   = 16384
 
-	dnsTTL = 5 * time.Minute
 )
-
-type dnsEntry struct {
-	ips    []string
-	expiry int64
-}
-
-var dnsCache sync.Map
-
-func resolveHost(host string) (string, error) {
-	now := time.Now().Unix()
-	if v, ok := dnsCache.Load(host); ok {
-		e := v.(*dnsEntry)
-		if now < atomic.LoadInt64(&e.expiry) {
-			return e.ips[0], nil
-		}
-	}
-	addrs, err := net.LookupHost(host)
-	if err != nil || len(addrs) == 0 {
-		return "", err
-	}
-	entry := &dnsEntry{ips: addrs}
-	atomic.StoreInt64(&entry.expiry, time.Now().Add(dnsTTL).Unix())
-	dnsCache.Store(host, entry)
-	return addrs[0], nil
-}
 
 type userEntry struct {
 	name    string
@@ -333,8 +311,10 @@ func checkAuth(id string) (string, int, authResult) {
 	return e.name, days, authOK
 }
 
-var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
-var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
+var framePool   = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
+var hdrPool     = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
+var readPool    = sync.Pool{New: func() interface{} { b := make([]byte, maxPayload); return &b }}
+var payloadPool = sync.Pool{New: func() interface{} { b := make([]byte, maxPayload); return &b }}
 
 func getFrame() []byte  { return *framePool.Get().(*[]byte) }
 func putFrame(b []byte) { framePool.Put(&b) }
@@ -427,43 +407,6 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	putHdr(hdr)
 }
 
-func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
-	if len(data) < 4 {
-		return "", 0, 0
-	}
-	if data[0] != 0x05 {
-		return "", 0, 0
-	}
-	switch data[3] {
-	case 0x01:
-		if len(data) < 10 {
-			return "", 0, 0
-		}
-		host = net.IP(data[4:8]).String()
-		port = binary.BigEndian.Uint16(data[8:10])
-		headerLen = 10
-	case 0x03:
-		if len(data) < 5 {
-			return "", 0, 0
-		}
-		l := int(data[4])
-		if len(data) < 5+l+2 {
-			return "", 0, 0
-		}
-		host = string(data[5 : 5+l])
-		port = binary.BigEndian.Uint16(data[5+l : 5+l+2])
-		headerLen = 5 + l + 2
-	case 0x04:
-		if len(data) < 22 {
-			return "", 0, 0
-		}
-		host = net.IP(data[4:20]).String()
-		port = binary.BigEndian.Uint16(data[20:22])
-		headerLen = 22
-	}
-	return
-}
-
 func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	defer func() {
 		if s.tryClose() {
@@ -474,28 +417,9 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 		}
 	}()
 
-	target := hevTCPAddr
-	if len(firstData) >= 10 && firstData[0] == 0x05 {
-		host, port, _ := parseSocks5Host(firstData)
-		if host != "" {
-			if port == 0 {
-				port = 80
-			}
-			resolved, err := resolveHost(host)
-			if err == nil {
-				target = fmt.Sprintf("%s:%d", resolved, port)
-			}
-		}
-	}
-
-	hev, err := net.DialTimeout("tcp", target, dialTimeout)
+	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
 	if err != nil {
-		if target != hevTCPAddr {
-			hev, err = net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
-		}
-		if err != nil {
-			return
-		}
+		return
 	}
 	defer hev.Close()
 
@@ -516,7 +440,9 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	go func() {
 		defer wg.Done()
 		for d := range s.q {
-			if _, err := hev.Write(d); err != nil {
+			_, err := hev.Write(d)
+			payloadPool.Put(&d)
+			if err != nil {
 				return
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
@@ -525,8 +451,10 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, maxPayload)
+		buf := *readPool.Get().(*[]byte)
+		defer readPool.Put(&buf)
 		for {
+			hev.SetReadDeadline(time.Now().Add(time.Duration(idleSecs+5) * time.Second))
 			n, err := hev.Read(buf)
 			if n > 0 {
 				m.send(tData, sid, buf[:n])
@@ -623,11 +551,12 @@ func (m *mux) run() {
 				continue
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
-			payload := make([]byte, ln)
+			payload := (*payloadPool.Get().(*[]byte))[:ln]
 			copy(payload, data)
 			select {
 			case s.q <- payload:
 			default:
+				payloadPool.Put(&payload)
 				if s.tryClose() {
 					m.del(sid)
 					close(s.q)
@@ -652,7 +581,7 @@ func (m *mux) run() {
 }
 
 // udpSession representa el túnel UDP de un usuario.
-// El cliente manda datagramas crudos por la conexión TCP (sin framing),
+// El cliente manda frames [2 bytes len][payload] por la conexión TCP,
 // el servidor los reenvía al hev-socks5-server via UDP y devuelve las respuestas.
 type udpSession struct {
 	conn   net.Conn
@@ -668,7 +597,7 @@ func (u *udpSession) kill() {
 func runUDPTunnel(conn net.Conn) {
 	defer conn.Close()
 
-	hevUDP, err := net.Dial("udp", hevUDPAddr)
+	hevUDP, err := net.Dial("udp", hevAddr)
 	if err != nil {
 		return
 	}
@@ -677,32 +606,44 @@ func runUDPTunnel(conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// cliente → hev: leer datagramas de la conexión TCP, reenviar a hev via UDP
+	// cliente → hev: leer frames [2 bytes longitud][payload] del túnel TCP,
+	// reenviar cada datagrama a hev via UDP
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, maxPayload)
+		lhdr := make([]byte, 2)
+		payload := make([]byte, maxPayload)
 		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
-				hevUDP.Write(buf[:n])
-			}
-			if err != nil {
+			conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			if _, err := io.ReadFull(conn, lhdr); err != nil {
 				return
 			}
+			dlen := int(lhdr[0])<<8 | int(lhdr[1])
+			if dlen == 0 || dlen > maxPayload {
+				return
+			}
+			if _, err := io.ReadFull(conn, payload[:dlen]); err != nil {
+				return
+			}
+			hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+			hevUDP.Write(payload[:dlen])
 		}
 	}()
 
-	// hev → cliente: leer respuestas UDP de hev, reenviar al cliente via TCP
+	// hev → cliente: leer datagramas UDP de hev, reenviar al cliente como
+	// frames [2 bytes longitud][payload] por el túnel TCP
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, maxPayload)
+		frame := make([]byte, 2+maxPayload)
 		for {
 			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
 			n, err := hevUDP.Read(buf)
 			if n > 0 {
+				frame[0] = byte(n >> 8)
+				frame[1] = byte(n)
+				copy(frame[2:], buf[:n])
 				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				conn.Write(buf[:n])
+				conn.Write(frame[:2+n])
 			}
 			if err != nil {
 				return
@@ -834,14 +775,12 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	resp := fmt.Sprintf(
-		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
-		name, days,
-	)
+	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"X-User-Name: " + name + "\r\nX-User-Days: " + strconv.Itoa(days) + "\r\n\r\n"
 	conn.Write([]byte(resp))
 
 	if action == "tunnel-udp" {
-		// Túnel UDP: datagramas directos sin framing, relay a hev via UDP
+		// Túnel UDP: frames [2 bytes len][payload] del cliente → datagramas UDP a hev
 		u := &udpSession{conn: conn}
 		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
 			prev.(*udpSession).kill()
@@ -859,21 +798,6 @@ func handle(conn net.Conn) {
 	}
 }
 
-func tuneListener(ln net.Listener) {
-	tc, ok := ln.(*net.TCPListener)
-	if !ok {
-		return
-	}
-	raw, err := tc.SyscallConn()
-	if err != nil {
-		return
-	}
-	raw.Control(func(fd uintptr) {
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
-	})
-}
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -889,8 +813,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tuneListener(ln)
-	log.Printf("btserver %s -> hev tcp:%s udp:%s (cpus=%d)", listenAddr, hevTCPAddr, hevUDPAddr, runtime.NumCPU())
+	log.Printf("btserver %s -> hev %s (cpus=%d)", listenAddr, hevAddr, runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
