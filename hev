@@ -67,7 +67,7 @@ PANEL_PORT=8090
 SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
 
 info "Deteniendo servicios existentes..."
-systemctl stop hev-socks5 hev-socks5-udp btserver btpanel 2>/dev/null || true
+systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
 sleep 1
 
 info "Descargando hev-socks5-server..."
@@ -119,6 +119,8 @@ main:
   port: 1080
   listen-address: '127.0.0.1'
   listen-ipv6-only: false
+  udp-port: 1080
+  udp-listen-address: '127.0.0.1'
 dns:
   port: 53
   address: '127.0.0.1'
@@ -128,45 +130,30 @@ misc:
   log-level: warn
 YMLEOF
 
-cat > /opt/btserver/hev-socks5-server-udp.yml << YMLEOF
-main:
-  workers: ${NWORKERS}
-  port: 1081
-  listen-address: '127.0.0.1'
-  listen-ipv6-only: false
-  udp-port: 1081
-  udp-listen-address: '127.0.0.1'
-misc:
-  log-file: stderr
-  log-level: warn
-YMLEOF
-
 info "Tuning TCP/kernel..."
 SYSCTL_CONF=/etc/sysctl.d/99-btserver.conf
 cat > "$SYSCTL_CONF" << 'SYSCTL'
-net.core.rmem_max=134217728
-net.core.wmem_max=134217728
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
 net.core.rmem_default=262144
 net.core.wmem_default=262144
-net.ipv4.tcp_rmem=4096 262144 134217728
-net.ipv4.tcp_wmem=4096 262144 134217728
+net.ipv4.tcp_rmem=4096 262144 16777216
+net.ipv4.tcp_wmem=4096 262144 16777216
 net.ipv4.tcp_notsent_lowat=4096
-net.core.somaxconn=4096
-net.ipv4.tcp_max_syn_backlog=4096
-net.core.netdev_max_backlog=16384
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=10
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=3
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_mem=524288 1048576 134217728
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=1000000
+net.ipv4.tcp_mem=786432 1048576 16777216
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
-vm.swappiness=5
-vm.dirty_ratio=40
-vm.dirty_background_ratio=10
+net.ipv4.tcp_low_latency=1
 SYSCTL
 
 modprobe tcp_bbr 2>/dev/null || true
@@ -187,7 +174,6 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
-	"strconv"
 	"fmt"
 	"io"
 	"log"
@@ -196,12 +182,13 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 const (
 	hevTCPAddr  = "127.0.0.1:1080"
-	hevUDPAddr  = "127.0.0.1:1081"
+	hevUDPAddr  = "127.0.0.1:1080"
 	listenAddr  = "0.0.0.0:80"
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
@@ -215,15 +202,41 @@ const (
 	sidCtrlMin = uint32(0x40000000)
 	sidCtrlMax = uint32(0x7FFFFFFF)
 
-	maxStreams   = 128
-	idleSecs     = 45
-	watchdogSecs = 15
-	queueSize    = 32
+	maxStreams   = 4096
+	idleSecs     = 120
+	watchdogSecs = 30
+	queueSize    = 512
 	dialTimeout  = 3 * time.Second
 	writeTimeout = 3 * time.Second
 	maxPayload   = 16384
 
+	dnsTTL = 5 * time.Minute
 )
+
+type dnsEntry struct {
+	ips    []string
+	expiry int64
+}
+
+var dnsCache sync.Map
+
+func resolveHost(host string) (string, error) {
+	now := time.Now().Unix()
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(*dnsEntry)
+		if now < atomic.LoadInt64(&e.expiry) {
+			return e.ips[0], nil
+		}
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return "", err
+	}
+	entry := &dnsEntry{ips: addrs}
+	atomic.StoreInt64(&entry.expiry, time.Now().Add(dnsTTL).Unix())
+	dnsCache.Store(host, entry)
+	return addrs[0], nil
+}
 
 type userEntry struct {
 	name    string
@@ -414,6 +427,43 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	putHdr(hdr)
 }
 
+func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
+	if len(data) < 4 {
+		return "", 0, 0
+	}
+	if data[0] != 0x05 {
+		return "", 0, 0
+	}
+	switch data[3] {
+	case 0x01:
+		if len(data) < 10 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:8]).String()
+		port = binary.BigEndian.Uint16(data[8:10])
+		headerLen = 10
+	case 0x03:
+		if len(data) < 5 {
+			return "", 0, 0
+		}
+		l := int(data[4])
+		if len(data) < 5+l+2 {
+			return "", 0, 0
+		}
+		host = string(data[5 : 5+l])
+		port = binary.BigEndian.Uint16(data[5+l : 5+l+2])
+		headerLen = 5 + l + 2
+	case 0x04:
+		if len(data) < 22 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:20]).String()
+		port = binary.BigEndian.Uint16(data[20:22])
+		headerLen = 22
+	}
+	return
+}
+
 func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	defer func() {
 		if s.tryClose() {
@@ -424,9 +474,28 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 		}
 	}()
 
-	hev, err := net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+	target := hevTCPAddr
+	if len(firstData) >= 10 && firstData[0] == 0x05 {
+		host, port, _ := parseSocks5Host(firstData)
+		if host != "" {
+			if port == 0 {
+				port = 80
+			}
+			resolved, err := resolveHost(host)
+			if err == nil {
+				target = fmt.Sprintf("%s:%d", resolved, port)
+			}
+		}
+	}
+
+	hev, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		return
+		if target != hevTCPAddr {
+			hev, err = net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+		}
+		if err != nil {
+			return
+		}
 	}
 	defer hev.Close()
 
@@ -608,40 +677,32 @@ func runUDPTunnel(conn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		lhdr := make([]byte, 2)
-		payload := make([]byte, maxPayload)
-		for {
-			conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-			if _, err := io.ReadFull(conn, lhdr); err != nil {
-				return
-			}
-			dlen := int(lhdr[0])<<8 | int(lhdr[1])
-			if dlen == 0 || dlen > maxPayload {
-				return
-			}
-			if _, err := io.ReadFull(conn, payload[:dlen]); err != nil {
-				return
-			}
-			hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
-			hevUDP.Write(payload[:dlen])
-		}
-	}()
-
+	// cliente → hev: leer datagramas de la conexión TCP, reenviar a hev via UDP
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, maxPayload)
-		frame := make([]byte, 2+maxPayload)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+				hevUDP.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// hev → cliente: leer respuestas UDP de hev, reenviar al cliente via TCP
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
 		for {
 			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
 			n, err := hevUDP.Read(buf)
 			if n > 0 {
-				frame[0] = byte(n >> 8)
-				frame[1] = byte(n)
-				copy(frame[2:], buf[:n])
 				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				conn.Write(frame[:2+n])
+				conn.Write(buf[:n])
 			}
 			if err != nil {
 				return
@@ -773,11 +834,14 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-		"X-User-Name: " + name + "\r\nX-User-Days: " + strconv.Itoa(days) + "\r\n\r\n"
+	resp := fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
+		name, days,
+	)
 	conn.Write([]byte(resp))
 
 	if action == "tunnel-udp" {
+		// Túnel UDP: datagramas directos sin framing, relay a hev via UDP
 		u := &udpSession{conn: conn}
 		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
 			prev.(*udpSession).kill()
@@ -795,6 +859,22 @@ func handle(conn net.Conn) {
 	}
 }
 
+func tuneListener(ln net.Listener) {
+	tc, ok := ln.(*net.TCPListener)
+	if !ok {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+	})
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	cache.reload()
@@ -809,7 +889,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("btserver %s tcp->hev:%s udp->hev:%s (cpus=%d)", listenAddr, hevTCPAddr, hevUDPAddr, runtime.NumCPU())
+	tuneListener(ln)
+	log.Printf("btserver %s -> hev tcp:%s udp:%s (cpus=%d)", listenAddr, hevTCPAddr, hevUDPAddr, runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -1038,7 +1119,7 @@ fi
 
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
-Description=HEV Socks5 TCP
+Description=HEV Socks5
 After=network.target
 
 [Service]
@@ -1052,27 +1133,11 @@ LimitNPROC=infinity
 WantedBy=multi-user.target
 SVC
 
-cat > /etc/systemd/system/hev-socks5-udp.service << 'SVC'
-[Unit]
-Description=HEV Socks5 UDP
-After=network.target
-
-[Service]
-ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server-udp.yml
-Restart=always
-RestartSec=2
-LimitNOFILE=1000000
-LimitNPROC=infinity
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
 cat > /etc/systemd/system/btserver.service << 'SVC'
 [Unit]
 Description=BlackTunnel Server
-After=network.target hev-socks5.service hev-socks5-udp.service
-Requires=hev-socks5.service hev-socks5-udp.service
+After=network.target hev-socks5.service
+Requires=hev-socks5.service
 
 [Service]
 ExecStart=/opt/btserver/btserver
@@ -1104,11 +1169,10 @@ WantedBy=multi-user.target
 SVC
 
 systemctl daemon-reload
-systemctl enable hev-socks5 hev-socks5-udp btserver btpanel
+systemctl enable hev-socks5 btserver btpanel
 
 info "Iniciando hev-socks5..."
 systemctl restart hev-socks5
-systemctl restart hev-socks5-udp
 sleep 1
 
 info "Iniciando btserver..."
@@ -1119,6 +1183,25 @@ info "Iniciando btpanel..."
 systemctl restart btpanel
 sleep 1
 
+info "Configurando QoS..."
+IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+if [ -n "$IFACE" ]; then
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 1: prio bands 3 \
+        priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 2ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 5ms interval 100ms
+    tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms interval 100ms
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 1 \
+        u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 2 \
+        u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 3 \
+        u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
+    info "QoS aplicado en $IFACE"
+else
+    info "No se detectó interfaz, QoS omitido"
+fi
 
 echo ""
 echo "================================================"
@@ -1129,7 +1212,7 @@ echo "  TOKEN:      ${PANEL_TOKEN}"
 echo "================================================"
 echo ""
 info "Estado servicios:"
-systemctl is-active hev-socks5 hev-socks5-udp btserver btpanel 2>/dev/null || true
+systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
 echo ""
 info "Crear usuario: POST /client/create  {id, name, days}"
 info "Actualizar:    POST /client/update  {id, add_days/sub_days/set_days/set_date}"
