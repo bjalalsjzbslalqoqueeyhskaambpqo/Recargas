@@ -539,7 +539,7 @@ func (m *mux) watchdog() {
 			s, ok := m.streams[sid]
 			if ok {
 				delete(m.streams, sid)
-				atomic.AddInt32(&m.count, -1)
+				m.count.Add(-1)
 			}
 			m.mu.Unlock()
 			if ok && s.tryClose() {
