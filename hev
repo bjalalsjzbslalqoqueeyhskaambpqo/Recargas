@@ -143,6 +143,8 @@ LIMITS
 
 info "Escribiendo btserver.go..."
 cat > /opt/btserver/btserver.go << 'GOEOF'
+//go:build go1.20
+
 package main
 
 import (
@@ -154,6 +156,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -167,11 +170,11 @@ const (
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
 
-	tOpen  = 0x01
-	tData  = 0x02
-	tClose = 0x03
-	tPing  = 0x04
-	tPong  = 0x05
+	tOpen  byte = 0x01
+	tData  byte = 0x02
+	tClose byte = 0x03
+	tPing  byte = 0x04
+	tPong  byte = 0x05
 
 	sidCtrlMin = uint32(0x40000000)
 	sidCtrlMax = uint32(0x7FFFFFFF)
@@ -198,7 +201,7 @@ func resolveHost(host string) (string, error) {
 	now := time.Now().Unix()
 	if v, ok := dnsCache.Load(host); ok {
 		e := v.(*dnsEntry)
-		if now < atomic.LoadInt64(&e.expiry) {
+		if now < e.expiry {
 			return e.ips[0], nil
 		}
 	}
@@ -207,7 +210,7 @@ func resolveHost(host string) (string, error) {
 		return "", err
 	}
 	entry := &dnsEntry{ips: addrs}
-	atomic.StoreInt64(&entry.expiry, time.Now().Add(dnsTTL).Unix())
+	entry.expiry = time.Now().Add(dnsTTL).Unix()
 	dnsCache.Store(host, entry)
 	return addrs[0], nil
 }
@@ -317,20 +320,20 @@ func putHdr(b []byte)   { hdrPool.Put(&b) }
 
 type stream struct {
 	q      chan []byte
-	active int64
-	closed uint32
+	active atomic.Int64
+	closed atomic.Uint32
 }
 
-func (s *stream) tryClose() bool { return atomic.CompareAndSwapUint32(&s.closed, 0, 1) }
-func (s *stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
+func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
+func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
 	conn    net.Conn
 	writeMu sync.Mutex
 	mu      sync.RWMutex
 	streams map[uint32]*stream
-	count   int32
-	dead    uint32
+	count   atomic.Int32
+	dead    atomic.Uint32
 }
 
 func newMux(conn net.Conn) *mux {
@@ -338,7 +341,7 @@ func newMux(conn net.Conn) *mux {
 }
 
 func (m *mux) kill() {
-	if atomic.CompareAndSwapUint32(&m.dead, 0, 1) {
+	if m.dead.CompareAndSwap(0, 1) {
 		m.conn.Close()
 	}
 }
@@ -346,11 +349,11 @@ func (m *mux) kill() {
 func (m *mux) add(sid uint32, s *stream) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if int(m.count) >= maxStreams {
+	if int(m.count.Load()) >= maxStreams {
 		return false
 	}
 	m.streams[sid] = s
-	atomic.AddInt32(&m.count, 1)
+	m.count.Add(1)
 	return true
 }
 
@@ -365,12 +368,15 @@ func (m *mux) del(sid uint32) {
 	m.mu.Lock()
 	if _, ok := m.streams[sid]; ok {
 		delete(m.streams, sid)
-		atomic.AddInt32(&m.count, -1)
+		m.count.Add(-1)
 	}
 	m.mu.Unlock()
 }
 
 func (m *mux) send(t byte, sid uint32, data []byte) {
+	if m.dead.Load() == 1 {
+		return
+	}
 	ln := len(data)
 	buf := getFrame()
 	buf[0] = t
@@ -489,7 +495,7 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 			if _, err := hev.Write(d); err != nil {
 				break
 			}
-			atomic.StoreInt64(&s.active, time.Now().Unix())
+			s.active.Store(time.Now().Unix())
 		}
 		tc.CloseWrite()
 	}()
@@ -501,7 +507,7 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 			n, err := hev.Read(buf)
 			if n > 0 {
 				m.send(tData, sid, buf[:n])
-				atomic.StoreInt64(&s.active, time.Now().Unix())
+				s.active.Store(time.Now().Unix())
 			}
 			if err != nil {
 				return
@@ -516,14 +522,14 @@ func (m *mux) watchdog() {
 	ticker := time.NewTicker(watchdogSecs * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if atomic.LoadUint32(&m.dead) == 1 {
+		if m.dead.Load() == 1 {
 			return
 		}
 		now := time.Now().Unix()
 		m.mu.RLock()
 		toKill := make([]uint32, 0, 16)
 		for sid, s := range m.streams {
-			if now-atomic.LoadInt64(&s.active) > idleSecs {
+			if now-s.active.Load() > idleSecs {
 				toKill = append(toKill, sid)
 			}
 		}
@@ -576,7 +582,7 @@ func (m *mux) run() {
 
 		switch ft {
 		case tOpen:
-			s := &stream{q: make(chan []byte, queueSize), active: time.Now().Unix()}
+			s := &stream{q: make(chan []byte, queueSize), }
 			if !m.add(sid, s) {
 				m.sendHdr(tClose, sid)
 				continue
@@ -592,7 +598,7 @@ func (m *mux) run() {
 			if s == nil || s.isClosed() {
 				continue
 			}
-			atomic.StoreInt64(&s.active, time.Now().Unix())
+			s.active.Store(time.Now().Unix())
 			payload := make([]byte, ln)
 			copy(payload, data)
 			select {
@@ -623,11 +629,11 @@ func (m *mux) run() {
 
 type udpSession struct {
 	conn net.Conn
-	dead uint32
+	dead atomic.Uint32
 }
 
 func (u *udpSession) kill() {
-	if atomic.CompareAndSwapUint32(&u.dead, 0, 1) {
+	if u.dead.CompareAndSwap(0, 1) {
 		u.conn.Close()
 	}
 }
@@ -816,6 +822,7 @@ func handle(conn net.Conn) {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetMemoryLimit(768 << 20)
 	cache.reload()
 	go func() {
 		t := time.NewTicker(cacheReload)
@@ -1018,7 +1025,7 @@ export GOCACHE=/root/.cache/go-build
 export GOFLAGS="-trimpath"
 mkdir -p "$GOPATH" "$GOCACHE"
 cd /opt/btserver
-$GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go || die "Error compilando btserver.go"
+GOEXPERIMENT=greenteagc $GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go ||     $GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go || die "Error compilando btserver.go"
 chmod +x /opt/btserver/btserver
 info "Compilado OK"
 
