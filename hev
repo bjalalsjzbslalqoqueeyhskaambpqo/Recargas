@@ -15,37 +15,20 @@ elif command -v curl >/dev/null 2>&1; then
     FETCH="curl -fsSL --connect-timeout 30 -o"
 else
     apt-get update -qq --fix-missing 2>/dev/null || true
-    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl disponible"
+    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl"
     FETCH="wget -q --timeout=30 -O"
 fi
 
-export PATH=$PATH:/usr/local/go/bin
-_need_go=true
-if command -v go >/dev/null 2>&1 || [ -f /usr/local/go/bin/go ]; then
-    _ver=$(go version 2>/dev/null | grep -oE 'go[0-9]+\.[0-9]+' | head -1 | tr -d 'go')
-    _maj=$(echo "$_ver" | cut -d. -f1)
-    _min=$(echo "$_ver" | cut -d. -f2)
-    if [ "${_maj:-0}" -gt 1 ] || { [ "${_maj:-0}" -eq 1 ] && [ "${_min:-0}" -ge 18 ]; }; then
-        _need_go=false
-        info "Go ya presente: $(go version)"
-    fi
-fi
-
-if [ "$_need_go" = "true" ]; then
-    info "Instalando Go 1.22..."
-    $FETCH /tmp/go.tar.gz https://go.dev/dl/go1.22.4.linux-amd64.tar.gz || die "No se pudo descargar Go"
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf /tmp/go.tar.gz
-    rm -f /tmp/go.tar.gz
-    export PATH=/usr/local/go/bin:$PATH
-    hash -r 2>/dev/null || true
-fi
-
-export PATH=/usr/local/go/bin:$(echo $PATH | tr ":" "\n" | grep -v "^/usr/local/go/bin$" | tr "\n" ":")
-hash -r 2>/dev/null || true
+info "Instalando Go 1.26.2..."
+rm -rf /usr/local/go
+$FETCH /tmp/go.tar.gz https://go.dev/dl/go1.26.2.linux-amd64.tar.gz || die "No se pudo descargar Go"
+tar -C /usr/local -xzf /tmp/go.tar.gz
+rm -f /tmp/go.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+export PATH=/usr/local/go/bin:$PATH
 GO=/usr/local/go/bin/go
-[ -f "$GO" ] || GO=$(command -v go) || die "go no encontrado"
-info "Usando Go: $($GO version)"
+info "Go: $($GO version)"
 
 if [ -f /opt/btserver/token.txt ] && [ -s /opt/btserver/token.txt ]; then
     PANEL_TOKEN=$(cat /opt/btserver/token.txt)
@@ -70,15 +53,16 @@ $FETCH /tmp/hev-socks5-server.tmp \
     || die "No se pudo descargar hev-socks5-server"
 mv -f /tmp/hev-socks5-server.tmp /opt/btserver/hev-socks5-server
 chmod +x /opt/btserver/hev-socks5-server
-
-if ! command -v dnsmasq >/dev/null 2>&1; then
-    apt-get update -qq --fix-missing 2>/dev/null || true
-    apt-get install -y -qq dnsmasq 2>/dev/null || info "dnsmasq no disponible"
-fi
+info "hev-socks5-server OK"
 
 if ! command -v python3 >/dev/null 2>&1; then
     apt-get update -qq --fix-missing 2>/dev/null || true
     apt-get install -y -qq python3 2>/dev/null || die "python3 no disponible"
+fi
+
+if ! command -v dnsmasq >/dev/null 2>&1; then
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq dnsmasq 2>/dev/null || info "dnsmasq no disponible"
 fi
 
 if command -v dnsmasq >/dev/null 2>&1; then
@@ -92,7 +76,7 @@ if command -v dnsmasq >/dev/null 2>&1; then
     cat > /etc/dnsmasq.d/btserver.conf << 'DNSEOF'
 cache-size=10000
 no-negcache
-dns-forward-max=500
+dns-forward-max=300
 server=8.8.8.8
 server=1.1.1.1
 listen-address=127.0.0.1
@@ -112,15 +96,18 @@ main:
   port: 1080
   listen-address: '127.0.0.1'
   listen-ipv6-only: false
+  udp-port: 1080
+  udp-listen-address: '127.0.0.1'
+dns:
+  port: 53
+  address: '127.0.0.1'
+  upstream: '8.8.8.8'
 misc:
-  task-stack-size: 65536
-  connect-timeout: 3000
   log-file: stderr
   log-level: warn
 YMLEOF
 
-info "Aplicando sysctl..."
-modprobe tcp_bbr 2>/dev/null || true
+info "Tuning TCP/kernel..."
 cat > /etc/sysctl.d/99-btserver.conf << 'SYSCTL'
 net.core.rmem_max=33554432
 net.core.wmem_max=33554432
@@ -131,24 +118,19 @@ net.ipv4.tcp_wmem=4096 262144 33554432
 net.ipv4.tcp_notsent_lowat=4096
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_fin_timeout=5
-net.ipv4.tcp_keepalive_time=30
-net.ipv4.tcp_keepalive_intvl=5
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=3
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_window_scaling=1
 net.core.somaxconn=65535
 net.ipv4.tcp_max_syn_backlog=65535
 net.core.netdev_max_backlog=65535
-net.core.busy_poll=50
-net.core.busy_read=50
 fs.file-max=1000000
 net.ipv4.tcp_mem=786432 1048576 33554432
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
-vm.swappiness=10
 SYSCTL
+modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
 info "Sysctl aplicado"
 
@@ -180,6 +162,7 @@ import (
 
 const (
 	hevTCPAddr  = "127.0.0.1:1080"
+	hevUDPAddr  = "127.0.0.1:1080"
 	listenAddr  = "0.0.0.0:80"
 	usersFile   = "/opt/btserver/users.txt"
 	cacheReload = 30 * time.Second
@@ -190,14 +173,44 @@ const (
 	tPing  = 0x04
 	tPong  = 0x05
 
-	maxStreams   = 4096
-	idleSecs     = 120
-	watchdogSecs = 30
+	sidCtrlMin = uint32(0x40000000)
+	sidCtrlMax = uint32(0x7FFFFFFF)
+
+	maxStreams   = 8192
+	idleSecs     = 3600
+	watchdogSecs = 60
 	queueSize    = 512
 	dialTimeout  = 3 * time.Second
-	writeTimeout = 3 * time.Second
+	writeTimeout = 5 * time.Second
 	maxPayload   = 16384
+
+	dnsTTL = 5 * time.Minute
 )
+
+type dnsEntry struct {
+	ips    []string
+	expiry int64
+}
+
+var dnsCache sync.Map
+
+func resolveHost(host string) (string, error) {
+	now := time.Now().Unix()
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(*dnsEntry)
+		if now < atomic.LoadInt64(&e.expiry) {
+			return e.ips[0], nil
+		}
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return "", err
+	}
+	entry := &dnsEntry{ips: addrs}
+	atomic.StoreInt64(&entry.expiry, time.Now().Add(dnsTTL).Unix())
+	dnsCache.Store(host, entry)
+	return addrs[0], nil
+}
 
 type userEntry struct {
 	name    string
@@ -295,9 +308,12 @@ func checkAuth(id string) (string, int, authResult) {
 }
 
 var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
+var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
 
 func getFrame() []byte  { return *framePool.Get().(*[]byte) }
 func putFrame(b []byte) { framePool.Put(&b) }
+func getHdr() []byte    { return *hdrPool.Get().(*[]byte) }
+func putHdr(b []byte)   { hdrPool.Put(&b) }
 
 type stream struct {
 	q      chan []byte
@@ -305,24 +321,12 @@ type stream struct {
 	closed uint32
 }
 
-func newStream() *stream {
-	return &stream{
-		q:      make(chan []byte, queueSize),
-		active: time.Now().Unix(),
-	}
-}
-
 func (s *stream) tryClose() bool { return atomic.CompareAndSwapUint32(&s.closed, 0, 1) }
 func (s *stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
 
-type writeMsg struct {
-	buf []byte
-	n   int
-}
-
 type mux struct {
 	conn    net.Conn
-	writeQ  chan writeMsg
+	writeMu sync.Mutex
 	mu      sync.RWMutex
 	streams map[uint32]*stream
 	count   int32
@@ -330,30 +334,12 @@ type mux struct {
 }
 
 func newMux(conn net.Conn) *mux {
-	m := &mux{
-		conn:    conn,
-		streams: make(map[uint32]*stream, 128),
-		writeQ:  make(chan writeMsg, 2048),
-	}
-	go m.writeLoop()
-	return m
-}
-
-func (m *mux) writeLoop() {
-	for msg := range m.writeQ {
-		if atomic.LoadUint32(&m.dead) == 0 {
-			m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			m.conn.Write(msg.buf[:msg.n])
-			m.conn.SetWriteDeadline(time.Time{})
-		}
-		putFrame(msg.buf)
-	}
+	return &mux{conn: conn, streams: make(map[uint32]*stream, 128)}
 }
 
 func (m *mux) kill() {
 	if atomic.CompareAndSwapUint32(&m.dead, 0, 1) {
 		m.conn.Close()
-		close(m.writeQ)
 	}
 }
 
@@ -385,9 +371,6 @@ func (m *mux) del(sid uint32) {
 }
 
 func (m *mux) send(t byte, sid uint32, data []byte) {
-	if atomic.LoadUint32(&m.dead) == 1 {
-		return
-	}
 	ln := len(data)
 	buf := getFrame()
 	buf[0] = t
@@ -396,16 +379,60 @@ func (m *mux) send(t byte, sid uint32, data []byte) {
 	if ln > 0 {
 		copy(buf[7:7+ln], data)
 	}
-	select {
-	case m.writeQ <- writeMsg{buf: buf, n: 7 + ln}:
-	default:
-		putFrame(buf)
-		m.kill()
-	}
+	m.writeMu.Lock()
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(buf[:7+ln])
+	m.conn.SetWriteDeadline(time.Time{})
+	m.writeMu.Unlock()
+	putFrame(buf)
 }
 
 func (m *mux) sendHdr(t byte, sid uint32) {
-	m.send(t, sid, nil)
+	hdr := getHdr()
+	hdr[0] = t
+	binary.BigEndian.PutUint32(hdr[1:5], sid)
+	hdr[5] = 0
+	hdr[6] = 0
+	m.writeMu.Lock()
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(hdr)
+	m.conn.SetWriteDeadline(time.Time{})
+	m.writeMu.Unlock()
+	putHdr(hdr)
+}
+
+func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
+	if len(data) < 4 || data[0] != 0x05 {
+		return "", 0, 0
+	}
+	switch data[3] {
+	case 0x01:
+		if len(data) < 10 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:8]).String()
+		port = binary.BigEndian.Uint16(data[8:10])
+		headerLen = 10
+	case 0x03:
+		if len(data) < 5 {
+			return "", 0, 0
+		}
+		l := int(data[4])
+		if len(data) < 5+l+2 {
+			return "", 0, 0
+		}
+		host = string(data[5 : 5+l])
+		port = binary.BigEndian.Uint16(data[5+l : 5+l+2])
+		headerLen = 5 + l + 2
+	case 0x04:
+		if len(data) < 22 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:20]).String()
+		port = binary.BigEndian.Uint16(data[20:22])
+		headerLen = 22
+	}
+	return
 }
 
 func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
@@ -413,23 +440,32 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 		if s.tryClose() {
 			m.del(sid)
 			m.sendHdr(tClose, sid)
-			for {
-				select {
-				case d, ok := <-s.q:
-					if !ok {
-						return
-					}
-					putFrame(d[:cap(d)])
-				default:
-					return
-				}
+			for range s.q {
 			}
 		}
 	}()
 
-	hev, err := net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+	target := hevTCPAddr
+	if len(firstData) >= 10 && firstData[0] == 0x05 {
+		host, port, _ := parseSocks5Host(firstData)
+		if host != "" {
+			if port == 0 {
+				port = 80
+			}
+			if resolved, err := resolveHost(host); err == nil {
+				target = fmt.Sprintf("%s:%d", resolved, port)
+			}
+		}
+	}
+
+	hev, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		return
+		if target != hevTCPAddr {
+			hev, err = net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+		}
+		if err != nil {
+			return
+		}
 	}
 	defer hev.Close()
 
@@ -450,13 +486,12 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 	go func() {
 		defer wg.Done()
 		for d := range s.q {
-			_, err := hev.Write(d)
-			putFrame(d[:cap(d)])
-			if err != nil {
-				return
+			if _, err := hev.Write(d); err != nil {
+				break
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
 		}
+		tc.CloseWrite()
 	}()
 
 	go func() {
@@ -523,23 +558,25 @@ func (m *mux) run() {
 		if int(ln) > maxPayload {
 			break
 		}
+		var data []byte
 		if ln > 0 {
 			if _, err := io.ReadFull(m.conn, readBuf[:ln]); err != nil {
 				break
 			}
+			data = readBuf[:ln]
 		}
 
 		if ft == tPing {
 			m.sendHdr(tPong, sid)
 			continue
 		}
-		if ft == tPong {
+		if ft == tPong || (sid >= sidCtrlMin && sid <= sidCtrlMax) {
 			continue
 		}
 
 		switch ft {
 		case tOpen:
-			s := newStream()
+			s := &stream{q: make(chan []byte, queueSize), active: time.Now().Unix()}
 			if !m.add(sid, s) {
 				m.sendHdr(tClose, sid)
 				continue
@@ -547,30 +584,26 @@ func (m *mux) run() {
 			var first []byte
 			if ln > 0 {
 				first = make([]byte, ln)
-				copy(first, readBuf[:ln])
+				copy(first, data)
 			}
 			go m.handleStream(sid, s, first)
-
 		case tData:
 			s := m.get(sid)
 			if s == nil || s.isClosed() {
 				continue
 			}
 			atomic.StoreInt64(&s.active, time.Now().Unix())
-			buf := getFrame()
-			copy(buf[7:7+ln], readBuf[:ln])
-			payload := buf[7 : 7+ln]
+			payload := make([]byte, ln)
+			copy(payload, data)
 			select {
 			case s.q <- payload:
 			default:
-				putFrame(buf)
 				if s.tryClose() {
 					m.del(sid)
 					close(s.q)
 					m.sendHdr(tClose, sid)
 				}
 			}
-
 		case tClose:
 			s := m.get(sid)
 			if s != nil && s.tryClose() {
@@ -588,7 +621,60 @@ func (m *mux) run() {
 	m.mu.Unlock()
 }
 
-var activeSessions sync.Map
+type udpSession struct {
+	conn net.Conn
+	dead uint32
+}
+
+func (u *udpSession) kill() {
+	if atomic.CompareAndSwapUint32(&u.dead, 0, 1) {
+		u.conn.Close()
+	}
+}
+
+func runUDPTunnel(conn net.Conn) {
+	defer conn.Close()
+	hevUDP, err := net.Dial("udp", hevUDPAddr)
+	if err != nil {
+		return
+	}
+	defer hevUDP.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+				hevUDP.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := hevUDP.Read(buf)
+			if n > 0 {
+				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				conn.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+var activeSessions    sync.Map
+var activeUDPSessions sync.Map
 
 var (
 	actionNeedle     = []byte("action:")
@@ -686,7 +772,7 @@ func handle(conn net.Conn) {
 
 	raw := buf[:n]
 	action := extractHeader(raw, actionNeedle)
-	if action != "tunnel" {
+	if action != "tunnel" && action != "tunnel-tcp" && action != "tunnel-udp" {
 		return
 	}
 
@@ -706,34 +792,26 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	resp := fmt.Sprintf(
+	conn.Write([]byte(fmt.Sprintf(
 		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
 		name, days,
-	)
-	conn.Write([]byte(resp))
+	)))
 
-	m := newMux(conn)
-	if prev, loaded := activeSessions.Swap(userID, m); loaded {
-		prev.(*mux).kill()
+	if action == "tunnel-udp" {
+		u := &udpSession{conn: conn}
+		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
+			prev.(*udpSession).kill()
+		}
+		runUDPTunnel(conn)
+		activeUDPSessions.CompareAndDelete(userID, u)
+	} else {
+		m := newMux(conn)
+		if prev, loaded := activeSessions.Swap(userID, m); loaded {
+			prev.(*mux).kill()
+		}
+		m.run()
+		activeSessions.CompareAndDelete(userID, m)
 	}
-	m.run()
-	activeSessions.CompareAndDelete(userID, m)
-}
-
-func tuneListener(ln net.Listener) {
-	tc, ok := ln.(*net.TCPListener)
-	if !ok {
-		return
-	}
-	raw, err := tc.SyscallConn()
-	if err != nil {
-		return
-	}
-	raw.Control(func(fd uintptr) {
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
-	})
 }
 
 func main() {
@@ -750,8 +828,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tuneListener(ln)
-	log.Printf("btserver %s -> hev:%s (cpus=%d)", listenAddr, hevTCPAddr, runtime.NumCPU())
+	if tc, ok := ln.(*net.TCPListener); ok {
+		if raw, err := tc.SyscallConn(); err == nil {
+			raw.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+			})
+		}
+	}
+	log.Printf("btserver %s -> hev tcp:%s (go=%s cpus=%d)", listenAddr, hevTCPAddr, runtime.Version(), runtime.NumCPU())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -787,9 +873,7 @@ def str_to_date(s):
 
 def days_left(exp_str):
     try:
-        exp = str_to_date(exp_str)
-        delta = (exp - datetime.now().date()).days + 1
-        return max(0, delta)
+        return max(0, (str_to_date(exp_str) - datetime.now().date()).days + 1)
     except:
         return 0
 
@@ -800,7 +884,7 @@ def load_users():
     users = {}
     if not USERS_FILE.exists():
         return users
-    with open(USERS_FILE, "r") as f:
+    with open(USERS_FILE) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -830,10 +914,8 @@ def json_resp(handler, code, data):
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
-
     def auth(self):
         return self.headers.get("X-Token", "").strip() == load_token()
-
     def read_body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length == 0: return {}
@@ -845,37 +927,22 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
-
         if path == "/clients":
             with _lock:
                 users = load_users()
-            result = []
-            for uid, data in sorted(users.items()):
-                result.append({
-                    "id": uid,
-                    "name": data["name"],
-                    "expires": data["expires"],
-                    "days_left": days_left(data["expires"]),
-                    "active": is_active(data["expires"])
-                })
-            json_resp(self, 200, {"clients": result, "total": len(result)})
-            return
-
+            result = [{"id": uid, "name": d["name"], "expires": d["expires"],
+                       "days_left": days_left(d["expires"]), "active": is_active(d["expires"])}
+                      for uid, d in sorted(users.items())]
+            json_resp(self, 200, {"clients": result, "total": len(result)}); return
         if path == "/client":
             uid = params.get("id", [""])[0].strip()
             if not uid: json_resp(self, 400, {"error": "falta id"}); return
             with _lock:
                 users = load_users()
             if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
-            data = users[uid]
-            json_resp(self, 200, {
-                "id": uid, "name": data["name"],
-                "expires": data["expires"],
-                "days_left": days_left(data["expires"]),
-                "active": is_active(data["expires"])
-            })
-            return
-
+            d = users[uid]
+            json_resp(self, 200, {"id": uid, "name": d["name"], "expires": d["expires"],
+                                   "days_left": days_left(d["expires"]), "active": is_active(d["expires"])}); return
         json_resp(self, 404, {"error": "ruta no encontrada"})
 
     def do_POST(self):
@@ -883,7 +950,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         body = self.read_body()
-
         if path == "/client/create":
             uid  = str(body.get("id", "")).strip()
             name = str(body.get("name", "sin-nombre")).strip() or "sin-nombre"
@@ -894,9 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                 users = load_users()
                 users[uid] = {"name": name, "expires": exp}
                 save_users(users)
-            json_resp(self, 200, {"ok": True, "id": uid, "name": name, "expires": exp, "days": days})
-            return
-
+            json_resp(self, 200, {"ok": True, "id": uid, "name": name, "expires": exp, "days": days}); return
         if path == "/client/delete":
             uid = str(body.get("id", "")).strip()
             if not uid: json_resp(self, 400, {"error": "falta id"}); return
@@ -905,9 +969,7 @@ class Handler(BaseHTTPRequestHandler):
                 if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
                 users.pop(uid)
                 save_users(users)
-            json_resp(self, 200, {"ok": True})
-            return
-
+            json_resp(self, 200, {"ok": True}); return
         if path == "/client/update":
             uid = str(body.get("id", "")).strip()
             if not uid: json_resp(self, 400, {"error": "falta id"}); return
@@ -938,14 +1000,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     users[uid] = item
                 save_users(users)
-            json_resp(self, 200, {
-                "ok": True, "id": uid,
-                "name": item["name"],
-                "expires": item["expires"],
-                "days_left": days_left(item["expires"])
-            })
-            return
-
+            json_resp(self, 200, {"ok": True, "id": uid, "name": item["name"],
+                                   "expires": item["expires"], "days_left": days_left(item["expires"])}); return
         json_resp(self, 404, {"error": "ruta no encontrada"})
 
 if __name__ == "__main__":
@@ -954,10 +1010,8 @@ if __name__ == "__main__":
 PYEOF
 chmod +x /opt/btserver/panel.py
 
-systemctl stop btserver btpanel 2>/dev/null || true
-sleep 1
 info "Compilando btserver..."
-export PATH=$PATH:/usr/local/go/bin
+export PATH=/usr/local/go/bin:$PATH
 export HOME=/root
 export GOPATH=/root/go
 export GOCACHE=/root/.cache/go-build
@@ -968,7 +1022,10 @@ $GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go || die "Err
 chmod +x /opt/btserver/btserver
 info "Compilado OK"
 
-[ -f /opt/btserver/users.txt ] || printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+if [ ! -f /opt/btserver/users.txt ]; then
+    printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+    info "users.txt creado"
+fi
 
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
@@ -978,7 +1035,7 @@ After=network.target
 [Service]
 ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server.yml
 Restart=always
-RestartSec=1
+RestartSec=2
 LimitNOFILE=1000000
 LimitNPROC=infinity
 
@@ -995,13 +1052,11 @@ Requires=hev-socks5.service
 [Service]
 ExecStart=/opt/btserver/btserver
 Restart=always
-RestartSec=1
+RestartSec=2
 LimitNOFILE=1000000
 LimitNPROC=infinity
 TasksMax=infinity
-Nice=-20
-CPUSchedulingPolicy=fifo
-CPUSchedulingPriority=99
+Nice=-10
 IOSchedulingClass=realtime
 IOSchedulingPriority=0
 
@@ -1043,15 +1098,13 @@ IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1
 if [ -n "$IFACE" ]; then
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
     tc qdisc add dev "$IFACE" root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 1ms interval 20ms
-    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 3ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 2ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 5ms interval 100ms
     tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms interval 100ms
     tc filter add dev "$IFACE" parent 1: protocol ip prio 1 u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
     tc filter add dev "$IFACE" parent 1: protocol ip prio 2 u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
     tc filter add dev "$IFACE" parent 1: protocol ip prio 3 u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
     info "QoS aplicado en $IFACE"
-else
-    info "No se detectó interfaz, QoS omitido"
 fi
 
 echo ""
@@ -1065,8 +1118,4 @@ echo ""
 info "Estado servicios:"
 systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
 echo ""
-info "Crear usuario:  POST /client/create  {id, name, days}"
-info "Actualizar:     POST /client/update  {id, add_days/sub_days/set_days/set_date}"
-info "Eliminar:       POST /client/delete  {id}"
-info "Listar:         GET  /clients"
-info "Consultar:      GET  /client?id=xxx"
+ss -s | grep -E "TCP|estab"
