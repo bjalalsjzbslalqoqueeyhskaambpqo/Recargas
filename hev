@@ -435,8 +435,8 @@ func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
 
 	tc := hev.(*net.TCPConn)
 	tc.SetNoDelay(true)
-	tc.SetReadBuffer(262144)
-	tc.SetWriteBuffer(262144)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
 
 	if len(firstData) > 0 {
 		if _, err := hev.Write(firstData); err != nil {
@@ -661,8 +661,8 @@ func handle(conn net.Conn) {
 		return
 	}
 	tc.SetNoDelay(true)
-	tc.SetReadBuffer(262144)
-	tc.SetWriteBuffer(262144)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
 	tc.SetKeepAlive(true)
 	tc.SetKeepAlivePeriod(30 * time.Second)
 
