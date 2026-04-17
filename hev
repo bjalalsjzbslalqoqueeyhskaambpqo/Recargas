@@ -77,6 +77,8 @@ if command -v dnsmasq >/dev/null 2>&1; then
 cache-size=10000
 no-negcache
 dns-forward-max=300
+min-cache-ttl=3600
+max-cache-ttl=7200
 server=8.8.8.8
 server=1.1.1.1
 listen-address=127.0.0.1
@@ -98,11 +100,15 @@ main:
   listen-ipv6-only: false
   udp-port: 1080
   udp-listen-address: '127.0.0.1'
+  domain-address-type: ipv4
 dns:
   port: 53
   address: '127.0.0.1'
   upstream: '8.8.8.8'
 misc:
+  task-stack-size: 8192
+  connect-timeout: 5000
+  read-write-timeout: 300000
   log-file: stderr
   log-level: warn
 YMLEOF
@@ -129,6 +135,10 @@ fs.file-max=1000000
 net.ipv4.tcp_mem=786432 1048576 33554432
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_max_tw_buckets=2000000
 SYSCTL
 modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
@@ -182,12 +192,12 @@ const (
 	maxStreams   = 8192
 	idleSecs     = 3600
 	watchdogSecs = 60
-	queueSize    = 512
-	dialTimeout  = 3 * time.Second
+	queueSize    = 1024
+	dialTimeout  = 1500 * time.Millisecond
 	writeTimeout = 5 * time.Second
 	maxPayload   = 16384
 
-	dnsTTL = 5 * time.Minute
+	dnsTTL = 2 * time.Hour
 )
 
 type dnsEntry struct {
@@ -311,12 +321,9 @@ func checkAuth(id string) (string, int, authResult) {
 }
 
 var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
-var hdrPool   = sync.Pool{New: func() interface{} { b := make([]byte, 7); return &b }}
 
 func getFrame() []byte  { return *framePool.Get().(*[]byte) }
 func putFrame(b []byte) { framePool.Put(&b) }
-func getHdr() []byte    { return *hdrPool.Get().(*[]byte) }
-func putHdr(b []byte)   { hdrPool.Put(&b) }
 
 type stream struct {
 	q      chan []byte
@@ -329,7 +336,7 @@ func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
 	conn    net.Conn
-	writeMu sync.Mutex
+	writeQ  chan []byte
 	mu      sync.RWMutex
 	streams map[uint32]*stream
 	count   atomic.Int32
@@ -337,12 +344,30 @@ type mux struct {
 }
 
 func newMux(conn net.Conn) *mux {
-	return &mux{conn: conn, streams: make(map[uint32]*stream, 128)}
+	m := &mux{
+		conn:    conn,
+		writeQ:  make(chan []byte, 4096),
+		streams: make(map[uint32]*stream, 512),
+	}
+	go m.writeLoop()
+	return m
+}
+
+func (m *mux) writeLoop() {
+	for buf := range m.writeQ {
+		if m.dead.Load() == 0 {
+			m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			m.conn.Write(buf)
+			m.conn.SetWriteDeadline(time.Time{})
+		}
+		putFrame(buf[:cap(buf)])
+	}
 }
 
 func (m *mux) kill() {
 	if m.dead.CompareAndSwap(0, 1) {
 		m.conn.Close()
+		close(m.writeQ)
 	}
 }
 
@@ -385,26 +410,27 @@ func (m *mux) send(t byte, sid uint32, data []byte) {
 	if ln > 0 {
 		copy(buf[7:7+ln], data)
 	}
-	m.writeMu.Lock()
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	m.conn.Write(buf[:7+ln])
-	m.conn.SetWriteDeadline(time.Time{})
-	m.writeMu.Unlock()
-	putFrame(buf)
+	select {
+	case m.writeQ <- buf[:7+ln]:
+	default:
+		putFrame(buf)
+	}
 }
 
 func (m *mux) sendHdr(t byte, sid uint32) {
-	hdr := getHdr()
-	hdr[0] = t
-	binary.BigEndian.PutUint32(hdr[1:5], sid)
-	hdr[5] = 0
-	hdr[6] = 0
-	m.writeMu.Lock()
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	m.conn.Write(hdr)
-	m.conn.SetWriteDeadline(time.Time{})
-	m.writeMu.Unlock()
-	putHdr(hdr)
+	if m.dead.Load() == 1 {
+		return
+	}
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5] = 0
+	buf[6] = 0
+	select {
+	case m.writeQ <- buf[:7]:
+	default:
+		putFrame(buf)
+	}
 }
 
 func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
