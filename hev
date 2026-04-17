@@ -1,26 +1,34 @@
 #!/bin/bash
-set -uo pipefail
+set -e
+GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; }
-
-if [ "$(id -u)" -ne 0 ]; then error "Ejecutar como root."; exit 1; fi
-
-info "Actualizando paquetes..."
-apt-get update -qq
-apt-get install -y -qq curl wget python3 python3-pip ca-certificates iproute2 unzip systemd
-
-FRESH_INSTALL=true
-if [ -f /opt/btserver/token.txt ] && systemctl is-active --quiet btserver 2>/dev/null; then
-    FRESH_INSTALL=false
-    warn "Instalación existente → modo ACTUALIZACIÓN"
-else
-    info "No se detectó instalación previa → modo INSTALACIÓN NUEVA"
-fi
+[ "$(id -u)" = "0" ] || die "Ejecutar como root"
 
 mkdir -p /opt/btserver
+cd /opt/btserver
+
+if command -v wget >/dev/null 2>&1; then
+    FETCH="wget -q --timeout=30 -O"
+elif command -v curl >/dev/null 2>&1; then
+    FETCH="curl -fsSL --connect-timeout 30 -o"
+else
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl"
+    FETCH="wget -q --timeout=30 -O"
+fi
+
+info "Instalando Go 1.26.2..."
+rm -rf /usr/local/go
+$FETCH /tmp/go.tar.gz https://go.dev/dl/go1.26.2.linux-amd64.tar.gz || die "No se pudo descargar Go"
+tar -C /usr/local -xzf /tmp/go.tar.gz
+rm -f /tmp/go.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+export PATH=/usr/local/go/bin:$PATH
+GO=/usr/local/go/bin/go
+info "Go: $($GO version)"
 
 if [ -f /opt/btserver/token.txt ] && [ -s /opt/btserver/token.txt ]; then
     PANEL_TOKEN=$(cat /opt/btserver/token.txt)
@@ -35,553 +43,899 @@ fi
 PANEL_PORT=8090
 SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DROPBEAR — unit nativo systemd (Debian 11 solo trae init SysV, no unit real)
-# ─────────────────────────────────────────────────────────────────────────────
-info "Instalando dropbear..."
-apt-get install -y dropbear
+info "Deteniendo servicios..."
+systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
+sleep 1
 
-# Detectar binario (puede estar en /usr/sbin o /usr/bin según distro)
-DROPBEAR_BIN=""
-for p in /usr/sbin/dropbear /usr/bin/dropbear; do
-    [ -x "$p" ] && { DROPBEAR_BIN="$p"; break; }
-done
-if [ -z "$DROPBEAR_BIN" ]; then
-    error "No se encontró el binario de dropbear."; exit 1
-fi
-info "Dropbear binario: $DROPBEAR_BIN"
+info "Descargando hev-socks5-server..."
+$FETCH /tmp/hev-socks5-server.tmp \
+    https://github.com/heiher/hev-socks5-server/releases/latest/download/hev-socks5-server-linux-x86_64 \
+    || die "No se pudo descargar hev-socks5-server"
+mv -f /tmp/hev-socks5-server.tmp /opt/btserver/hev-socks5-server
+chmod +x /opt/btserver/hev-socks5-server
+info "hev-socks5-server OK"
 
-# Parar el servicio antes de reconfigurar
-systemctl stop dropbear 2>/dev/null || true
-
-# Deshabilitar el init SysV para que no compita con nuestro unit nativo
-update-rc.d dropbear disable 2>/dev/null || true
-
-# Marcar NO_START=1 en /etc/default/dropbear para que el init.d no arranque nada
-cat > /etc/default/dropbear << 'DBEOF'
-NO_START=1
-DROPBEAR_PORT=2222
-DROPBEAR_EXTRA_ARGS="-w -R"
-DBEOF
-
-# Eliminar el override.conf si quedó de versiones anteriores (era ignorado de todos modos)
-rm -f /etc/systemd/system/dropbear.service.d/override.conf
-rmdir /etc/systemd/system/dropbear.service.d 2>/dev/null || true
-
-# Generar claves de host si no existen
-mkdir -p /etc/dropbear
-dropbearkey -t rsa    -f /etc/dropbear/dropbear_rsa_host_key    2>/dev/null || true
-dropbearkey -t ecdsa  -f /etc/dropbear/dropbear_ecdsa_host_key  2>/dev/null || true
-dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null || true
-
-# Escribir unit nativo completo — tiene precedencia total sobre el generador SysV
-# en /run/systemd/generator.late/, por lo que ya no aparece "is not a native service"
-cat > /etc/systemd/system/dropbear.service << DBSVC
-[Unit]
-Description=Dropbear SSH server (127.0.0.1:2222)
-After=network.target
-Documentation=man:dropbear(8)
-
-[Service]
-ExecStart=${DROPBEAR_BIN} -F -E -p 127.0.0.1:2222 -w -R
-Restart=on-failure
-RestartSec=3
-KillMode=process
-
-[Install]
-WantedBy=multi-user.target
-DBSVC
-
-systemctl daemon-reload
-systemctl enable dropbear 2>/dev/null || true
-info "Dropbear configurado en 127.0.0.1:2222 (unit nativo systemd, SysV deshabilitado)"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BADVPN-UDPGW — compilar desde source (el repo oficial no tiene binarios)
-# ─────────────────────────────────────────────────────────────────────────────
-UDPGW_PORT=7300
-BADVPN_INSTALLED=false
-
-if command -v badvpn-udpgw &>/dev/null; then
-    info "badvpn-udpgw ya instalado — omitiendo compilación."
-    BADVPN_INSTALLED=true
-else
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
-        info "Instalando dependencias para compilar badvpn..."
-        apt-get install -y -qq cmake gcc make git 2>/dev/null || \
-            apt-get install -y cmake gcc make git
-        BADVPN_TMP=$(mktemp -d)
-        info "Descargando badvpn desde source..."
-        if git clone --depth=1 https://github.com/ambrop72/badvpn.git "$BADVPN_TMP/badvpn" 2>/dev/null; then
-            mkdir -p "$BADVPN_TMP/build"
-            cd "$BADVPN_TMP/build"
-            if cmake "$BADVPN_TMP/badvpn" \
-                    -DBUILD_NOTHING_BY_DEFAULT=1 \
-                    -DBUILD_UDPGW=1 \
-                    -DCMAKE_BUILD_TYPE=Release \
-                    -DCMAKE_INSTALL_PREFIX=/usr/local \
-                    2>/dev/null && make -j"$(nproc)" 2>/dev/null; then
-                cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
-                chmod +x /usr/local/bin/badvpn-udpgw
-                BADVPN_INSTALLED=true
-                info "badvpn-udpgw compilado e instalado correctamente."
-            else
-                warn "Falló la compilación de badvpn — omitiendo."
-            fi
-            cd - > /dev/null
-        else
-            warn "No se pudo clonar el repositorio de badvpn — omitiendo."
-        fi
-        rm -rf "$BADVPN_TMP"
-    else
-        warn "badvpn no soportado en arquitectura $ARCH — omitiendo."
-    fi
+if ! command -v python3 >/dev/null 2>&1; then
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq python3 2>/dev/null || die "python3 no disponible"
 fi
 
-# Crear unit systemd para badvpn-udpgw si está disponible
-if [ "$BADVPN_INSTALLED" = true ]; then
-    cat > /etc/systemd/system/badvpn.service << BVSVC
-[Unit]
-Description=BadVPN UDP Gateway (puerto ${UDPGW_PORT})
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:${UDPGW_PORT} --max-clients 500 --max-connections-for-client 10
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-BVSVC
-    systemctl daemon-reload
-    systemctl enable badvpn 2>/dev/null || true
+if ! command -v dnsmasq >/dev/null 2>&1; then
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq dnsmasq 2>/dev/null || info "dnsmasq no disponible"
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TUNNEL-ONLY SHELL
-# ─────────────────────────────────────────────────────────────────────────────
-cat > /usr/local/bin/tunnel-only << 'SHEOF'
-#!/bin/bash
-echo "Tunneling only. No shell access."
-sleep 86400
-SHEOF
-chmod +x /usr/local/bin/tunnel-only
-grep -qxF "/usr/local/bin/tunnel-only" /etc/shells || echo "/usr/local/bin/tunnel-only" >> /etc/shells
-
-id -u sshtunnel &>/dev/null || useradd -r -s /usr/sbin/nologin -M sshtunnel 2>/dev/null || true
-
-# ─────────────────────────────────────────────────────────────────────────────
-# XRAY
-# ─────────────────────────────────────────────────────────────────────────────
-info "Instalando/actualizando Xray..."
-if bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install; then
-    info "Xray instalado correctamente."
-else
-    error "Falló la instalación de Xray."
-    exit 1
+if command -v dnsmasq >/dev/null 2>&1; then
+    systemctl stop systemd-resolved 2>/dev/null || true
+    systemctl disable systemd-resolved 2>/dev/null || true
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf || true
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    mkdir -p /etc/dnsmasq.d
+    cat > /etc/dnsmasq.d/btserver.conf << 'DNSEOF'
+cache-size=10000
+no-negcache
+dns-forward-max=300
+min-cache-ttl=3600
+max-cache-ttl=7200
+server=8.8.8.8
+server=1.1.1.1
+listen-address=127.0.0.1
+bind-interfaces
+no-resolv
+DNSEOF
+    systemctl enable dnsmasq 2>/dev/null || true
+    systemctl restart dnsmasq 2>/dev/null && info "dnsmasq OK" || info "dnsmasq FALLO"
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BBR
-# ─────────────────────────────────────────────────────────────────────────────
-info "Activando BBR..."
-if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
-    grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null || {
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    }
-    sysctl -p -q 2>/dev/null || true
-    info "BBR activado."
-else
-    warn "BBR no disponible en este kernel."
-fi
+NWORKERS=$(nproc 2>/dev/null || echo 1)
+info "HEV workers: $NWORKERS"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# XRAY CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-XRAY_CONFIG=/usr/local/etc/xray/config.json
-mkdir -p "$(dirname "$XRAY_CONFIG")"
+cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
+main:
+  workers: ${NWORKERS}
+  port: 1080
+  listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+  udp-port: 1080
+  udp-listen-address: '127.0.0.1'
+  domain-address-type: ipv4
+dns:
+  port: 53
+  address: '127.0.0.1'
+  upstream: '8.8.8.8'
+misc:
+  task-stack-size: 8192
+  connect-timeout: 5000
+  read-write-timeout: 300000
+  log-file: stderr
+  log-level: warn
+YMLEOF
 
-if [ "$FRESH_INSTALL" = true ] || [ ! -f "$XRAY_CONFIG" ]; then
-    info "Escribiendo configuración de Xray..."
-    cat > "$XRAY_CONFIG" << 'XEOF'
-{
-  "log": { "loglevel": "warning" },
-  "dns": {
-    "servers": ["8.8.8.8", "1.1.1.1"],
-    "queryStrategy": "UseIPv4"
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "handshake": 4,
-        "connIdle": 600,
-        "uplinkOnly": 30,
-        "downlinkOnly": 30,
-        "bufferSize": 512
-      }
-    },
-    "system": {
-      "udpTimeout": 0,
-      "connIdle": 600,
-      "downlinkOnly": 30,
-      "uplinkOnly": 30
-    }
-  },
-  "inbounds": [
-    {
-      "port": 10809,
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "a3482e88-686a-4a58-8126-99c9df64b7bf" }],
-        "decryption": "none"
-      },
-      "streamSettings": { "network": "tcp", "security": "none" }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIPv4" },
-      "streamSettings": {
-        "sockopt": {
-          "tcpFastOpen": true,
-          "tcpCongestion": "bbr",
-          "tcpKeepAliveInterval": 30,
-          "tcpKeepAliveIdle": 60,
-          "tcpUserTimeout": 10000
-        }
-      }
-    }
-  ]
+info "Tuning TCP/kernel..."
+cat > /etc/sysctl.d/99-btserver.conf << 'SYSCTL'
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
+net.ipv4.tcp_notsent_lowat=4096
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=3
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=1000000
+net.ipv4.tcp_mem=786432 1048576 33554432
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_max_tw_buckets=2000000
+SYSCTL
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
+info "Sysctl aplicado"
+
+cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
+*    soft nofile 1000000
+*    hard nofile 1000000
+root soft nofile 1000000
+root hard nofile 1000000
+LIMITS
+
+info "Escribiendo btserver.go..."
+cat > /opt/btserver/btserver.go << 'GOEOF'
+//go:build go1.20
+
+package main
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+const (
+	hevTCPAddr  = "127.0.0.1:1080"
+	hevUDPAddr  = "127.0.0.1:1080"
+	listenAddr  = "0.0.0.0:80"
+	usersFile   = "/opt/btserver/users.txt"
+	cacheReload = 30 * time.Second
+
+	tOpen  byte = 0x01
+	tData  byte = 0x02
+	tClose byte = 0x03
+	tPing  byte = 0x04
+	tPong  byte = 0x05
+
+	sidCtrlMin = uint32(0x40000000)
+	sidCtrlMax = uint32(0x7FFFFFFF)
+
+	maxStreams   = 8192
+	idleSecs     = 3600
+	watchdogSecs = 60
+	queueSize    = 1024
+	dialTimeout  = 1500 * time.Millisecond
+	writeTimeout = 5 * time.Second
+	maxPayload   = 16384
+
+	dnsTTL = 2 * time.Hour
+)
+
+type dnsEntry struct {
+	ips    []string
+	expiry int64
 }
-XEOF
-else
-    warn "Config de Xray existente conservada."
-fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BTSERVER.PY
-# ─────────────────────────────────────────────────────────────────────────────
-info "Escribiendo btserver.py..."
-cat > /opt/btserver/btserver.py << 'PYEOF'
-#!/usr/bin/env python3
-import asyncio, struct, time, json, threading
-from pathlib import Path
+var dnsCache sync.Map
 
-TYPE_OPEN  = 0x01
-TYPE_DATA  = 0x02
-TYPE_CLOSE = 0x03
+func resolveHost(host string) (string, error) {
+	now := time.Now().Unix()
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(*dnsEntry)
+		if now < e.expiry {
+			return e.ips[0], nil
+		}
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return "", err
+	}
+	entry := &dnsEntry{ips: addrs}
+	entry.expiry = time.Now().Add(dnsTTL).Unix()
+	dnsCache.Store(host, entry)
+	return addrs[0], nil
+}
 
-DB_PATH    = Path("/opt/btserver/clients.json")
-DB_CACHE   = {}
-DB_MTIME   = 0.0
-ACTIVE_SESSIONS = {}
+type userEntry struct {
+	name    string
+	expires time.Time
+}
 
-XRAY_HOST  = "127.0.0.1"
-XRAY_PORT  = 10809
-SSH_HOST   = "127.0.0.1"
-SSH_PORT   = 2222
+type userCache struct {
+	mu       sync.RWMutex
+	table    map[string]*userEntry
+	loadedAt time.Time
+}
 
-def load_db():
-    global DB_CACHE, DB_MTIME
-    if not DB_PATH.exists():
-        return {}
-    try:
-        mtime = DB_PATH.stat().st_mtime
-        if mtime == DB_MTIME and DB_CACHE:
-            return DB_CACHE
-        DB_CACHE = json.loads(DB_PATH.read_text())
-        DB_MTIME = mtime
-        return DB_CACHE
-    except:
-        return DB_CACHE
+var cache = &userCache{table: make(map[string]*userEntry)}
 
-def ensure_client(client_id):
-    db = load_db()
-    item = db.get(client_id)
-    now = int(time.time())
-    if not item:
-        return "UNKNOWN", 0, "", 0
-    expires_at = int(item.get("expires_at", 0))
-    name = str(item.get("name", "")).strip() or "sin-nombre"
-    if now > expires_at:
-        return "EXPIRED", 0, name, expires_at
-    days_left = max(0, (expires_at - now + 86399) // 86400)
-    return "VALID", days_left, name, expires_at
+func (c *userCache) reload() {
+	f, err := os.Open(usersFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	t := make(map[string]*userEntry, 64)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		var id, name, exp string
+		n := 0
+		start := 0
+		for i := 0; i <= len(line); i++ {
+			if i == len(line) || line[i] == ':' {
+				part := line[start:i]
+				switch n {
+				case 0:
+					id = part
+				case 1:
+					name = part
+				case 2:
+					exp = part
+				}
+				n++
+				start = i + 1
+				if n == 3 {
+					break
+				}
+			}
+		}
+		if n < 3 || id == "" || name == "" || exp == "" {
+			continue
+		}
+		expires, err := time.ParseInLocation("2006-01-02", exp, time.Local)
+		if err != nil {
+			continue
+		}
+		expires = expires.Add(24*time.Hour - time.Second)
+		t[id] = &userEntry{name: name, expires: expires}
+	}
+	c.mu.Lock()
+	c.table = t
+	c.loadedAt = time.Now()
+	c.mu.Unlock()
+}
 
-def expiry_checker():
-    while True:
-        now = time.time()
-        tomorrow_2am = now - (now % 86400) + 86400 + 2 * 3600
-        if tomorrow_2am - now > 86400:
-            tomorrow_2am -= 86400
-        time.sleep(max(1, tomorrow_2am - time.time()))
-        db = load_db()
-        now_int = int(time.time())
-        expired = [cid for cid, w in list(ACTIVE_SESSIONS.items())
-                   if int(db.get(cid, {}).get("expires_at", 0)) < now_int]
-        for cid in expired:
-            w = ACTIVE_SESSIONS.pop(cid, None)
-            if w:
-                try: w.close()
-                except: pass
-        time.sleep(1)
+func (c *userCache) lookup(id string) (*userEntry, bool) {
+	c.mu.RLock()
+	needReload := time.Since(c.loadedAt) > cacheReload
+	e, ok := c.table[id]
+	c.mu.RUnlock()
+	if needReload {
+		go c.reload()
+	}
+	return e, ok
+}
 
-async def pipe(src_r, dst_w):
-    try:
-        while True:
-            d = await src_r.read(65536)
-            if not d:
-                break
-            dst_w.write(d)
-            await dst_w.drain()
-    except:
-        pass
-    try:
-        dst_w.close()
-    except:
-        pass
+type authResult int
 
-async def handle_mux(reader, writer):
-    streams = {}
-    write_lock = asyncio.Lock()
-    buf = bytearray()
+const (
+	authOK       authResult = iota
+	authNotFound
+	authExpired
+)
 
-    async def send_frame(t, sid, data=b""):
-        async with write_lock:
-            writer.write(struct.pack("!B I I", t, sid, len(data)) + data)
-            await writer.drain()
+func checkAuth(id string) (string, int, authResult) {
+	e, ok := cache.lookup(id)
+	if !ok {
+		return "", 0, authNotFound
+	}
+	now := time.Now()
+	if now.After(e.expires) {
+		return e.name, 0, authExpired
+	}
+	days := int(e.expires.Sub(now).Hours()/24) + 1
+	return e.name, days, authOK
+}
 
-    async def xray_to_client(sid, xr):
-        try:
-            while True:
-                d = await xr.read(65536)
-                if not d:
-                    break
-                await send_frame(TYPE_DATA, sid, d)
-        except:
-            pass
-        await send_frame(TYPE_CLOSE, sid)
-        streams.pop(sid, None)
+var framePool = sync.Pool{New: func() interface{} { b := make([]byte, 7+maxPayload); return &b }}
 
-    async def read_n(n):
-        nonlocal buf
-        while len(buf) < n:
-            chunk = await reader.read(65536)
-            if not chunk:
-                raise ConnectionError()
-            buf.extend(chunk)
-        d, buf[:] = bytes(buf[:n]), buf[n:]
-        return d
+func getFrame() []byte  { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte) { framePool.Put(&b) }
 
-    try:
-        while True:
-            t, sid, l = struct.unpack("!B I I", await read_n(9))
-            data = await read_n(l) if l else b""
-            if t == TYPE_OPEN:
-                try:
-                    xr, xw = await asyncio.open_connection(XRAY_HOST, XRAY_PORT)
-                    streams[sid] = (xr, xw)
-                    asyncio.get_event_loop().create_task(xray_to_client(sid, xr))
-                except:
-                    await send_frame(TYPE_CLOSE, sid)
-            elif t == TYPE_DATA:
-                pair = streams.get(sid)
-                if pair:
-                    try:
-                        pair[1].write(data)
-                        await pair[1].drain()
-                    except:
-                        await send_frame(TYPE_CLOSE, sid)
-                        streams.pop(sid, None)
-            elif t == TYPE_CLOSE:
-                pair = streams.pop(sid, None)
-                if pair:
-                    try:
-                        pair[1].close()
-                        await pair[1].wait_closed()
-                    except:
-                        pass
-    except:
-        pass
-    finally:
-        for _, (_, xw) in list(streams.items()):
-            try:
-                xw.close()
-            except:
-                pass
-        try:
-            writer.close()
-        except:
-            pass
+type stream struct {
+	q      chan []byte
+	active atomic.Int64
+	closed atomic.Uint32
+}
 
-async def handle(reader, writer):
-    writer.transport.set_write_buffer_limits(high=65536, low=16384)
-    raw = b""
-    start = time.monotonic()
-    while time.monotonic() - start < 5:
-        try:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=1)
-            if not chunk:
-                break
-            raw += chunk
-            if b"\r\n\r\n" in raw:
-                break
-        except asyncio.TimeoutError:
-            break
+func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
+func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
-    action = ""
-    client_id = ""
-    for line in raw.decode(errors="replace").splitlines():
-        lower = line.lower().strip()
-        if lower.startswith("action:") or lower.startswith("action :"):
-            action = line.split(":", 1)[1].strip().lower()
-        if lower.startswith("x-client-id:"):
-            client_id = line.split(":", 1)[1].strip()
+type mux struct {
+	conn    net.Conn
+	writeQ  chan []byte
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   atomic.Int32
+	dead    atomic.Uint32
+}
 
-    async def reject(state, days=0):
-        try:
-            writer.write(
-                f"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n"
-                f"X-Status: {state}\r\nX-Auth-State: {state}\r\nX-Days-Left: {days}\r\n\r\n"
-                .encode()
-            )
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-        except:
-            pass
+func newMux(conn net.Conn) *mux {
+	m := &mux{
+		conn:    conn,
+		writeQ:  make(chan []byte, 4096),
+		streams: make(map[uint32]*stream, 512),
+	}
+	go m.writeLoop()
+	return m
+}
 
-    if action == "ssh":
-        try:
-            writer.write(
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                b"X-Status: VALID\r\nX-Auth-State: VALID\r\n\r\n"
-            )
-            await writer.drain()
-            ssh_r, ssh_w = await asyncio.open_connection(SSH_HOST, SSH_PORT)
-            await asyncio.gather(
-                pipe(reader, ssh_w),
-                pipe(ssh_r, writer)
-            )
-        except:
-            pass
-        finally:
-            try:
-                writer.close()
-            except:
-                pass
-        return
+func (m *mux) writeLoop() {
+	for buf := range m.writeQ {
+		if m.dead.Load() == 0 {
+			m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			m.conn.Write(buf)
+			m.conn.SetWriteDeadline(time.Time{})
+		}
+		putFrame(buf[:cap(buf)])
+	}
+}
 
-    if not client_id:
-        await reject("INVALID")
-        return
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
+	}
+}
 
-    state, days_left, name, expires_at = ensure_client(client_id)
-    if state != "VALID":
-        await reject(state, days_left)
-        return
+func (m *mux) add(sid uint32, s *stream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int(m.count.Load()) >= maxStreams {
+		return false
+	}
+	m.streams[sid] = s
+	m.count.Add(1)
+	return true
+}
 
-    response = (
-        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        b"X-Status: VALID\r\nX-Auth-State: VALID\r\n"
-        + f"X-Name: {name}\r\nX-Expire: {expires_at}\r\nX-Days-Left: {days_left}\r\n\r\n".encode()
-    )
+func (m *mux) get(sid uint32) *stream {
+	m.mu.RLock()
+	s := m.streams[sid]
+	m.mu.RUnlock()
+	return s
+}
 
-    if action in ("tunnel", "tunnel-fast"):
-        writer.write(response)
-        await writer.drain()
-        prev = ACTIVE_SESSIONS.get(client_id)
-        ACTIVE_SESSIONS[client_id] = writer
-        if prev is not None:
-            try:
-                prev.close()
-            except:
-                pass
-        try:
-            await handle_mux(reader, writer)
-        finally:
-            if ACTIVE_SESSIONS.get(client_id) is writer:
-                ACTIVE_SESSIONS.pop(client_id, None)
-    elif action == "auth":
-        writer.write(response)
-        await writer.drain()
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except:
-            pass
-    else:
-        try:
-            writer.close()
-        except:
-            pass
+func (m *mux) del(sid uint32) {
+	m.mu.Lock()
+	if _, ok := m.streams[sid]; ok {
+		delete(m.streams, sid)
+		m.count.Add(-1)
+	}
+	m.mu.Unlock()
+}
 
-async def main():
-    threading.Thread(target=expiry_checker, daemon=True).start()
-    srv = await asyncio.start_server(handle, "0.0.0.0", 80, limit=65536, backlog=512)
-    print("btserver escuchando :80  →  xray:10809 / dropbear:2222")
-    async with srv:
-        await srv.serve_forever()
+func (m *mux) send(t byte, sid uint32, data []byte) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	ln := len(data)
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
+	if ln > 0 {
+		copy(buf[7:7+ln], data)
+	}
+	select {
+	case m.writeQ <- buf[:7+ln]:
+	default:
+		putFrame(buf)
+	}
+}
 
-if __name__ == "__main__":
-    asyncio.run(main())
-PYEOF
-chmod +x /opt/btserver/btserver.py
+func (m *mux) sendHdr(t byte, sid uint32) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5] = 0
+	buf[6] = 0
+	select {
+	case m.writeQ <- buf[:7]:
+	default:
+		putFrame(buf)
+	}
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PANEL.PY
-# ─────────────────────────────────────────────────────────────────────────────
+func parseSocks5Host(data []byte) (host string, port uint16, headerLen int) {
+	if len(data) < 4 || data[0] != 0x05 {
+		return "", 0, 0
+	}
+	switch data[3] {
+	case 0x01:
+		if len(data) < 10 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:8]).String()
+		port = binary.BigEndian.Uint16(data[8:10])
+		headerLen = 10
+	case 0x03:
+		if len(data) < 5 {
+			return "", 0, 0
+		}
+		l := int(data[4])
+		if len(data) < 5+l+2 {
+			return "", 0, 0
+		}
+		host = string(data[5 : 5+l])
+		port = binary.BigEndian.Uint16(data[5+l : 5+l+2])
+		headerLen = 5 + l + 2
+	case 0x04:
+		if len(data) < 22 {
+			return "", 0, 0
+		}
+		host = net.IP(data[4:20]).String()
+		port = binary.BigEndian.Uint16(data[20:22])
+		headerLen = 22
+	}
+	return
+}
+
+func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
+	defer func() {
+		if s.tryClose() {
+			m.del(sid)
+			m.sendHdr(tClose, sid)
+			for range s.q {
+			}
+		}
+	}()
+
+	target := hevTCPAddr
+	if len(firstData) >= 10 && firstData[0] == 0x05 {
+		host, port, _ := parseSocks5Host(firstData)
+		if host != "" {
+			if port == 0 {
+				port = 80
+			}
+			if resolved, err := resolveHost(host); err == nil {
+				target = fmt.Sprintf("%s:%d", resolved, port)
+			}
+		}
+	}
+
+	hev, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		if target != hevTCPAddr {
+			hev, err = net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+		}
+		if err != nil {
+			return
+		}
+	}
+	defer hev.Close()
+
+	tc := hev.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
+
+	if len(firstData) > 0 {
+		if _, err := hev.Write(firstData); err != nil {
+			return
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for d := range s.q {
+			if _, err := hev.Write(d); err != nil {
+				break
+			}
+			s.active.Store(time.Now().Unix())
+		}
+		tc.CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := hev.Read(buf)
+			if n > 0 {
+				m.send(tData, sid, buf[:n])
+				s.active.Store(time.Now().Unix())
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func (m *mux) watchdog() {
+	ticker := time.NewTicker(watchdogSecs * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if m.dead.Load() == 1 {
+			return
+		}
+		now := time.Now().Unix()
+		m.mu.RLock()
+		toKill := make([]uint32, 0, 16)
+		for sid, s := range m.streams {
+			if now-s.active.Load() > idleSecs {
+				toKill = append(toKill, sid)
+			}
+		}
+		m.mu.RUnlock()
+		for _, sid := range toKill {
+			m.mu.Lock()
+			s, ok := m.streams[sid]
+			if ok {
+				delete(m.streams, sid)
+				m.count.Add(-1)
+			}
+			m.mu.Unlock()
+			if ok && s.tryClose() {
+				close(s.q)
+				m.sendHdr(tClose, sid)
+			}
+		}
+	}
+}
+
+func (m *mux) run() {
+	go m.watchdog()
+	hdr     := make([]byte, 7)
+	readBuf := make([]byte, maxPayload)
+	for {
+		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+			break
+		}
+		ft  := hdr[0]
+		sid := binary.BigEndian.Uint32(hdr[1:5])
+		ln  := binary.BigEndian.Uint16(hdr[5:7])
+		if int(ln) > maxPayload {
+			break
+		}
+		var data []byte
+		if ln > 0 {
+			if _, err := io.ReadFull(m.conn, readBuf[:ln]); err != nil {
+				break
+			}
+			data = readBuf[:ln]
+		}
+
+		if ft == tPing {
+			m.sendHdr(tPong, sid)
+			continue
+		}
+		if ft == tPong || (sid >= sidCtrlMin && sid <= sidCtrlMax) {
+			continue
+		}
+
+		switch ft {
+		case tOpen:
+			s := &stream{q: make(chan []byte, queueSize), }
+			if !m.add(sid, s) {
+				m.sendHdr(tClose, sid)
+				continue
+			}
+			var first []byte
+			if ln > 0 {
+				first = make([]byte, ln)
+				copy(first, data)
+			}
+			go m.handleStream(sid, s, first)
+		case tData:
+			s := m.get(sid)
+			if s == nil || s.isClosed() {
+				continue
+			}
+			s.active.Store(time.Now().Unix())
+			payload := make([]byte, ln)
+			copy(payload, data)
+			select {
+			case s.q <- payload:
+			default:
+				if s.tryClose() {
+					m.del(sid)
+					close(s.q)
+					m.sendHdr(tClose, sid)
+				}
+			}
+		case tClose:
+			s := m.get(sid)
+			if s != nil && s.tryClose() {
+				m.del(sid)
+				close(s.q)
+			}
+		}
+	}
+	m.mu.Lock()
+	for _, s := range m.streams {
+		if s.tryClose() {
+			close(s.q)
+		}
+	}
+	m.mu.Unlock()
+}
+
+type udpSession struct {
+	conn net.Conn
+	dead atomic.Uint32
+}
+
+func (u *udpSession) kill() {
+	if u.dead.CompareAndSwap(0, 1) {
+		u.conn.Close()
+	}
+}
+
+func runUDPTunnel(conn net.Conn) {
+	defer conn.Close()
+	hevUDP, err := net.Dial("udp", hevUDPAddr)
+	if err != nil {
+		return
+	}
+	defer hevUDP.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+				hevUDP.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := hevUDP.Read(buf)
+			if n > 0 {
+				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				conn.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+var activeSessions    sync.Map
+var activeUDPSessions sync.Map
+
+var (
+	actionNeedle     = []byte("action:")
+	internalIDNeedle = []byte("x-internal-id:")
+	crlfcrlf         = []byte("\r\n\r\n")
+	resp403NotReg    = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n\r\nnot_registered")
+	resp403Expired   = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nexpired")
+)
+
+func indexBytes(s, sub []byte) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	if len(s) < len(sub) {
+		return -1
+	}
+	first := sub[0] | 0x20
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i]|0x20 != first {
+			continue
+		}
+		match := true
+		for j := 1; j < len(sub); j++ {
+			if s[i+j]|0x20 != sub[j]|0x20 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func extractHeader(raw []byte, needle []byte) string {
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\n' {
+			continue
+		}
+		end := i
+		if end > start && raw[end-1] == '\r' {
+			end--
+		}
+		line := raw[start:end]
+		start = i + 1
+		if len(line) <= len(needle) {
+			continue
+		}
+		if indexBytes(line[:len(needle)], needle) != 0 {
+			continue
+		}
+		val := line[len(needle):]
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+			val = val[1:]
+		}
+		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+			val = val[:len(val)-1]
+		}
+		return string(val)
+	}
+	return ""
+}
+
+func handle(conn net.Conn) {
+	defer conn.Close()
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(65536)
+	tc.SetWriteBuffer(65536)
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+
+	buf := make([]byte, 4096)
+	n := 0
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for n < len(buf) {
+		nr, err := conn.Read(buf[n:])
+		if nr > 0 {
+			n += nr
+			raw := buf[:n]
+			if indexBytes(raw, actionNeedle) >= 0 && indexBytes(raw, crlfcrlf) >= 0 {
+				break
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	raw := buf[:n]
+	action := extractHeader(raw, actionNeedle)
+	if action != "tunnel" && action != "tunnel-tcp" && action != "tunnel-udp" {
+		return
+	}
+
+	userID := extractHeader(raw, internalIDNeedle)
+	if userID == "" {
+		conn.Write(resp403NotReg)
+		return
+	}
+
+	name, days, result := checkAuth(userID)
+	switch result {
+	case authNotFound:
+		conn.Write(resp403NotReg)
+		return
+	case authExpired:
+		conn.Write(resp403Expired)
+		return
+	}
+
+	conn.Write([]byte(fmt.Sprintf(
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: %s\r\nX-User-Days: %d\r\n\r\n",
+		name, days,
+	)))
+
+	if action == "tunnel-udp" {
+		u := &udpSession{conn: conn}
+		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
+			prev.(*udpSession).kill()
+		}
+		runUDPTunnel(conn)
+		activeUDPSessions.CompareAndDelete(userID, u)
+	} else {
+		m := newMux(conn)
+		if prev, loaded := activeSessions.Swap(userID, m); loaded {
+			prev.(*mux).kill()
+		}
+		m.run()
+		activeSessions.CompareAndDelete(userID, m)
+	}
+}
+
+func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetMemoryLimit(768 << 20)
+	cache.reload()
+	go func() {
+		t := time.NewTicker(cacheReload)
+		defer t.Stop()
+		for range t.C {
+			cache.reload()
+		}
+	}()
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if tc, ok := ln.(*net.TCPListener); ok {
+		if raw, err := tc.SyscallConn(); err == nil {
+			raw.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+			})
+		}
+	}
+	log.Printf("btserver %s -> hev tcp:%s (go=%s cpus=%d)", listenAddr, hevTCPAddr, runtime.Version(), runtime.NumCPU())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handle(conn)
+	}
+}
+GOEOF
+
 info "Escribiendo panel.py..."
 cat > /opt/btserver/panel.py << PYEOF
 #!/usr/bin/env python3
-import json
-import subprocess
-import time
+import json, os, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta
 
-DB_PATH      = Path("/opt/btserver/clients.json")
-SSH_DB_PATH  = Path("/opt/btserver/ssh_users.json")
-TOKEN_PATH   = Path("/opt/btserver/token.txt")
-PORT         = ${PANEL_PORT}
-TUNNEL_SHELL = "/usr/local/bin/tunnel-only"
+USERS_FILE = Path("/opt/btserver/users.txt")
+TOKEN_FILE = Path("/opt/btserver/token.txt")
+PORT = ${PANEL_PORT}
+_lock = threading.Lock()
 
 def load_token():
-    return TOKEN_PATH.read_text().strip()
+    return TOKEN_FILE.read_text().strip()
 
-def load_db():
-    if not DB_PATH.exists():
-        DB_PATH.write_text("{}")
+def date_to_str(d):
+    return d.strftime("%Y-%m-%d")
+
+def str_to_date(s):
+    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
+
+def days_left(exp_str):
     try:
-        return json.loads(DB_PATH.read_text())
+        return max(0, (str_to_date(exp_str) - datetime.now().date()).days + 1)
     except:
-        return {}
+        return 0
 
-def save_db(db):
-    DB_PATH.write_text(json.dumps(db, indent=2, sort_keys=True))
+def is_active(exp_str):
+    return days_left(exp_str) > 0
 
-def load_ssh_db():
-    if not SSH_DB_PATH.exists():
-        SSH_DB_PATH.write_text("{}")
-    try:
-        return json.loads(SSH_DB_PATH.read_text())
-    except:
-        return {}
+def load_users():
+    users = {}
+    if not USERS_FILE.exists():
+        return users
+    with open(USERS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            uid, name, exp = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if uid:
+                users[uid] = {"name": name, "expires": exp}
+    return users
 
-def save_ssh_db(db):
-    SSH_DB_PATH.write_text(json.dumps(db, indent=2, sort_keys=True))
-
-def now_ts():
-    return int(time.time())
-
-def days_left(expires_at):
-    return max(0, (int(expires_at) - now_ts() + 86399) // 86400)
+def save_users(users):
+    lines = ["# formato: id:nombre:YYYY-MM-DD\n"]
+    for uid, data in sorted(users.items()):
+        lines.append(f"{uid}:{data['name']}:{data['expires']}\n")
+    with open(USERS_FILE, "w") as f:
+        f.writelines(lines)
 
 def json_resp(handler, code, data):
     body = json.dumps(data, ensure_ascii=False).encode()
@@ -591,233 +945,159 @@ def json_resp(handler, code, data):
     handler.end_headers()
     handler.wfile.write(body)
 
-def ensure_tunnel_shell():
-    p = Path(TUNNEL_SHELL)
-    if not p.exists():
-        p.write_text("#!/bin/bash\necho 'Tunneling only. No shell access.'\nsleep 86400\n")
-        p.chmod(0o755)
-    try:
-        shells = Path("/etc/shells").read_text()
-    except:
-        shells = ""
-    if TUNNEL_SHELL not in shells:
-        with open("/etc/shells", "a") as f:
-            f.write(TUNNEL_SHELL + "\n")
-
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
-
+    def log_message(self, fmt, *args): pass
     def auth(self):
         return self.headers.get("X-Token", "").strip() == load_token()
-
     def read_body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length == 0:
-            return {}
-        try:
-            return json.loads(self.rfile.read(length).decode())
-        except:
-            return {}
+        if length == 0: return {}
+        try: return json.loads(self.rfile.read(length).decode())
+        except: return {}
 
     def do_GET(self):
-        if not self.auth():
-            json_resp(self, 401, {"error": "unauthorized"}); return
+        if not self.auth(): json_resp(self, 401, {"error": "unauthorized"}); return
         parsed = urlparse(self.path)
-        path   = parsed.path.rstrip("/")
+        path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
-
         if path == "/clients":
-            db = load_db()
-            result = []
-            for cid, data in sorted(db.items()):
-                exp = int(data.get("expires_at", 0))
-                result.append({"id": cid, "name": data.get("name", "sin-nombre"),
-                    "expires_at": exp, "days_left": days_left(exp), "active": now_ts() <= exp})
+            with _lock:
+                users = load_users()
+            result = [{"id": uid, "name": d["name"], "expires": d["expires"],
+                       "days_left": days_left(d["expires"]), "active": is_active(d["expires"])}
+                      for uid, d in sorted(users.items())]
             json_resp(self, 200, {"clients": result, "total": len(result)}); return
-
         if path == "/client":
-            cid = params.get("id", [""])[0].strip()
-            if not cid:
-                json_resp(self, 400, {"error": "falta id"}); return
-            db   = load_db()
-            item = db.get(cid)
-            if not item:
-                json_resp(self, 404, {"error": "no encontrado"}); return
-            exp = int(item.get("expires_at", 0))
-            json_resp(self, 200, {"id": cid, "name": item.get("name", "sin-nombre"),
-                "expires_at": exp, "days_left": days_left(exp), "active": now_ts() <= exp}); return
-
-        if path == "/ssh/users":
-            db = load_ssh_db()
-            result = []
-            for user, data in sorted(db.items()):
-                exp = int(data.get("expires_at", 0))
-                result.append({"user": user, "name": data.get("name", user),
-                    "expires_at": exp, "days_left": days_left(exp), "active": now_ts() <= exp})
-            json_resp(self, 200, {"users": result, "total": len(result)}); return
-
+            uid = params.get("id", [""])[0].strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+            if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+            d = users[uid]
+            json_resp(self, 200, {"id": uid, "name": d["name"], "expires": d["expires"],
+                                   "days_left": days_left(d["expires"]), "active": is_active(d["expires"])}); return
         json_resp(self, 404, {"error": "ruta no encontrada"})
 
     def do_POST(self):
-        if not self.auth():
-            json_resp(self, 401, {"error": "unauthorized"}); return
+        if not self.auth(): json_resp(self, 401, {"error": "unauthorized"}); return
         parsed = urlparse(self.path)
-        path   = parsed.path.rstrip("/")
-        body   = self.read_body()
-
+        path = parsed.path.rstrip("/")
+        body = self.read_body()
         if path == "/client/create":
-            cid  = str(body.get("id", "")).strip()
+            uid  = str(body.get("id", "")).strip()
             name = str(body.get("name", "sin-nombre")).strip() or "sin-nombre"
             days = int(body.get("days", 30))
-            if not cid:
-                json_resp(self, 400, {"error": "falta id"}); return
-            db  = load_db()
-            now = now_ts()
-            db[cid] = {"name": name, "created_at": db.get(cid, {}).get("created_at", now),
-                "expires_at": now + max(days, 0) * 86400}
-            save_db(db)
-            json_resp(self, 200, {"ok": True, "id": cid, "name": name, "days": days}); return
-
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            exp = date_to_str((datetime.now() + timedelta(days=max(days, 0))).date())
+            with _lock:
+                users = load_users()
+                users[uid] = {"name": name, "expires": exp}
+                save_users(users)
+            json_resp(self, 200, {"ok": True, "id": uid, "name": name, "expires": exp, "days": days}); return
         if path == "/client/delete":
-            cid = str(body.get("id", "")).strip()
-            if not cid:
-                json_resp(self, 400, {"error": "falta id"}); return
-            db = load_db()
-            if cid not in db:
-                json_resp(self, 404, {"error": "no encontrado"}); return
-            db.pop(cid); save_db(db)
+            uid = str(body.get("id", "")).strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+                if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+                users.pop(uid)
+                save_users(users)
             json_resp(self, 200, {"ok": True}); return
-
         if path == "/client/update":
-            cid = str(body.get("id", "")).strip()
-            if not cid:
-                json_resp(self, 400, {"error": "falta id"}); return
-            db   = load_db()
-            item = db.get(cid)
-            if not item:
-                json_resp(self, 404, {"error": "no encontrado"}); return
-            if "name" in body:
-                item["name"] = str(body["name"]).strip() or "sin-nombre"
-            base_exp = int(item.get("expires_at", now_ts()))
-            base     = base_exp if base_exp > now_ts() else now_ts()
-            if "add_days" in body:
-                item["expires_at"] = base + max(int(body["add_days"]), 0) * 86400
-            elif "sub_days" in body:
-                item["expires_at"] = max(0, base_exp - max(int(body["sub_days"]), 0) * 86400)
-            elif "set_days" in body:
-                item["expires_at"] = now_ts() + max(int(body["set_days"]), 0) * 86400
-            new_id = str(body.get("new_id", "")).strip()
-            if new_id and new_id != cid:
-                db.pop(cid); db[new_id] = item; cid = new_id
-            else:
-                db[cid] = item
-            save_db(db)
-            exp = int(item.get("expires_at", 0))
-            json_resp(self, 200, {"ok": True, "id": cid, "name": item.get("name"),
-                "days_left": days_left(exp)}); return
-
-        if path == "/ssh/create":
-            user     = str(body.get("user", "")).strip()
-            password = str(body.get("password", "")).strip()
-            name     = str(body.get("name", user)).strip() or user
-            days     = int(body.get("days", 30))
-            if not user or not password:
-                json_resp(self, 400, {"error": "falta user o password"}); return
-
-            ensure_tunnel_shell()
-
-            existing = subprocess.run(["id", user], capture_output=True)
-            if existing.returncode != 0:
-                r = subprocess.run(
-                    ["useradd", "-s", TUNNEL_SHELL, "-M", "-p", "!", user],
-                    capture_output=True, text=True
-                )
-                if r.returncode != 0:
-                    json_resp(self, 500, {"error": f"useradd fallo: {r.stderr.strip()}"}); return
-            else:
-                subprocess.run(["usermod", "-s", TUNNEL_SHELL, user], capture_output=True)
-
-            p = subprocess.run(
-                ["chpasswd"],
-                input=f"{user}:{password}",
-                capture_output=True, text=True
-            )
-            if p.returncode != 0:
-                json_resp(self, 500, {"error": f"chpasswd fallo: {p.stderr.strip()}"}); return
-
-            db  = load_ssh_db()
-            now = now_ts()
-            db[user] = {"name": name, "created_at": db.get(user, {}).get("created_at", now),
-                "expires_at": now + max(days, 0) * 86400}
-            save_ssh_db(db)
-            json_resp(self, 200, {"ok": True, "user": user, "name": name, "days": days}); return
-
-        if path == "/ssh/delete":
-            user = str(body.get("user", "")).strip()
-            if not user:
-                json_resp(self, 400, {"error": "falta user"}); return
-            db = load_ssh_db()
-            if user not in db:
-                json_resp(self, 404, {"error": "no encontrado"}); return
-            subprocess.run(["userdel", user], capture_output=True)
-            db.pop(user); save_ssh_db(db)
-            json_resp(self, 200, {"ok": True}); return
-
-        if path == "/ssh/update":
-            user = str(body.get("user", "")).strip()
-            if not user:
-                json_resp(self, 400, {"error": "falta user"}); return
-            db   = load_ssh_db()
-            item = db.get(user)
-            if not item:
-                json_resp(self, 404, {"error": "no encontrado"}); return
-            if "name" in body:
-                item["name"] = str(body["name"]).strip() or user
-            if "password" in body:
-                new_pass = str(body["password"]).strip()
-                if new_pass:
-                    subprocess.run(["chpasswd"], input=f"{user}:{new_pass}",
-                        capture_output=True, text=True)
-            base_exp = int(item.get("expires_at", now_ts()))
-            base     = base_exp if base_exp > now_ts() else now_ts()
-            if "add_days" in body:
-                item["expires_at"] = base + max(int(body["add_days"]), 0) * 86400
-            elif "sub_days" in body:
-                item["expires_at"] = max(0, base_exp - max(int(body["sub_days"]), 0) * 86400)
-            elif "set_days" in body:
-                item["expires_at"] = now_ts() + max(int(body["set_days"]), 0) * 86400
-            db[user] = item
-            save_ssh_db(db)
-            exp = int(item.get("expires_at", 0))
-            json_resp(self, 200, {"ok": True, "user": user, "days_left": days_left(exp)}); return
-
+            uid = str(body.get("id", "")).strip()
+            if not uid: json_resp(self, 400, {"error": "falta id"}); return
+            with _lock:
+                users = load_users()
+                if uid not in users: json_resp(self, 404, {"error": "no encontrado"}); return
+                item = users[uid]
+                if "name" in body:
+                    item["name"] = str(body["name"]).strip() or "sin-nombre"
+                try:
+                    cur_exp = str_to_date(item["expires"])
+                except:
+                    cur_exp = datetime.now().date()
+                base = cur_exp if cur_exp > datetime.now().date() else datetime.now().date()
+                if "add_days" in body:
+                    item["expires"] = date_to_str(base + timedelta(days=max(int(body["add_days"]), 0)))
+                elif "sub_days" in body:
+                    item["expires"] = date_to_str(cur_exp - timedelta(days=max(int(body["sub_days"]), 0)))
+                elif "set_days" in body:
+                    item["expires"] = date_to_str((datetime.now() + timedelta(days=max(int(body["set_days"]), 0))).date())
+                elif "set_date" in body:
+                    item["expires"] = str(body["set_date"]).strip()
+                new_id = str(body.get("new_id", "")).strip()
+                if new_id and new_id != uid:
+                    users.pop(uid)
+                    users[new_id] = item
+                    uid = new_id
+                else:
+                    users[uid] = item
+                save_users(users)
+            json_resp(self, 200, {"ok": True, "id": uid, "name": item["name"],
+                                   "expires": item["expires"], "days_left": days_left(item["expires"])}); return
         json_resp(self, 404, {"error": "ruta no encontrada"})
 
 if __name__ == "__main__":
-    print(f"btpanel escuchando :{PORT}")
+    print(f"panel api escuchando :{PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 PYEOF
 chmod +x /opt/btserver/panel.py
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SYSTEMD UNITS — btserver y btpanel
-# ─────────────────────────────────────────────────────────────────────────────
-cat > /etc/systemd/system/btserver.service << 'SVCEOF'
+info "Compilando btserver..."
+export PATH=/usr/local/go/bin:$PATH
+export HOME=/root
+export GOPATH=/root/go
+export GOCACHE=/root/.cache/go-build
+export GOFLAGS="-trimpath"
+mkdir -p "$GOPATH" "$GOCACHE"
+cd /opt/btserver
+GOEXPERIMENT=greenteagc $GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go ||     $GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go || die "Error compilando btserver.go"
+chmod +x /opt/btserver/btserver
+info "Compilado OK"
+
+if [ ! -f /opt/btserver/users.txt ]; then
+    printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+    info "users.txt creado"
+fi
+
+cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
-Description=BlackTunnel Server
-After=network.target xray.service dropbear.service
+Description=HEV Socks5
+After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/btserver/btserver.py
+ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server.yml
 Restart=always
 RestartSec=2
-LimitNOFILE=65535
+LimitNOFILE=1000000
+LimitNPROC=infinity
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+SVC
 
-cat > /etc/systemd/system/btpanel.service << 'SVCEOF'
+cat > /etc/systemd/system/btserver.service << 'SVC'
+[Unit]
+Description=BlackTunnel Server
+After=network.target hev-socks5.service
+Requires=hev-socks5.service
+
+[Service]
+ExecStart=/opt/btserver/btserver
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+TasksMax=infinity
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat > /etc/systemd/system/btpanel.service << 'SVC'
 [Unit]
 Description=BlackTunnel Panel API
 After=network.target
@@ -829,50 +1109,46 @@ RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+SVC
 
 systemctl daemon-reload
+systemctl enable hev-socks5 btserver btpanel
 
-# Habilitar servicios base siempre
-systemctl enable xray btserver btpanel dropbear 2>/dev/null || true
+info "Iniciando hev-socks5..."
+systemctl restart hev-socks5
+sleep 1
 
-# Habilitar badvpn solo si se instaló
-if [ "$BADVPN_INSTALLED" = true ]; then
-    systemctl enable badvpn 2>/dev/null || true
-fi
+info "Iniciando btserver..."
+systemctl restart btserver
+sleep 1
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ARRANQUE FINAL
-# ─────────────────────────────────────────────────────────────────────────────
-info "Iniciando servicios..."
-for svc in xray dropbear btserver btpanel; do
-    if systemctl restart "$svc" 2>/dev/null; then
-        info "  ✓ $svc OK"
-    else
-        warn "  ✗ $svc falló — revisa: journalctl -u $svc -n 30"
-    fi
-done
+info "Iniciando btpanel..."
+systemctl restart btpanel
+sleep 1
 
-if [ "$BADVPN_INSTALLED" = true ]; then
-    if systemctl restart badvpn 2>/dev/null; then
-        info "  ✓ badvpn OK"
-    else
-        warn "  ✗ badvpn falló — revisa: journalctl -u badvpn -n 30"
-    fi
+info "Configurando QoS..."
+IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+if [ -n "$IFACE" ]; then
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 2ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 5ms interval 100ms
+    tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms interval 100ms
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 1 u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 2 u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 3 u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
+    info "QoS aplicado en $IFACE"
 fi
 
 echo ""
 echo "================================================"
-[ "$FRESH_INSTALL" = true ] && echo "  INSTALACION COMPLETA" || echo "  ACTUALIZACION COMPLETA"
+echo "  INSTALACION COMPLETA"
 echo "================================================"
-echo ""
-echo "  URL PANEL:  http://${SERVER_IP}:${PANEL_PORT}"
+echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
 echo "  TOKEN:      ${PANEL_TOKEN}"
-echo "  BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'no disponible')"
-echo "  BADVPN UDP: $([ "$BADVPN_INSTALLED" = true ] && echo "127.0.0.1:${UDPGW_PORT}" || echo "no instalado")"
-echo ""
-echo "  Flujo:  cliente:80 → btserver.py"
-echo "            action:ssh    → dropbear 127.0.0.1:2222"
-echo "            action:tunnel → xray     127.0.0.1:10809"
-echo "            udp/icmp      → badvpn   127.0.0.1:${UDPGW_PORT}"
 echo "================================================"
+echo ""
+info "Estado servicios:"
+systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
+echo ""
+ss -s | grep -E "TCP|estab"
