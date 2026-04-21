@@ -116,23 +116,1035 @@ root soft nofile 1000000
 root hard nofile 1000000
 LIMITS
 
-# ── btserver.go ───────────────────────────────────────────────────
 info "Escribiendo btserver.go..."
-python3 -c "
-import base64
-data =  + go_b64 + 
-open('/opt/btserver/btserver.go','wb').write(base64.b64decode(data))
-"
+cat > /opt/btserver/btserver.go << 'GOEOF'
+//go:build go1.20
 
-# ── panel.go ──────────────────────────────────────────────────────
+package main
+
+import (
+	"bufio"
+	"encoding/binary"
+	"io"
+	"log"
+	"net"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+const (
+	hevTCPAddr  = "127.0.0.1:1080"
+	hevUDPAddr  = "127.0.0.1:1080"
+	listenAddr  = "0.0.0.0:80"
+	usersFile   = "/opt/btserver/users.txt"
+	cacheReload = 30 * time.Second
+
+	tOpen  byte = 0x01
+	tData  byte = 0x02
+	tClose byte = 0x03
+	tPing  byte = 0x04
+	tPong  byte = 0x05
+
+	maxStreams   = 8192
+	queueSize    = 64
+	dialTimeout  = 100 * time.Millisecond
+	writeTimeout = 5 * time.Second
+	maxPayload   = 16384
+)
+
+/* ── Usuarios ─────────────────────────────────────────────────── */
+
+type userEntry struct {
+	name    string
+	expires time.Time
+}
+
+type userCache struct {
+	mu       sync.RWMutex
+	table    map[string]*userEntry
+	loadedAt time.Time
+}
+
+var cache = &userCache{table: make(map[string]*userEntry)}
+
+func (c *userCache) reload() {
+	f, err := os.Open(usersFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	t := make(map[string]*userEntry, 64)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		var id, name, exp string
+		n, start := 0, 0
+		for i := 0; i <= len(line); i++ {
+			if i == len(line) || line[i] == ':' {
+				switch n {
+				case 0:
+					id = line[start:i]
+				case 1:
+					name = line[start:i]
+				case 2:
+					exp = line[start:i]
+				}
+				n++
+				start = i + 1
+				if n == 3 {
+					break
+				}
+			}
+		}
+		if n < 3 || id == "" || name == "" || exp == "" {
+			continue
+		}
+		expires, err := time.ParseInLocation("2006-01-02", exp, time.Local)
+		if err != nil {
+			continue
+		}
+		expires = expires.Add(24*time.Hour - time.Second)
+		t[id] = &userEntry{name: name, expires: expires}
+	}
+	c.mu.Lock()
+	c.table = t
+	c.loadedAt = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *userCache) lookup(id string) (*userEntry, bool) {
+	c.mu.RLock()
+	needReload := time.Since(c.loadedAt) > cacheReload
+	e, ok := c.table[id]
+	c.mu.RUnlock()
+	if needReload {
+		go c.reload()
+	}
+	return e, ok
+}
+
+type authResult int
+
+const (
+	authOK       authResult = iota
+	authNotFound
+	authExpired
+)
+
+func checkAuth(id string) (string, int, authResult) {
+	e, ok := cache.lookup(id)
+	if !ok {
+		return "", 0, authNotFound
+	}
+	if time.Now().After(e.expires) {
+		return e.name, 0, authExpired
+	}
+	days := int(e.expires.Sub(time.Now()).Hours()/24) + 1
+	return e.name, days, authOK
+}
+
+/* ── Frame pool ───────────────────────────────────────────────── */
+
+var framePool = sync.Pool{New: func() interface{} {
+	b := make([]byte, 7+maxPayload)
+	return &b
+}}
+
+func getFrame() []byte  { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte) { framePool.Put(&b) }
+
+// Pool de payloads — elimina alloca por frame en tData/tOpen
+var payloadPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, maxPayload)
+	return &b
+}}
+
+func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
+func putPayload(b []byte) { payloadPool.Put(&b) }
+
+// Pool de buffers de lectura — elimina alloca por stream en handleStream
+var readBufPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, maxPayload)
+	return &b
+}}
+
+/* ── Stream ───────────────────────────────────────────────────── */
+
+type stream struct {
+	q      chan []byte
+	closed atomic.Uint32
+}
+
+func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
+func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
+
+/* ── Mux ──────────────────────────────────────────────────────── */
+
+type mux struct {
+	conn    net.Conn
+	writeQ  chan []byte
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   atomic.Int32
+	dead    atomic.Uint32
+}
+
+func newMux(conn net.Conn) *mux {
+	m := &mux{
+		conn:    conn,
+		writeQ:  make(chan []byte, 4096),
+		streams: make(map[uint32]*stream, 512),
+	}
+	go m.writeLoop()
+	return m
+}
+
+func (m *mux) writeLoop() {
+	var bufs net.Buffers
+	var toFree [][]byte
+	for buf := range m.writeQ {
+		if m.dead.Load() == 1 {
+			putFrame(buf[:cap(buf)])
+			continue
+		}
+		// Acumular todo lo disponible en el canal ahora mismo
+		bufs = append(bufs[:0], buf)
+		toFree = append(toFree[:0], buf)
+	drain:
+		for {
+			select {
+			case b := <-m.writeQ:
+				bufs = append(bufs, b)
+				toFree = append(toFree, b)
+			default:
+				break drain
+			}
+		}
+		m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		bufs.WriteTo(m.conn)
+		m.conn.SetWriteDeadline(time.Time{})
+		for _, b := range toFree {
+			putFrame(b[:cap(b)])
+		}
+	}
+}
+
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
+	}
+}
+
+func (m *mux) add(sid uint32, s *stream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int(m.count.Load()) >= maxStreams {
+		return false
+	}
+	m.streams[sid] = s
+	m.count.Add(1)
+	return true
+}
+
+func (m *mux) get(sid uint32) *stream {
+	m.mu.RLock()
+	s := m.streams[sid]
+	m.mu.RUnlock()
+	return s
+}
+
+func (m *mux) del(sid uint32) {
+	m.mu.Lock()
+	if _, ok := m.streams[sid]; ok {
+		delete(m.streams, sid)
+		m.count.Add(-1)
+	}
+	m.mu.Unlock()
+}
+
+func (m *mux) send(t byte, sid uint32, data []byte) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	ln := len(data)
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
+	if ln > 0 {
+		copy(buf[7:7+ln], data)
+	}
+	select {
+	case m.writeQ <- buf[:7+ln]:
+	default:
+		putFrame(buf)
+	}
+}
+
+func (m *mux) sendHdr(t byte, sid uint32) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5] = 0
+	buf[6] = 0
+	select {
+	case m.writeQ <- buf[:7]:
+	default:
+		putFrame(buf)
+	}
+}
+
+/* ── handleStream — transporte puro hacia hev ────────────────── */
+
+func (m *mux) handleStream(sid uint32, s *stream, firstData []byte) {
+	defer func() {
+		if s.tryClose() {
+			m.del(sid)
+			m.sendHdr(tClose, sid)
+			for range s.q {
+			}
+		}
+	}()
+
+	// Siempre al motor — sin DNS propio, sin bypass
+	hev, err := net.DialTimeout("tcp", hevTCPAddr, dialTimeout)
+	if err != nil {
+		return
+	}
+	defer hev.Close()
+
+	tc := hev.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(262144)
+	tc.SetWriteBuffer(262144)
+
+	if len(firstData) > 0 {
+		if _, err := hev.Write(firstData); err != nil {
+			return
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Cliente → hev
+	go func() {
+		defer wg.Done()
+		for d := range s.q {
+			_, err := hev.Write(d)
+			putPayload(d[:cap(d)])
+			if err != nil {
+				break
+			}
+		}
+		tc.CloseWrite()
+	}()
+
+	// hev → cliente
+	go func() {
+		defer wg.Done()
+		buf := *readBufPool.Get().(*[]byte)
+		defer readBufPool.Put(&buf)
+		for {
+			n, err := hev.Read(buf)
+			if n > 0 {
+				m.send(tData, sid, buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+/* ── Mux loop — lee frames del cliente ───────────────────────── */
+
+func (m *mux) run() {
+	hdr     := make([]byte, 7)
+	readBuf := make([]byte, maxPayload)
+	for {
+		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+			break
+		}
+		ft  := hdr[0]
+		sid := binary.BigEndian.Uint32(hdr[1:5])
+		ln  := binary.BigEndian.Uint16(hdr[5:7])
+		if int(ln) > maxPayload {
+			break
+		}
+		var data []byte
+		if ln > 0 {
+			if _, err := io.ReadFull(m.conn, readBuf[:ln]); err != nil {
+				break
+			}
+			data = readBuf[:ln]
+		}
+
+		if ft == tPing {
+			m.sendHdr(tPong, sid)
+			continue
+		}
+		if ft == tPong {
+			continue
+		}
+
+		switch ft {
+		case tOpen:
+			s := &stream{q: make(chan []byte, queueSize)}
+			if !m.add(sid, s) {
+				m.sendHdr(tClose, sid)
+				continue
+			}
+			var first []byte
+			if ln > 0 {
+				first = make([]byte, ln)
+				copy(first, data)
+			}
+			go m.handleStream(sid, s, first)
+		case tData:
+			s := m.get(sid)
+			if s == nil || s.isClosed() {
+				continue
+			}
+			payload := getPayload()[:ln]
+			copy(payload, data)
+			select {
+			case s.q <- payload:
+			default:
+				putPayload(payload[:cap(payload)])
+				if s.tryClose() {
+					m.del(sid)
+					close(s.q)
+					m.sendHdr(tClose, sid)
+				}
+			}
+		case tClose:
+			s := m.get(sid)
+			if s != nil && s.tryClose() {
+				m.del(sid)
+				close(s.q)
+			}
+		}
+	}
+	m.mu.Lock()
+	for _, s := range m.streams {
+		if s.tryClose() {
+			close(s.q)
+		}
+	}
+	m.mu.Unlock()
+}
+
+/* ── UDP tunnel ───────────────────────────────────────────────── */
+
+type udpSession struct {
+	conn net.Conn
+	dead atomic.Uint32
+}
+
+func (u *udpSession) kill() {
+	if u.dead.CompareAndSwap(0, 1) {
+		u.conn.Close()
+	}
+}
+
+func runUDPTunnel(conn net.Conn) {
+	defer conn.Close()
+	hevUDP, err := net.Dial("udp", hevUDPAddr)
+	if err != nil {
+		return
+	}
+	defer hevUDP.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				hevUDP.SetWriteDeadline(time.Now().Add(writeTimeout))
+				hevUDP.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, maxPayload)
+		for {
+			hevUDP.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := hevUDP.Read(buf)
+			if n > 0 {
+				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				conn.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+/* ── Sesiones activas ─────────────────────────────────────────── */
+
+var activeSessions    sync.Map
+var activeUDPSessions sync.Map
+
+/* ── Handshake HTTP + auth ────────────────────────────────────── */
+
+var (
+	actionNeedle     = []byte("action:")
+	internalIDNeedle = []byte("x-internal-id:")
+	crlfcrlf         = []byte("\r\n\r\n")
+	resp403NotReg    = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n\r\nnot_registered")
+	resp403Expired   = []byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\nexpired")
+)
+
+func indexBytes(s, sub []byte) int {
+	if len(sub) == 0 || len(s) < len(sub) {
+		return -1
+	}
+	first := sub[0] | 0x20
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i]|0x20 != first {
+			continue
+		}
+		match := true
+		for j := 1; j < len(sub); j++ {
+			if s[i+j]|0x20 != sub[j]|0x20 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func extractHeader(raw []byte, needle []byte) string {
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\n' {
+			continue
+		}
+		end := i
+		if end > start && raw[end-1] == '\r' {
+			end--
+		}
+		line := raw[start:end]
+		start = i + 1
+		if len(line) <= len(needle) {
+			continue
+		}
+		if indexBytes(line[:len(needle)], needle) != 0 {
+			continue
+		}
+		val := line[len(needle):]
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+			val = val[1:]
+		}
+		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+			val = val[:len(val)-1]
+		}
+		return string(val)
+	}
+	return ""
+}
+
+func handle(conn net.Conn) {
+	defer conn.Close()
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(262144)
+	tc.SetWriteBuffer(262144)
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+
+	buf := make([]byte, 4096)
+	n := 0
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for n < len(buf) {
+		nr, err := conn.Read(buf[n:])
+		if nr > 0 {
+			n += nr
+			raw := buf[:n]
+			if indexBytes(raw, actionNeedle) >= 0 && indexBytes(raw, crlfcrlf) >= 0 {
+				break
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	raw := buf[:n]
+	action := extractHeader(raw, actionNeedle)
+	if action != "tunnel" && action != "tunnel-tcp" && action != "tunnel-udp" {
+		return
+	}
+
+	userID := extractHeader(raw, internalIDNeedle)
+	if userID == "" {
+		conn.Write(resp403NotReg)
+		return
+	}
+
+	name, days, result := checkAuth(userID)
+	switch result {
+	case authNotFound:
+		conn.Write(resp403NotReg)
+		return
+	case authExpired:
+		conn.Write(resp403Expired)
+		return
+	}
+
+	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: " +
+		name + "\r\nX-User-Days: " + itoa(days) + "\r\n\r\n"))
+
+	if action == "tunnel-udp" {
+		u := &udpSession{conn: conn}
+		if prev, loaded := activeUDPSessions.Swap(userID, u); loaded {
+			prev.(*udpSession).kill()
+		}
+		runUDPTunnel(conn)
+		activeUDPSessions.CompareAndDelete(userID, u)
+	} else {
+		m := newMux(conn)
+		if prev, loaded := activeSessions.Swap(userID, m); loaded {
+			prev.(*mux).kill()
+		}
+		m.run()
+		activeSessions.CompareAndDelete(userID, m)
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	buf := make([]byte, 20)
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+/* ── Main ─────────────────────────────────────────────────────── */
+
+func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetMemoryLimit(768 << 20)
+	cache.reload()
+	go func() {
+		t := time.NewTicker(cacheReload)
+		defer t.Stop()
+		for range t.C {
+			cache.reload()
+		}
+	}()
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if tc, ok := ln.(*net.TCPListener); ok {
+		if raw, err := tc.SyscallConn(); err == nil {
+			raw.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+			})
+		}
+	}
+
+	log.Printf("btserver %s -> hev %s (go=%s cpus=%d)",
+		listenAddr, hevTCPAddr, runtime.Version(), runtime.NumCPU())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handle(conn)
+	}
+}
+
+GOEOF
+
 info "Escribiendo panel.go..."
-python3 -c "
-import base64
-data =  + panel_b64 + 
-open('/opt/btserver/panel.go','wb').write(base64.b64decode(data))
-"
+cat > /opt/btserver/panel.go << 'GOEOF'
+package main
 
-# ── Compilar ──────────────────────────────────────────────────────
+import (
+	"bufio"
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	panelAddr = "0.0.0.0:8090"
+	usersPath = "/opt/btserver/users.txt"
+	tokenPath = "/opt/btserver/token.txt"
+)
+
+/* ── Rate limiter simple ──────────────────────────────────────── */
+
+var (
+	rateMu   sync.Mutex
+	rateHits = map[string][]int64{}
+)
+
+func rateOK(ip string) bool {
+	now := time.Now().Unix()
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	hits := rateHits[ip]
+	valid := hits[:0]
+	for _, t := range hits {
+		if now-t < 60 {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= 30 {
+		rateHits[ip] = valid
+		return false
+	}
+	rateHits[ip] = append(valid, now)
+	if len(rateHits) > 1000 {
+		rateHits = map[string][]int64{}
+	}
+	return true
+}
+
+/* ── Token ────────────────────────────────────────────────────── */
+
+func loadToken() string {
+	b, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+/* ── Usuarios ─────────────────────────────────────────────────── */
+
+type user struct {
+	Name    string `json:"name"`
+	Expires string `json:"expires"`
+}
+
+var usersMu sync.Mutex
+
+func loadUsers() map[string]*user {
+	f, err := os.Open(usersPath)
+	if err != nil {
+		return map[string]*user{}
+	}
+	defer f.Close()
+	out := map[string]*user{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		id, name, exp := strings.TrimSpace(parts[0]),
+			strings.TrimSpace(parts[1]),
+			strings.TrimSpace(parts[2])
+		if id != "" {
+			out[id] = &user{Name: name, Expires: exp}
+		}
+	}
+	return out
+}
+
+func saveUsers(users map[string]*user) {
+	dir := filepath.Dir(usersPath)
+	tmp, err := os.CreateTemp(dir, ".users_tmp")
+	if err != nil {
+		return
+	}
+	w := bufio.NewWriter(tmp)
+	w.WriteString("# formato: id:nombre:YYYY-MM-DD\n")
+	for id, u := range users {
+		w.WriteString(id + ":" + u.Name + ":" + u.Expires + "\n")
+	}
+	w.Flush()
+	tmp.Close()
+	os.Rename(tmp.Name(), usersPath)
+}
+
+func daysLeft(exp string) int {
+	t, err := time.ParseInLocation("2006-01-02", exp, time.Local)
+	if err != nil {
+		return 0
+	}
+	d := int(time.Until(t.Add(24*time.Hour-time.Second).Add(1)).Hours() / 24)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func addDate(base time.Time, days int) string {
+	return base.AddDate(0, 0, days).Format("2006-01-02")
+}
+
+/* ── Helpers HTTP ─────────────────────────────────────────────── */
+
+func jsonResp(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func clientIP(r *http.Request) string {
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !rateOK(clientIP(r)) {
+			jsonResp(w, 429, map[string]any{"error": "too many requests"})
+			return
+		}
+		if strings.TrimSpace(r.Header.Get("X-Token")) != loadToken() {
+			jsonResp(w, 401, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+/* ── Handlers ─────────────────────────────────────────────────── */
+
+func handleClients(w http.ResponseWriter, r *http.Request) {
+	usersMu.Lock()
+	users := loadUsers()
+	usersMu.Unlock()
+	result := make([]map[string]any, 0, len(users))
+	for id, u := range users {
+		dl := daysLeft(u.Expires)
+		result = append(result, map[string]any{
+			"id": id, "name": u.Name, "expires": u.Expires,
+			"days_left": dl, "active": dl > 0,
+		})
+	}
+	jsonResp(w, 200, map[string]any{"clients": result, "total": len(result)})
+}
+
+func handleClient(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	users := loadUsers()
+	usersMu.Unlock()
+	u, ok := users[id]
+	if !ok {
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	dl := daysLeft(u.Expires)
+	jsonResp(w, 200, map[string]any{
+		"id": id, "name": u.Name, "expires": u.Expires,
+		"days_left": dl, "active": dl > 0,
+	})
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonResp(w, 400, map[string]any{"error": "body invalido"})
+		return
+	}
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	name := strings.TrimSpace(str(body["name"]))
+	if name == "" {
+		name = "sin-nombre"
+	}
+	days := intVal(body["days"], 30)
+	exp := addDate(time.Now(), days)
+	usersMu.Lock()
+	users := loadUsers()
+	users[id] = &user{Name: name, Expires: exp}
+	saveUsers(users)
+	usersMu.Unlock()
+	jsonResp(w, 200, map[string]any{"ok": true, "id": id, "name": name, "expires": exp, "days": days})
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	users := loadUsers()
+	if _, ok := users[id]; !ok {
+		usersMu.Unlock()
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	delete(users, id)
+	saveUsers(users)
+	usersMu.Unlock()
+	jsonResp(w, 200, map[string]any{"ok": true})
+}
+
+func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	defer usersMu.Unlock()
+	users := loadUsers()
+	u, ok := users[id]
+	if !ok {
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	if v, ok := body["name"]; ok {
+		if n := strings.TrimSpace(str(v)); n != "" {
+			u.Name = n
+		}
+	}
+	// Fecha base
+	base, err := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
+	if err != nil {
+		base = time.Now()
+	}
+	if base.Before(time.Now()) {
+		base = time.Now()
+	}
+	if _, ok := body["add_days"]; ok {
+		u.Expires = addDate(base, intVal(body["add_days"], 0))
+	} else if _, ok := body["sub_days"]; ok {
+		orig, _ := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
+		u.Expires = addDate(orig, -intVal(body["sub_days"], 0))
+	} else if _, ok := body["set_days"]; ok {
+		u.Expires = addDate(time.Now(), intVal(body["set_days"], 0))
+	} else if v, ok := body["set_date"]; ok {
+		u.Expires = strings.TrimSpace(str(v))
+	}
+	newID := strings.TrimSpace(str(body["new_id"]))
+	if newID != "" && newID != id {
+		delete(users, id)
+		users[newID] = u
+		id = newID
+	} else {
+		users[id] = u
+	}
+	saveUsers(users)
+	jsonResp(w, 200, map[string]any{
+		"ok": true, "id": id, "name": u.Name,
+		"expires": u.Expires, "days_left": daysLeft(u.Expires),
+	})
+}
+
+/* ── Helpers ──────────────────────────────────────────────────── */
+
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	}
+	return ""
+}
+
+func intVal(v any, def int) int {
+	if v == nil {
+		return def
+	}
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return def
+}
+
+/* ── Main ─────────────────────────────────────────────────────── */
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/clients",       authMiddleware(handleClients))
+	mux.HandleFunc("/client",        authMiddleware(handleClient))
+	mux.HandleFunc("/client/create", authMiddleware(handleCreate))
+	mux.HandleFunc("/client/delete", authMiddleware(handleDelete))
+	mux.HandleFunc("/client/update", authMiddleware(handleUpdate))
+
+	srv := &http.Server{
+		Addr:         panelAddr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	log.Printf("panel api escuchando %s", panelAddr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+GOEOF
+
 info "Compilando btserver..."
 export PATH=/usr/local/go/bin:$PATH
 export HOME=/root
@@ -155,7 +1167,6 @@ if [ ! -f /opt/btserver/users.txt ]; then
     info "users.txt creado"
 fi
 
-# ── Systemd ───────────────────────────────────────────────────────
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
 Description=HEV Socks5
