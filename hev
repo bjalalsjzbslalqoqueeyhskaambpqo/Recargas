@@ -64,16 +64,15 @@ main:
   port: 1080
   listen-address: '127.0.0.1'
   listen-ipv6-only: false
-  udp-port: 1080
-  udp-listen-address: '127.0.0.1'
-  domain-address-type: ipv4
+  domain-address-type: unspec
 dns:
   port: 53
   address: '127.0.0.1'
   upstream: '8.8.8.8'
 misc:
   connect-timeout: 5000
-  read-write-timeout: 300000
+  tcp-read-write-timeout: 300000
+  udp-read-write-timeout: 60000
   log-file: stderr
   log-level: warn
 YMLEOF
