@@ -1,812 +1,1110 @@
-package com.blacktunnel;
+#!/bin/bash
+set -e
+GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.content.Context;
-import android.content.Intent;
-import android.content.SharedPreferences;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
-import android.net.VpnService;
-import android.os.Build;
-import android.os.ParcelFileDescriptor;
-import android.os.SystemClock;
-import android.provider.Settings;
-import androidx.core.app.NotificationCompat;
-import java.io.EOFException;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.UnknownHostException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.Enumeration;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
+[ "$(id -u)" = "0" ] || die "Ejecutar como root"
 
-public class BtVpnService extends VpnService {
-    public static final String ACTION_START = "com.blacktunnel.START";
-    public static final String ACTION_STOP  = "com.blacktunnel.STOP";
-    public static final String ACTION_APPLY = "com.blacktunnel.APPLY";
-    private static final String CH_ID = "bt_vpn";
-    private static final int    NF_ID = 33;
-    private static final AtomicBoolean runningState      = new AtomicBoolean(false);
-    private static final AtomicBoolean proxyStarted      = new AtomicBoolean(false);
-    private static volatile Thread     localProxyThread  = null;
-    private static final AtomicBoolean hotspotStarted    = new AtomicBoolean(false);
-    private static final Object        LOG_LOCK          = new Object();
-    private static final StringBuilder LOGS              = new StringBuilder(8192);
-    private static final int           MAX_LOG_CHARS     = 24000;
+mkdir -p /opt/btserver
+cd /opt/btserver
 
-    private final AtomicBoolean   running  = new AtomicBoolean(false);
-    private final AtomicBoolean   stopping = new AtomicBoolean(false);
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+if command -v wget >/dev/null 2>&1; then
+    FETCH="wget -q --timeout=30 -O"
+elif command -v curl >/dev/null 2>&1; then
+    FETCH="curl -fsSL --connect-timeout 30 -o"
+else
+    apt-get update -qq --fix-missing 2>/dev/null || true
+    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl"
+    FETCH="wget -q --timeout=30 -O"
+fi
 
-    private volatile ParcelFileDescriptor                tunPfd;
-    private volatile Thread                              hevThread;
-    private volatile int                                 hevTunFd  = -1;
-    private volatile File                                hevCfgFile;
-    private volatile ConnectivityManager.NetworkCallback netCallback;
+info "Instalando Go..."
+rm -rf /usr/local/go
+$FETCH /tmp/go.tar.gz https://go.dev/dl/go1.22.3.linux-amd64.tar.gz || die "No se pudo descargar Go"
+tar -C /usr/local -xzf /tmp/go.tar.gz
+rm -f /tmp/go.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+export PATH=/usr/local/go/bin:$PATH
+GO=/usr/local/go/bin/go
+info "Go: $($GO version)"
 
-    public static boolean isRunningState() { return runningState.get(); }
+if [ -f /opt/btserver/token.txt ] && [ -s /opt/btserver/token.txt ]; then
+    PANEL_TOKEN=$(cat /opt/btserver/token.txt)
+    info "Token existente conservado."
+else
+    PANEL_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 64 || true)
+    echo "${PANEL_TOKEN}" > /opt/btserver/token.txt
+    chmod 600 /opt/btserver/token.txt
+    info "Nuevo token generado."
+fi
 
-    public static void log(String message) {
-        String line = "[" + new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date())
-                    + "] " + message + "\n";
-        synchronized (LOG_LOCK) {
-            LOGS.append(line);
-            if (LOGS.length() > MAX_LOG_CHARS)
-                LOGS.delete(0, LOGS.length() - MAX_LOG_CHARS);
-        }
-    }
+PANEL_PORT=8090
+SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
 
-    public static String dumpLogs() {
-        synchronized (LOG_LOCK) {
-            String native_ = BtProxy.drainLogs();
-            if (native_ != null && !native_.isBlank()) {
-                LOGS.append(native_);
-                if (LOGS.length() > MAX_LOG_CHARS)
-                    LOGS.delete(0, LOGS.length() - MAX_LOG_CHARS);
-            }
-            return LOGS.toString();
-        }
-    }
+info "Deteniendo servicios..."
+systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
+sleep 1
 
-    // ── Proxy local hotspot ──────────────────────────────────────
+info "Descargando hev-socks5-server..."
+$FETCH /tmp/hev-socks5-server.tmp \
+    https://github.com/heiher/hev-socks5-server/releases/latest/download/hev-socks5-server-linux-x86_64 \
+    || die "No se pudo descargar hev-socks5-server"
+mv -f /tmp/hev-socks5-server.tmp /opt/btserver/hev-socks5-server
+chmod +x /opt/btserver/hev-socks5-server
+info "hev-socks5-server OK"
 
-    public static void startLocalProxy(int port) {
-        if (hotspotStarted.getAndSet(true)) return;
-        Thread t = new Thread(() -> {
-            try (ServerSocket ss = new ServerSocket(port, 128,
-                    InetAddress.getByName("0.0.0.0"))) {
-                ss.setReuseAddress(true);
-                while (!Thread.currentThread().isInterrupted()) {
-                    Socket client;
-                    try { client = ss.accept(); }
-                    catch (Exception e) { break; }
-                    Thread relay = new Thread(() -> handleClient(client));
-                    relay.setDaemon(true);
-                    relay.start();
-                }
-            } catch (Exception ignored) {}
-            hotspotStarted.set(false);
-        }, "local-proxy");
-        t.setDaemon(true);
-        localProxyThread = t;
-        t.start();
-    }
+NWORKERS=$(nproc 2>/dev/null || echo 1)
+info "HEV workers: $NWORKERS"
 
-    public static void stopLocalProxy() {
-        Thread t = localProxyThread;
-        if (t != null) { t.interrupt(); localProxyThread = null; }
-        hotspotStarted.set(false);
-    }
+cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
+main:
+  workers: ${NWORKERS}
+  port: 1080
+  listen-address: '127.0.0.1'
+  listen-ipv6-only: false
+  domain-address-type: unspec
+misc:
+  connect-timeout: 5000
+  tcp-read-write-timeout: 300000
+  udp-read-write-timeout: 60000
+  max-session-count: 0
+  log-file: stderr
+  log-level: warn
+  limit-nofile: 1000000
+YMLEOF
 
-    public static String getHotspotIp() {
-        try {
-            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
-            if (ifaces == null) return null;
-            while (ifaces.hasMoreElements()) {
-                NetworkInterface iface = ifaces.nextElement();
-                if (!iface.isUp() || iface.isLoopback()) continue;
-                String name = iface.getName().toLowerCase();
-                if (name.equals("lo") || name.startsWith("rmnet") || name.startsWith("ccmni") ||
-                    name.startsWith("dummy") || name.startsWith("p2p") || name.startsWith("bt-pan") ||
-                    name.startsWith("sit") || name.startsWith("ip6tnl")) continue;
-                Enumeration<InetAddress> addrs = iface.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress addr = addrs.nextElement();
-                    if (!addr.isSiteLocalAddress() || !(addr instanceof Inet4Address)) continue;
-                    String ip = addr.getHostAddress();
-                    if (ip == null || ip.startsWith("198.18.") || ip.startsWith("172.")) continue;
-                    return ip;
-                }
-            }
-        } catch (Exception ignored) {}
-        return null;
-    }
+info "Tuning TCP/kernel..."
+cat > /etc/sysctl.d/99-btserver.conf << 'SYSCTL'
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
+net.ipv4.tcp_notsent_lowat=4096
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=10
+net.ipv4.tcp_keepalive_probes=3
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=1000000
+net.ipv4.tcp_mem=786432 1048576 33554432
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_max_tw_buckets=2000000
+SYSCTL
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
+info "Sysctl aplicado"
 
-    private static void handleClient(Socket client) {
-        try {
-            client.setTcpNoDelay(true);
-            InputStream  ci = client.getInputStream();
-            OutputStream co = client.getOutputStream();
-            int first = ci.read();
-            if (first < 0) return;
-            if (first == 0x05) {
-                handleSocks5Direct(client, ci, co, (byte) first);
-            } else {
-                handleHttpLoop(client, ci, co, (byte) first);
-            }
-        } catch (Exception ignored) {
-        } finally {
-            try { client.close(); } catch (Exception ignored) {}
-        }
-    }
+cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
+*    soft nofile 1000000
+*    hard nofile 1000000
+root soft nofile 1000000
+root hard nofile 1000000
+LIMITS
 
-    private static void handleSocks5Direct(Socket client, InputStream ci,
-            OutputStream co, byte firstByte) throws Exception {
-        try (Socket motor = new Socket("127.0.0.1", BtProxy.SOCKS5_PORT)) {
-            motor.setTcpNoDelay(true);
-            InputStream  mi = motor.getInputStream();
-            OutputStream mo = motor.getOutputStream();
-            mo.write(firstByte);
-            final Socket m = motor;
-            Thread r = new Thread(() -> {
-                try { pipe(mi, co); } catch (Exception ignored) {}
-                try { m.close(); } catch (Exception ignored) {}
-            });
-            r.setDaemon(true);
-            r.start();
-            pipe(ci, mo);
-        }
-    }
+info "Escribiendo btserver.go..."
+cat > /opt/btserver/btserver.go << 'GOEOF'
+//go:build go1.20
 
-    private static void handleHttpLoop(Socket client, InputStream ci,
-            OutputStream co, byte firstByte) throws Exception {
-        byte[] pending = new byte[]{(byte) firstByte};
-        while (true) {
-            String firstLine = readLineWithPrefix(ci, pending);
-            pending = null;
-            if (firstLine == null || firstLine.isEmpty()) return;
-            StringBuilder headers = new StringBuilder();
-            String line;
-            while (!(line = readLine(ci)).isEmpty())
-                headers.append(line).append("\r\n");
-            String hdrs      = headers.toString();
-            String hdrsLower = hdrs.toLowerCase(Locale.ROOT);
-            boolean isConnect = firstLine.startsWith("CONNECT ");
-            boolean isUpgrade = hdrsLower.contains("upgrade: websocket");
-            boolean keepAlive = !firstLine.contains("HTTP/1.0")
-                    && !hdrsLower.contains("connection: close");
-            if (isConnect) { handleConnect(firstLine, ci, co); return; }
-            else if (isUpgrade) { handleWebSocket(firstLine, hdrs, ci, co); return; }
-            else {
-                boolean ok = handleHttpRequest(firstLine, hdrs, ci, co);
-                if (!ok || !keepAlive) return;
-            }
-        }
-    }
+package main
 
-    private static void handleConnect(String firstLine, InputStream ci,
-            OutputStream co) throws Exception {
-        String[] parts = firstLine.split(" ");
-        if (parts.length < 2) { sendError(co, 400); return; }
-        String hostPort = parts[1];
-        int colon = hostPort.lastIndexOf(':');
-        String host = colon >= 0 ? hostPort.substring(0, colon) : hostPort;
-        int    port = colon >= 0 ? parsePort(hostPort.substring(colon + 1), 443) : 443;
-        if (host.isEmpty()) { sendError(co, 400); return; }
-        try (Socket motor = new Socket("127.0.0.1", BtProxy.SOCKS5_PORT)) {
-            motor.setTcpNoDelay(true);
-            InputStream  mi = motor.getInputStream();
-            OutputStream mo = motor.getOutputStream();
-            if (!socks5Connect(mi, mo, host, port)) { sendError(co, 502); return; }
-            co.write("HTTP/1.1 200 Connection established\r\n\r\n"
-                    .getBytes(StandardCharsets.UTF_8));
-            co.flush();
-            final Socket m = motor;
-            Thread r = new Thread(() -> {
-                try { pipe(mi, co); } catch (Exception ignored) {}
-                try { m.close(); } catch (Exception ignored) {}
-            });
-            r.setDaemon(true);
-            r.start();
-            pipe(ci, mo);
-        } catch (Exception e) { sendError(co, 502); }
-    }
+import (
+	"bufio"
+	"encoding/binary"
+	"io"
+	"log"
+	"net"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
 
-    private static void handleWebSocket(String firstLine, String hdrs,
-            InputStream ci, OutputStream co) throws Exception {
-        String host = extractHeader(hdrs, "Host:");
-        int port = 80;
-        int colon = host.lastIndexOf(':');
-        if (colon >= 0) { port = parsePort(host.substring(colon + 1), 80); host = host.substring(0, colon); }
-        if (host.isEmpty()) { sendError(co, 400); return; }
-        try (Socket motor = new Socket("127.0.0.1", BtProxy.SOCKS5_PORT)) {
-            motor.setTcpNoDelay(true);
-            InputStream  mi = motor.getInputStream();
-            OutputStream mo = motor.getOutputStream();
-            if (!socks5Connect(mi, mo, host, port)) { sendError(co, 502); return; }
-            mo.write((firstLine + "\r\n" + hdrs + "\r\n").getBytes(StandardCharsets.UTF_8));
-            mo.flush();
-            final Socket m = motor;
-            Thread r = new Thread(() -> {
-                try { pipe(mi, co); } catch (Exception ignored) {}
-                try { m.close(); } catch (Exception ignored) {}
-            });
-            r.setDaemon(true);
-            r.start();
-            pipe(ci, mo);
-        } catch (Exception e) { sendError(co, 502); }
-    }
+const (
+	hevAddr      = "127.0.0.1:1080"
+	listenAddr   = "0.0.0.0:80"
+	usersFile    = "/opt/btserver/users.txt"
+	cacheReload  = 30 * time.Second
+	tOpen        = byte(0x01)
+	tData        = byte(0x02)
+	tClose       = byte(0x03)
+	tPing        = byte(0x04)
+	tPong        = byte(0x05)
+	maxStreams   = 8192
+	queueSize    = 64
+	dialTimeout  = 100 * time.Millisecond
+	writeTimeout = 5 * time.Second
+	maxPayload   = 16384
+)
 
-    private static boolean handleHttpRequest(String firstLine, String hdrs,
-            InputStream ci, OutputStream co) throws Exception {
-        String[] parts = firstLine.split(" ");
-        if (parts.length < 2) { sendError(co, 400); return false; }
-        String method  = parts[0];
-        String url     = parts[1];
-        String version = parts.length > 2 ? parts[2] : "HTTP/1.1";
-        String host; int port; String path;
-        if (url.startsWith("http://")) {
-            String without = url.substring(7);
-            int slash = without.indexOf('/');
-            String hostPort = slash >= 0 ? without.substring(0, slash) : without;
-            path = slash >= 0 ? without.substring(slash) : "/";
-            int colon = hostPort.lastIndexOf(':');
-            host = colon >= 0 ? hostPort.substring(0, colon) : hostPort;
-            port = colon >= 0 ? parsePort(hostPort.substring(colon + 1), 80) : 80;
-        } else {
-            String hostHeader = extractHeader(hdrs, "Host:");
-            int colon = hostHeader.lastIndexOf(':');
-            host = colon >= 0 ? hostHeader.substring(0, colon) : hostHeader;
-            port = colon >= 0 ? parsePort(hostHeader.substring(colon + 1), 80) : 80;
-            path = url.isEmpty() ? "/" : url;
-        }
-        if (host.isEmpty()) { sendError(co, 400); return false; }
-        byte[] body = readBody(hdrs, ci);
-        try (Socket motor = new Socket("127.0.0.1", BtProxy.SOCKS5_PORT)) {
-            motor.setTcpNoDelay(true);
-            InputStream  mi = motor.getInputStream();
-            OutputStream mo = motor.getOutputStream();
-            if (!socks5Connect(mi, mo, host, port)) { sendError(co, 502); return false; }
-            StringBuilder req = new StringBuilder();
-            req.append(method).append(' ').append(path).append(' ').append(version).append("\r\n");
-            for (String h : hdrs.split("\r\n")) {
-                if (h.toLowerCase(Locale.ROOT).startsWith("proxy-connection:") || h.isEmpty()) continue;
-                req.append(h).append("\r\n");
-            }
-            req.append("\r\n");
-            mo.write(req.toString().getBytes(StandardCharsets.UTF_8));
-            if (body != null && body.length > 0) mo.write(body);
-            mo.flush();
-            pipeResponse(mi, co);
-        } catch (Exception e) { sendError(co, 502); return false; }
-        return true;
-    }
-
-    private static boolean socks5Connect(InputStream mi, OutputStream mo,
-            String host, int port) throws Exception {
-        mo.write(new byte[]{0x05, 0x01, 0x00}); mo.flush();
-        byte[] resp = new byte[2]; readFully(mi, resp);
-        if (resp[0] != 0x05 || resp[1] != 0x00) return false;
-        byte[] hostBytes = host.getBytes(StandardCharsets.UTF_8);
-        byte[] req = new byte[7 + hostBytes.length];
-        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-        req[4] = (byte) hostBytes.length;
-        System.arraycopy(hostBytes, 0, req, 5, hostBytes.length);
-        req[5 + hostBytes.length] = (byte) ((port >> 8) & 0xFF);
-        req[6 + hostBytes.length] = (byte) (port & 0xFF);
-        mo.write(req); mo.flush();
-        byte[] shead = new byte[4]; readFully(mi, shead);
-        if (shead[1] != 0x00) return false;
-        switch (shead[3]) {
-            case 0x01: { byte[] s = new byte[6];  readFully(mi, s); break; }
-            case 0x04: { byte[] s = new byte[18]; readFully(mi, s); break; }
-            case 0x03: { int len = mi.read() & 0xFF; byte[] s = new byte[len+2]; readFully(mi,s); break; }
-            default: return false;
-        }
-        return true;
-    }
-
-    private static byte[] readBody(String hdrs, InputStream in) throws Exception {
-        String cl = extractHeader(hdrs, "Content-Length:");
-        if (cl.isEmpty()) return null;
-        try {
-            int len = Integer.parseInt(cl.trim());
-            if (len <= 0) return null;
-            byte[] buf = new byte[len]; readFully(in, buf); return buf;
-        } catch (Exception ignored) { return null; }
-    }
-
-    private static void pipeResponse(InputStream in, OutputStream out) throws Exception {
-        String status = readLine(in);
-        if (status.isEmpty()) return;
-        out.write((status + "\r\n").getBytes(StandardCharsets.UTF_8));
-        int contentLength = -1; boolean chunked = false;
-        String line;
-        StringBuilder respHdrs = new StringBuilder();
-        while (!(line = readLine(in)).isEmpty()) {
-            respHdrs.append(line).append("\r\n");
-            String lower = line.toLowerCase(Locale.ROOT);
-            if (lower.startsWith("content-length:"))
-                try { contentLength = Integer.parseInt(line.substring(15).trim()); } catch (Exception ignored) {}
-            if (lower.contains("transfer-encoding:") && lower.contains("chunked")) chunked = true;
-        }
-        out.write((respHdrs + "\r\n").getBytes(StandardCharsets.UTF_8));
-        out.flush();
-        if (chunked) { pipeChunked(in, out); }
-        else if (contentLength > 0) {
-            byte[] buf = new byte[8192]; int remaining = contentLength;
-            while (remaining > 0) {
-                int n = in.read(buf, 0, Math.min(remaining, buf.length));
-                if (n < 0) break;
-                out.write(buf, 0, n); remaining -= n;
-            }
-            out.flush();
-        } else if (contentLength == 0) {
-        } else { pipe(in, out); throw new EOFException(); }
-    }
-
-    private static void pipeChunked(InputStream in, OutputStream out) throws Exception {
-        byte[] buf = new byte[8192];
-        while (true) {
-            String sizeLine = readLine(in);
-            if (sizeLine.isEmpty()) continue;
-            out.write((sizeLine + "\r\n").getBytes(StandardCharsets.UTF_8));
-            int chunkSize;
-            try { chunkSize = Integer.parseInt(sizeLine.trim().split(";")[0], 16); }
-            catch (Exception e) { break; }
-            if (chunkSize == 0) { readLine(in); out.write("\r\n".getBytes(StandardCharsets.UTF_8)); out.flush(); break; }
-            int remaining = chunkSize;
-            while (remaining > 0) {
-                int n = in.read(buf, 0, Math.min(remaining, buf.length));
-                if (n < 0) return;
-                out.write(buf, 0, n); remaining -= n;
-            }
-            readLine(in); out.write("\r\n".getBytes(StandardCharsets.UTF_8)); out.flush();
-        }
-    }
-
-    private static void sendError(OutputStream out, int code) {
-        try {
-            String msg = code == 400 ? "Bad Request" : code == 502 ? "Bad Gateway" : "Error";
-            out.write(("HTTP/1.1 " + code + " " + msg + "\r\nContent-Length: 0\r\n\r\n")
-                    .getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        } catch (Exception ignored) {}
-    }
-
-    private static String readLineWithPrefix(InputStream in, byte[] prefix) throws Exception {
-        StringBuilder sb = new StringBuilder();
-        if (prefix != null) for (byte b : prefix) sb.append((char)(b & 0xFF));
-        int b;
-        while ((b = in.read()) >= 0) { if (b == '\n') break; if (b != '\r') sb.append((char) b); }
-        return b < 0 && sb.length() == 0 ? null : sb.toString().trim();
-    }
-
-    private static String readLine(InputStream in) throws Exception {
-        StringBuilder sb = new StringBuilder(); int b;
-        while ((b = in.read()) >= 0) { if (b == '\n') break; if (b != '\r') sb.append((char) b); }
-        return sb.toString();
-    }
-
-    private static String extractHeader(String headers, String name) {
-        String nameLower = name.toLowerCase(Locale.ROOT);
-        for (String l : headers.split("\r\n"))
-            if (l.toLowerCase(Locale.ROOT).startsWith(nameLower)) return l.substring(name.length()).trim();
-        return "";
-    }
-
-    private static int parsePort(String s, int def) {
-        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
-    }
-
-    private static void readFully(InputStream in, byte[] buf) throws Exception {
-        int off = 0;
-        while (off < buf.length) { int n = in.read(buf, off, buf.length - off); if (n < 0) throw new EOFException(); off += n; }
-    }
-
-    private static void pipe(InputStream in, OutputStream out) throws Exception {
-        byte[] buf = new byte[8192]; int n;
-        while ((n = in.read(buf)) != -1) { out.write(buf, 0, n); out.flush(); }
-    }
-
-    // ── Ciclo de vida ────────────────────────────────────────────
-
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        String action = intent != null ? intent.getAction() : null;
-        if (ACTION_STOP.equals(action)) { executor.execute(() -> stopAll()); return START_NOT_STICKY; }
-        if (ACTION_APPLY.equals(action)) { executor.execute(this::applyRuntimeChanges); return START_STICKY; }
-        executor.execute(this::startAll);
-        return START_STICKY;
-    }
-
-    @Override
-    public void onDestroy() {
-        stopAll();
-        executor.shutdown();
-        super.onDestroy();
-    }
-
-    public void onTunnelReconnected() {
-        if (!running.get() || stopping.get()) return;
-        executor.execute(this::rebuildTunnel);
-    }
-
-    private void rebuildTunnel() {
-        if (!running.get() || stopping.get()) return;
-        try { HevBridge.stop(); } catch (Throwable ignored) {}
-        Thread old = hevThread; hevThread = null;
-        if (old != null) try { old.join(2000); } catch (InterruptedException ignored) {}
-        ParcelFileDescriptor oldPfd = tunPfd; tunPfd = null;
-        if (oldPfd != null) try { oldPfd.close(); } catch (Exception ignored) {}
-        int oldFd = hevTunFd; hevTunFd = -1;
-        if (oldFd >= 0) try { ParcelFileDescriptor.adoptFd(oldFd).close(); } catch (Exception ignored) {}
-        Builder builder = new Builder()
-                .setSession("bt-hev").setMtu(1500)
-                .addAddress("198.18.0.1", 15).addAddress("fc00::1", 128)
-                .addDnsServer("198.18.0.2");
-        addPublicRoutes(builder);
-        applyPerAppVpnPolicy(builder);
-        tunPfd = builder.establish();
-        if (tunPfd == null) { stopAll(); return; }
-        try {
-            hevTunFd = ParcelFileDescriptor.dup(tunPfd.getFileDescriptor()).detachFd();
-        } catch (Exception e) {
-            try { tunPfd.close(); } catch (Exception ignored) {}
-            tunPfd = null; stopAll(); return;
-        }
-        hevCfgFile = writeHevCfg();
-        final int fd = hevTunFd; final File cfg = hevCfgFile;
-        hevThread = new Thread(() -> {
-            HevBridge.start(cfg.getAbsolutePath(), fd);
-            try { ParcelFileDescriptor.adoptFd(fd).close(); } catch (Exception ignored) {}
-            if (hevTunFd == fd) hevTunFd = -1;
-        }, "hev");
-        hevThread.start();
-    }
-
-    private void startAll() {
-        if (running.get() || stopping.get()) return;
-        createChannel();
-        startForeground(NF_ID, buildNotif());
-        BtProxy.stop();
-        proxyStarted.set(false);
-        String internalId = BtProxy.getOrCreateInternalId(this);
-        if (BtProxy.start(this, internalId) < 0) {
-            SystemClock.sleep(250);
-            if (BtProxy.start(this, internalId) < 0) {
-                log("E btproxy start failed");
-                stopForeground(STOP_FOREGROUND_REMOVE);
-                return;
-            }
-        }
-        proxyStarted.set(true);
-        BtProxy.applyStoredGamingMode(this);
-        registerNet();
-        Builder builder = new Builder()
-                .setSession("bt-hev").setMtu(1500)
-                .addAddress("198.18.0.1", 15).addAddress("fc00::1", 128)
-                .addDnsServer("198.18.0.2");
-        addPublicRoutes(builder);
-        applyPerAppVpnPolicy(builder);
-        tunPfd = builder.establish();
-        if (tunPfd == null) {
-            unregisterNet();
-            if (proxyStarted.compareAndSet(true, false)) BtProxy.stop();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            return;
-        }
-        try {
-            hevTunFd = ParcelFileDescriptor.dup(tunPfd.getFileDescriptor()).detachFd();
-        } catch (Exception e) {
-            try { tunPfd.close(); } catch (Exception ignored) {}
-            tunPfd = null;
-            unregisterNet();
-            if (proxyStarted.compareAndSet(true, false)) BtProxy.stop();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            return;
-        }
-        hevCfgFile = writeHevCfg();
-        final int fd = hevTunFd; final File cfg = hevCfgFile;
-        hevThread = new Thread(() -> {
-            HevBridge.start(cfg.getAbsolutePath(), fd);
-            try { ParcelFileDescriptor.adoptFd(fd).close(); } catch (Exception ignored) {}
-            if (hevTunFd == fd) hevTunFd = -1;
-        }, "hev");
-        hevThread.start();
-        running.set(true);
-        runningState.set(true);
-        log("I startAll ok");
-    }
-
-    private void stopAll() {
-        if (!stopping.compareAndSet(false, true)) return;
-        try {
-            running.set(false);
-            runningState.set(false);
-            try { HevBridge.stop(); } catch (Throwable ignored) {}
-            Thread ht = hevThread; hevThread = null;
-            if (ht != null) try { ht.join(2000); } catch (InterruptedException ignored) {}
-            ParcelFileDescriptor pfd = tunPfd; tunPfd = null;
-            if (pfd != null) try { pfd.close(); } catch (Exception ignored) {}
-            int fd = hevTunFd; hevTunFd = -1;
-            if (fd >= 0) try { ParcelFileDescriptor.adoptFd(fd).close(); } catch (Exception ignored) {}
-            if (proxyStarted.compareAndSet(true, false)) BtProxy.stop();
-            unregisterNet();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            log("I stopAll ok");
-        } finally {
-            stopping.set(false);
-        }
-    }
-
-    private void applyRuntimeChanges() {
-        if (!running.get() || stopping.get()) return;
-        BtProxy.applyRuntimeMode(this);
-        rebuildTunnel();
-    }
-
-    private void registerNet() {
-        try {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            if (cm == null) return;
-            Network active = cm.getActiveNetwork();
-            if (active != null) {
-                BtProxy.nativeSetNetwork(active.getNetworkHandle());
-                setUnderlyingNetworks(new Network[]{active});
-            }
-            netCallback = new ConnectivityManager.NetworkCallback() {
-                @Override public void onAvailable(Network net) {
-                    BtProxy.nativeSetNetwork(net.getNetworkHandle());
-                    setUnderlyingNetworks(new Network[]{net});
-                }
-                @Override public void onLost(Network net) {
-                    BtProxy.nativeSetNetwork(0L);
-                    setUnderlyingNetworks(null);
-                }
-            };
-            cm.registerNetworkCallback(
-                new NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(),
-                netCallback);
-        } catch (Exception ignored) {}
-    }
-
-    private void unregisterNet() {
-        try {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            ConnectivityManager.NetworkCallback cb = netCallback; netCallback = null;
-            if (cm != null && cb != null) cm.unregisterNetworkCallback(cb);
-            BtProxy.nativeSetNetwork(0L);
-        } catch (Exception ignored) {}
-    }
-
-    private void addPublicRoutes(Builder builder) {
-        String[] excludes = {
-            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-            "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32"
-        };
-        List<long[]> excluded = new ArrayList<>();
-        for (String cidr : excludes) {
-            try {
-                String[] p = cidr.split("/");
-                long base = ip2long(InetAddress.getByName(p[0]));
-                int pfx = Integer.parseInt(p[1]);
-                long mask = pfx == 0 ? 0L : (~0L << (32 - pfx)) & 0xFFFFFFFFL;
-                long start = base & mask;
-                excluded.add(new long[]{start, start + (~mask & 0xFFFFFFFFL)});
-            } catch (UnknownHostException ignored) {}
-        }
-        excluded.sort((a, b) -> Long.compare(a[0], b[0]));
-        long cur = 0L;
-        for (long[] ex : excluded) {
-            if (cur < ex[0]) addCIDRs(builder, cur, ex[0] - 1);
-            if (cur <= ex[1]) cur = ex[1] + 1;
-        }
-        if (cur <= 0xFFFFFFFEL) addCIDRs(builder, cur, 0xFFFFFFFEL);
-        builder.addRoute("2000::", 3);
-        builder.addRoute("fc00::", 7);
-    }
-
-    private void addCIDRs(Builder builder, long start, long end) {
-        while (start <= end) {
-            int prefix = maxPrefix(start, end);
-            builder.addRoute(long2ip(start), prefix);
-            start += (1L << (32 - prefix));
-        }
-    }
-
-    private int maxPrefix(long start, long end) {
-        int p = Math.max(0, 32 - Math.min(32, Long.numberOfTrailingZeros(start)));
-        while (p < 32 && (1L << (32 - p)) > (end - start + 1)) p++;
-        return p;
-    }
-
-    private long ip2long(InetAddress a) {
-        byte[] b = a.getAddress();
-        return ((long)(b[0]&0xFF)<<24)|((long)(b[1]&0xFF)<<16)|((long)(b[2]&0xFF)<<8)|(b[3]&0xFF);
-    }
-
-    private String long2ip(long v) {
-        return ((v>>24)&0xFF)+"."+((v>>16)&0xFF)+"."+((v>>8)&0xFF)+"."+(v&0xFF);
-    }
-
-    private void applyPerAppVpnPolicy(Builder builder) {
-        boolean gaming = BtProxy.isGamingMode(this);
-        List<String> pkgs = BtProxy.getGamingSelectedPackages(this);
-        if (gaming && !pkgs.isEmpty()) {
-            for (String pkg : pkgs)
-                if (pkg != null && !pkg.isBlank())
-                    try { builder.addAllowedApplication(pkg); } catch (Exception ignored) {}
-        } else {
-            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
-        }
-    }
-
-    private File writeHevCfg() {
-        String yml =
-            "tunnel:\n  name: bt-hev\n  mtu: 1500\n  ipv4: 198.18.0.1\n  ipv6: 'fc00::1'\n" +
-            "socks5:\n  address: 127.0.0.1\n  port: " + BtProxy.SOCKS5_PORT + "\n  udp: 'tcp'\n  pipeline: true\n" +
-            "mapdns:\n  address: 198.18.0.2\n  port: 53\n  network: 198.18.0.0\n  netmask: 255.254.0.0\n  cache-size: 8192\n" +
-            "misc:\n" +
-            "  connect-timeout: 5000\n" +
-            "  tcp-read-write-timeout: 180000\n" +
-            "  udp-read-write-timeout: 30000\n" +
-            "  max-session-count: 512\n" +
-            "  log-level: warn\n" +
-            "  limit-nofile: 65535\n";
-        File f = new File(getFilesDir(), "hev.yml");
-        try (FileOutputStream o = new FileOutputStream(f, false)) {
-            o.write(yml.getBytes(StandardCharsets.UTF_8)); o.flush();
-        } catch (Exception ignored) {}
-        return f;
-    }
-
-    private void createChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        if (nm != null)
-            nm.createNotificationChannel(
-                new NotificationChannel(CH_ID, "BlackTunnel", NotificationManager.IMPORTANCE_LOW));
-    }
-
-    private Notification buildNotif() {
-        return new NotificationCompat.Builder(this, CH_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_warning)
-                .setContentTitle("BlackTunnel").setOngoing(true).build();
-    }
-
-    static final class HevBridge {
-        static { System.loadLibrary("hev-jni"); }
-        static native int  start(String path, int fd);
-        static native void stop();
-    }
+type userEntry struct {
+	name    string
+	expires time.Time
 }
 
-final class BtProxy {
-    static final int SOCKS5_PORT = 10809;
-    private static final String PREFS           = "strike_prefs";
-    private static final String KEY_INTERNAL_ID = "internal_id";
-    private static final String KEY_GAMING_MODE = "gaming_mode";
-    private static final String KEY_GAMING_APPS = "gaming_apps";
-    private static final boolean NATIVE_READY;
-    private static final String  NATIVE_LOAD_ERROR;
-
-    static {
-        boolean ready = false;
-        String error = "";
-        try {
-            System.loadLibrary("btproxy");
-            ready = true;
-        } catch (Throwable t) {
-            error = t.getClass().getSimpleName() + ": " + String.valueOf(t.getMessage());
-            android.util.Log.e("BtProxy", "No se pudo cargar btproxy", t);
-        }
-        NATIVE_READY = ready;
-        NATIVE_LOAD_ERROR = error;
-    }
-
-    static boolean isNativeReady()      { return NATIVE_READY; }
-    static String  getNativeLoadError() { return NATIVE_LOAD_ERROR; }
-
-    static int start(VpnService svc, String id) {
-        if (!NATIVE_READY) return -1;
-        return nativeStart(SOCKS5_PORT, svc, id);
-    }
-    static void stop() {
-        if (!NATIVE_READY) return;
-        nativeStop();
-    }
-    static String drainLogs() {
-        if (!NATIVE_READY) return "";
-        return nativeDrainLogs();
-    }
-
-    static void setGamingMode(Context ctx, boolean enabled) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-           .edit().putBoolean(KEY_GAMING_MODE, enabled).apply();
-        if (NATIVE_READY) nativeSetGamingMode(enabled);
-    }
-
-    static boolean isGamingMode(Context ctx) {
-        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                  .getBoolean(KEY_GAMING_MODE, false);
-    }
-
-    static void applyStoredGamingMode(Context ctx) {
-        if (!NATIVE_READY) return;
-        nativeSetGamingMode(isGamingMode(ctx));
-    }
-    static void applyRuntimeMode(Context ctx) {
-        if (!NATIVE_READY) return;
-        nativeApplyMode(isGamingMode(ctx));
-    }
-
-    static List<String> getGamingSelectedPackages(Context ctx) {
-        Set<String> set = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                             .getStringSet(KEY_GAMING_APPS, new HashSet<>());
-        return new ArrayList<>(set);
-    }
-
-    static void setGamingSelectedPackages(Context ctx, List<String> packages) {
-        HashSet<String> clean = new HashSet<>();
-        if (packages != null)
-            for (String pkg : packages)
-                if (pkg != null && !pkg.isBlank()) clean.add(pkg);
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-           .edit().putStringSet(KEY_GAMING_APPS, clean).apply();
-    }
-
-    static String getOrCreateInternalId(Context ctx) {
-        SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        String existing = sp.getString(KEY_INTERNAL_ID, null);
-        if (existing != null && !existing.isBlank()) return existing;
-        String rawId = Settings.Secure.getString(ctx.getContentResolver(), Settings.Secure.ANDROID_ID);
-        if (rawId == null) rawId = "unknown";
-        String seed = rawId + "|" + Build.BRAND + "|" + Build.MODEL + "|" +
-                      ctx.getPackageName() + "|" + System.currentTimeMillis();
-        String id = "STRK-" + sha256(seed).substring(0, 48);
-        sp.edit().putString(KEY_INTERNAL_ID, id).apply();
-        return id;
-    }
-
-    private static String sha256(String v) {
-        try {
-            byte[] d = MessageDigest.getInstance("SHA-256").digest(v.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(d.length * 2);
-            for (byte b : d) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) {
-            return Long.toHexString(System.currentTimeMillis()) + Long.toHexString(System.nanoTime());
-        }
-    }
-
-    private static native int    nativeStart(int port, VpnService svc, String id);
-    private static native void   nativeStop();
-    private static native String nativeDrainLogs();
-    public  static native void   nativeSetGamingMode(boolean enabled);
-    public  static native void   nativeApplyMode(boolean enabled);
-    public  static native int    nativeGetGamingMode();
-    public  static native void   nativeSetNetwork(long networkHandle);
+type userCache struct {
+	mu       sync.RWMutex
+	table    map[string]*userEntry
+	loadedAt time.Time
 }
+
+var cache = &userCache{table: make(map[string]*userEntry)}
+
+func (c *userCache) reload() {
+	f, err := os.Open(usersFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	t := make(map[string]*userEntry, 64)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		parts := [3]string{}
+		n, start := 0, 0
+		for i := 0; i <= len(line) && n < 3; i++ {
+			if i == len(line) || line[i] == ':' {
+				parts[n] = line[start:i]
+				n++
+				start = i + 1
+			}
+		}
+		if n < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			continue
+		}
+		exp, err := time.ParseInLocation("2006-01-02", parts[2], time.Local)
+		if err != nil {
+			continue
+		}
+		t[parts[0]] = &userEntry{name: parts[1], expires: exp.Add(24*time.Hour - time.Second)}
+	}
+	c.mu.Lock()
+	c.table = t
+	c.loadedAt = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *userCache) lookup(id string) (*userEntry, bool) {
+	c.mu.RLock()
+	stale := time.Since(c.loadedAt) > cacheReload
+	e, ok := c.table[id]
+	c.mu.RUnlock()
+	if stale {
+		go c.reload()
+	}
+	return e, ok
+}
+
+type authResult int
+
+const (
+	authOK       authResult = iota
+	authNotFound
+	authExpired
+)
+
+func checkAuth(id string) (string, int, authResult) {
+	e, ok := cache.lookup(id)
+	if !ok {
+		return "", 0, authNotFound
+	}
+	if time.Now().After(e.expires) {
+		return e.name, 0, authExpired
+	}
+	return e.name, int(time.Until(e.expires).Hours()/24) + 1, authOK
+}
+
+var (
+	framePool = sync.Pool{New: func() interface{} {
+		b := make([]byte, 7+maxPayload)
+		return &b
+	}}
+	payloadPool = sync.Pool{New: func() interface{} {
+		b := make([]byte, maxPayload)
+		return &b
+	}}
+	readBufPool = sync.Pool{New: func() interface{} {
+		b := make([]byte, maxPayload)
+		return &b
+	}}
+)
+
+func getFrame() []byte    { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte)   { framePool.Put(&b) }
+func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
+func putPayload(b []byte) { payloadPool.Put(&b) }
+
+type stream struct {
+	q      chan []byte
+	closed atomic.Uint32
+}
+
+func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
+func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
+
+type mux struct {
+	conn    net.Conn
+	writeQ  chan []byte
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   atomic.Int32
+	dead    atomic.Uint32
+}
+
+func newMux(conn net.Conn) *mux {
+	m := &mux{
+		conn:    conn,
+		writeQ:  make(chan []byte, 4096),
+		streams: make(map[uint32]*stream, 256),
+	}
+	go m.writeLoop()
+	return m
+}
+
+func (m *mux) writeLoop() {
+	var bufs net.Buffers
+	var toFree [][]byte
+	for buf := range m.writeQ {
+		bufs = append(bufs[:0], buf)
+		toFree = append(toFree[:0], buf)
+	drain:
+		for {
+			select {
+			case b := <-m.writeQ:
+				bufs = append(bufs, b)
+				toFree = append(toFree, b)
+			default:
+				break drain
+			}
+		}
+		m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		bufs.WriteTo(m.conn)
+		m.conn.SetWriteDeadline(time.Time{})
+		for _, b := range toFree {
+			putFrame(b[:cap(b)])
+		}
+	}
+}
+
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
+	}
+}
+
+func (m *mux) trySend(buf []byte) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	select {
+	case m.writeQ <- buf:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *mux) send(t byte, sid uint32, data []byte) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	ln := len(data)
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
+	if ln > 0 {
+		copy(buf[7:7+ln], data)
+	}
+	if !m.trySend(buf[:7+ln]) {
+		putFrame(buf)
+	}
+}
+
+func (m *mux) sendHdr(t byte, sid uint32) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5], buf[6] = 0, 0
+	if !m.trySend(buf[:7]) {
+		putFrame(buf)
+	}
+}
+
+func (m *mux) addStream(sid uint32, s *stream) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int(m.count.Load()) >= maxStreams {
+		return false
+	}
+	m.streams[sid] = s
+	m.count.Add(1)
+	return true
+}
+
+func (m *mux) getStream(sid uint32) *stream {
+	m.mu.RLock()
+	s := m.streams[sid]
+	m.mu.RUnlock()
+	return s
+}
+
+func (m *mux) delStream(sid uint32) {
+	m.mu.Lock()
+	if _, ok := m.streams[sid]; ok {
+		delete(m.streams, sid)
+		m.count.Add(-1)
+	}
+	m.mu.Unlock()
+}
+
+func (m *mux) closeStream(sid uint32) {
+	s := m.getStream(sid)
+	if s != nil && s.tryClose() {
+		m.delStream(sid)
+		close(s.q)
+		go func() {
+			for range s.q {
+			}
+		}()
+	}
+}
+
+func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
+	defer func() {
+		if s.tryClose() {
+			m.delStream(sid)
+			m.sendHdr(tClose, sid)
+			for range s.q {
+			}
+		}
+	}()
+
+	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	if err != nil {
+		return
+	}
+	defer hev.Close()
+
+	tc := hev.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(262144)
+	tc.SetWriteBuffer(262144)
+
+	if len(first) > 0 {
+		if _, err := hev.Write(first); err != nil {
+			return
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for d := range s.q {
+			_, err := hev.Write(d)
+			putPayload(d[:cap(d)])
+			if err != nil {
+				break
+			}
+		}
+		tc.CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := *readBufPool.Get().(*[]byte)
+		defer readBufPool.Put(&buf)
+		for {
+			n, err := hev.Read(buf)
+			if n > 0 {
+				m.send(tData, sid, buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func (m *mux) run() {
+	hdr := make([]byte, 7)
+	rb := make([]byte, maxPayload)
+
+	for {
+		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+			break
+		}
+		ft := hdr[0]
+		sid := binary.BigEndian.Uint32(hdr[1:5])
+		ln := int(binary.BigEndian.Uint16(hdr[5:7]))
+		if ln > maxPayload {
+			break
+		}
+		if ln > 0 {
+			if _, err := io.ReadFull(m.conn, rb[:ln]); err != nil {
+				break
+			}
+		}
+
+		switch ft {
+		case tPing:
+			m.sendHdr(tPong, sid)
+		case tPong:
+		case tOpen:
+			s := &stream{q: make(chan []byte, queueSize)}
+			if !m.addStream(sid, s) {
+				m.sendHdr(tClose, sid)
+				continue
+			}
+			var first []byte
+			if ln > 0 {
+				first = make([]byte, ln)
+				copy(first, rb[:ln])
+			}
+			go m.handleStream(sid, s, first)
+		case tData:
+			s := m.getStream(sid)
+			if s == nil || s.isClosed() {
+				continue
+			}
+			p := getPayload()[:ln]
+			copy(p, rb[:ln])
+			select {
+			case s.q <- p:
+			default:
+				putPayload(p[:cap(p)])
+				if s.tryClose() {
+					m.delStream(sid)
+					close(s.q)
+					m.sendHdr(tClose, sid)
+				}
+			}
+		case tClose:
+			m.closeStream(sid)
+		}
+	}
+
+	m.mu.Lock()
+	for _, s := range m.streams {
+		if s.tryClose() {
+			close(s.q)
+		}
+	}
+	m.mu.Unlock()
+}
+
+var (
+	activeSessions = sync.Map{}
+	needleAction   = []byte("action:")
+	needleID       = []byte("x-internal-id:")
+	needleEnd      = []byte("\r\n\r\n")
+	resp403NotReg  = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\n\r\nnot_registered")
+	resp403Expired = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\n\r\nexpired")
+)
+
+func bytesIndex(s, sub []byte) int {
+	if len(sub) == 0 || len(s) < len(sub) {
+		return -1
+	}
+	f := sub[0] | 0x20
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i]|0x20 != f {
+			continue
+		}
+		ok := true
+		for j := 1; j < len(sub); j++ {
+			if s[i+j]|0x20 != sub[j]|0x20 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+func extractHeader(raw, needle []byte) string {
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\n' {
+			continue
+		}
+		end := i
+		if end > start && raw[end-1] == '\r' {
+			end--
+		}
+		line := raw[start:end]
+		start = i + 1
+		if len(line) <= len(needle) || bytesIndex(line[:len(needle)], needle) != 0 {
+			continue
+		}
+		val := line[len(needle):]
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+			val = val[1:]
+		}
+		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+			val = val[:len(val)-1]
+		}
+		return string(val)
+	}
+	return ""
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	b := make([]byte, 20)
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+func handle(conn net.Conn) {
+	defer conn.Close()
+	tc := conn.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	tc.SetReadBuffer(262144)
+	tc.SetWriteBuffer(262144)
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+
+	buf := make([]byte, 4096)
+	n := 0
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for n < len(buf) {
+		nr, err := conn.Read(buf[n:])
+		if nr > 0 {
+			n += nr
+			if bytesIndex(buf[:n], needleAction) >= 0 && bytesIndex(buf[:n], needleEnd) >= 0 {
+				break
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	raw := buf[:n]
+	action := extractHeader(raw, needleAction)
+	if action != "tunnel" && action != "tunnel-tcp" {
+		return
+	}
+
+	userID := extractHeader(raw, needleID)
+	if userID == "" {
+		conn.Write(resp403NotReg)
+		return
+	}
+
+	name, days, res := checkAuth(userID)
+	switch res {
+	case authNotFound:
+		conn.Write(resp403NotReg)
+		return
+	case authExpired:
+		conn.Write(resp403Expired)
+		return
+	}
+
+	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: " +
+		name + "\r\nX-User-Days: " + itoa(days) + "\r\n\r\n"))
+
+	m := newMux(conn)
+	if prev, loaded := activeSessions.Swap(userID, m); loaded {
+		prev.(*mux).kill()
+	}
+	m.run()
+	activeSessions.CompareAndDelete(userID, m)
+}
+
+func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetMemoryLimit(768 << 20)
+	cache.reload()
+	go func() {
+		t := time.NewTicker(cacheReload)
+		defer t.Stop()
+		for range t.C {
+			cache.reload()
+		}
+	}()
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if tc, ok := ln.(*net.TCPListener); ok {
+		if raw, err := tc.SyscallConn(); err == nil {
+			raw.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
+			})
+		}
+	}
+
+	log.Printf("btserver %s -> hev %s (go=%s cpus=%d)", listenAddr, hevAddr, runtime.Version(), runtime.NumCPU())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handle(conn)
+	}
+}
+GOEOF
+
+info "Escribiendo panel.go..."
+cat > /opt/btserver/panel.go << 'GOEOF'
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	panelAddr = "0.0.0.0:8090"
+	usersPath = "/opt/btserver/users.txt"
+	tokenPath = "/opt/btserver/token.txt"
+)
+
+var (
+	token     string
+	tokenOnce sync.Once
+	usersMu   sync.Mutex
+	rateMu    sync.Mutex
+	rateHits  = map[string][]int64{}
+)
+
+func getToken() string {
+	tokenOnce.Do(func() {
+		b, err := os.ReadFile(tokenPath)
+		if err == nil {
+			token = strings.TrimSpace(string(b))
+		}
+	})
+	return token
+}
+
+func rateOK(ip string) bool {
+	now := time.Now().Unix()
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	hits := rateHits[ip]
+	valid := hits[:0]
+	for _, t := range hits {
+		if now-t < 60 {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= 30 {
+		rateHits[ip] = valid
+		return false
+	}
+	rateHits[ip] = append(valid, now)
+	if len(rateHits) > 1000 {
+		rateHits = map[string][]int64{}
+	}
+	return true
+}
+
+type user struct {
+	Name    string `json:"name"`
+	Expires string `json:"expires"`
+}
+
+func loadUsers() map[string]*user {
+	f, err := os.Open(usersPath)
+	if err != nil {
+		return map[string]*user{}
+	}
+	defer f.Close()
+	out := map[string]*user{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		p := strings.SplitN(line, ":", 3)
+		if len(p) < 3 || strings.TrimSpace(p[0]) == "" {
+			continue
+		}
+		out[strings.TrimSpace(p[0])] = &user{
+			Name:    strings.TrimSpace(p[1]),
+			Expires: strings.TrimSpace(p[2]),
+		}
+	}
+	return out
+}
+
+func saveUsers(users map[string]*user) {
+	tmp, err := os.CreateTemp(filepath.Dir(usersPath), ".users_tmp")
+	if err != nil {
+		return
+	}
+	w := bufio.NewWriter(tmp)
+	w.WriteString("# formato: id:nombre:YYYY-MM-DD\n")
+	for id, u := range users {
+		w.WriteString(id + ":" + u.Name + ":" + u.Expires + "\n")
+	}
+	w.Flush()
+	tmp.Close()
+	os.Rename(tmp.Name(), usersPath)
+}
+
+func daysLeft(exp string) int {
+	t, err := time.ParseInLocation("2006-01-02", exp, time.Local)
+	if err != nil {
+		return 0
+	}
+	d := int(time.Until(t.Add(24*time.Hour - time.Second)).Hours() / 24)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func addDate(base time.Time, days int) string {
+	return base.AddDate(0, 0, days).Format("2006-01-02")
+}
+
+func jsonResp(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func clientIP(r *http.Request) string {
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+func auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !rateOK(clientIP(r)) {
+			jsonResp(w, 429, map[string]any{"error": "too many requests"})
+			return
+		}
+		if strings.TrimSpace(r.Header.Get("X-Token")) != getToken() {
+			jsonResp(w, 401, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func str(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	}
+	return ""
+}
+
+func intVal(v any, def int) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return def
+}
+
+func userRow(id string, u *user) map[string]any {
+	dl := daysLeft(u.Expires)
+	return map[string]any{"id": id, "name": u.Name, "expires": u.Expires, "days_left": dl, "active": dl > 0}
+}
+
+func handleClients(w http.ResponseWriter, r *http.Request) {
+	usersMu.Lock()
+	users := loadUsers()
+	usersMu.Unlock()
+	rows := make([]map[string]any, 0, len(users))
+	for id, u := range users {
+		rows = append(rows, userRow(id, u))
+	}
+	jsonResp(w, 200, map[string]any{"clients": rows, "total": len(rows)})
+}
+
+func handleClient(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	users := loadUsers()
+	usersMu.Unlock()
+	u, ok := users[id]
+	if !ok {
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	jsonResp(w, 200, userRow(id, u))
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	if json.NewDecoder(r.Body).Decode(&body) != nil {
+		jsonResp(w, 400, map[string]any{"error": "body invalido"})
+		return
+	}
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	name := strings.TrimSpace(str(body["name"]))
+	if name == "" {
+		name = "sin-nombre"
+	}
+	days := intVal(body["days"], 30)
+	exp := addDate(time.Now(), days)
+	usersMu.Lock()
+	users := loadUsers()
+	users[id] = &user{Name: name, Expires: exp}
+	saveUsers(users)
+	usersMu.Unlock()
+	jsonResp(w, 200, map[string]any{"ok": true, "id": id, "name": name, "expires": exp, "days": days})
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	defer usersMu.Unlock()
+	users := loadUsers()
+	if _, ok := users[id]; !ok {
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	delete(users, id)
+	saveUsers(users)
+	jsonResp(w, 200, map[string]any{"ok": true})
+}
+
+func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	id := strings.TrimSpace(str(body["id"]))
+	if id == "" {
+		jsonResp(w, 400, map[string]any{"error": "falta id"})
+		return
+	}
+	usersMu.Lock()
+	defer usersMu.Unlock()
+	users := loadUsers()
+	u, ok := users[id]
+	if !ok {
+		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
+		return
+	}
+	if n := strings.TrimSpace(str(body["name"])); n != "" {
+		u.Name = n
+	}
+	base, err := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
+	if err != nil || base.Before(time.Now()) {
+		base = time.Now()
+	}
+	switch {
+	case body["add_days"] != nil:
+		u.Expires = addDate(base, intVal(body["add_days"], 0))
+	case body["sub_days"] != nil:
+		orig, _ := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
+		u.Expires = addDate(orig, -intVal(body["sub_days"], 0))
+	case body["set_days"] != nil:
+		u.Expires = addDate(time.Now(), intVal(body["set_days"], 0))
+	case body["set_date"] != nil:
+		u.Expires = strings.TrimSpace(str(body["set_date"]))
+	}
+	if newID := strings.TrimSpace(str(body["new_id"])); newID != "" && newID != id {
+		delete(users, id)
+		id = newID
+	}
+	users[id] = u
+	saveUsers(users)
+	jsonResp(w, 200, userRow(id, u))
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/clients", auth(handleClients))
+	mux.HandleFunc("/client", auth(handleClient))
+	mux.HandleFunc("/client/create", auth(handleCreate))
+	mux.HandleFunc("/client/delete", auth(handleDelete))
+	mux.HandleFunc("/client/update", auth(handleUpdate))
+	srv := &http.Server{
+		Addr:         panelAddr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	log.Printf("panel api escuchando %s", panelAddr)
+	log.Fatal(srv.ListenAndServe())
+}
+GOEOF
+
+info "Compilando btserver..."
+export PATH=/usr/local/go/bin:$PATH
+export HOME=/root
+export GOPATH=/root/go
+export GOCACHE=/root/.cache/go-build
+export GOFLAGS="-trimpath"
+mkdir -p "$GOPATH" "$GOCACHE"
+cd /opt/btserver
+$GO build -ldflags="-s -w" -gcflags="all=-B" -o btserver btserver.go \
+    || die "Error compilando btserver.go"
+info "btserver compilado OK"
+
+info "Compilando panel..."
+$GO build -ldflags="-s -w" -gcflags="all=-B" -o panel panel.go \
+    || die "Error compilando panel.go"
+info "panel compilado OK"
+
+if [ ! -f /opt/btserver/users.txt ]; then
+    printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+    info "users.txt creado"
+fi
+
+cat > /etc/systemd/system/hev-socks5.service << 'SVC'
+[Unit]
+Description=HEV Socks5
+After=network.target
+
+[Service]
+ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server.yml
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+TasksMax=infinity
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat > /etc/systemd/system/btserver.service << 'SVC'
+[Unit]
+Description=BlackTunnel Server
+After=network.target hev-socks5.service
+Requires=hev-socks5.service
+
+[Service]
+ExecStart=/opt/btserver/btserver
+Restart=always
+RestartSec=2
+LimitNOFILE=1000000
+LimitNPROC=infinity
+TasksMax=infinity
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+cat > /etc/systemd/system/btpanel.service << 'SVC'
+[Unit]
+Description=BlackTunnel Panel
+After=network.target
+
+[Service]
+ExecStart=/opt/btserver/panel
+Restart=always
+RestartSec=2
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl daemon-reload
+systemctl enable hev-socks5 btserver btpanel
+
+info "Iniciando servicios..."
+systemctl restart hev-socks5
+sleep 1
+systemctl restart btserver
+sleep 1
+systemctl restart btpanel
+sleep 1
+
+info "Configurando QoS..."
+IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+if [ -n "$IFACE" ]; then
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+    tc qdisc add dev "$IFACE" root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256 target 2ms interval 50ms
+    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512 target 5ms interval 100ms
+    tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms interval 100ms
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 1 u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 2 u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
+    tc filter add dev "$IFACE" parent 1: protocol ip prio 3 u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
+    info "QoS aplicado en $IFACE"
+fi
+
+echo ""
+echo "================================================"
+echo "  INSTALACION COMPLETA"
+echo "================================================"
+echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
+echo "  TOKEN:      ${PANEL_TOKEN}"
+echo "================================================"
+info "Estado servicios:"
+systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
+ss -s | grep -E "TCP|estab"
