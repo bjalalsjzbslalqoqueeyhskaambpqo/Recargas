@@ -56,7 +56,6 @@ chmod +x /opt/btserver/hev-socks5-server
 info "hev-socks5-server OK"
 
 NWORKERS=$(nproc 2>/dev/null || echo 1)
-info "HEV workers: $NWORKERS"
 
 cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
 main:
@@ -104,7 +103,6 @@ net.ipv4.tcp_max_tw_buckets=2000000
 SYSCTL
 modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
-info "Sysctl aplicado"
 
 cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
 *    soft nofile 1000000
@@ -112,6 +110,46 @@ cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
 root soft nofile 1000000
 root hard nofile 1000000
 LIMITS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# btserver.go
+# ─────────────────────────────────────────────────────────────────────────────
+# PROTOCOLO DE DESCONEXIÓN PARA EL CLIENTE
+# ══════════════════════════════════════════
+#
+# CASO 1 – Intento de conexión con usuario EXPIRADO o NO REGISTRADO
+#   El servidor responde con HTTP normal (sin hacer upgrade):
+#
+#   HTTP/1.1 403 Forbidden
+#   X-Disconnect-Reason: expired        ← usuario existe pero venció
+#   X-Disconnect-Reason: not_registered ← usuario no existe / fue eliminado
+#   Content-Length: N
+#   <body ignorable>
+#
+#   El cliente debe leer el header X-Disconnect-Reason ANTES de intentar
+#   cualquier reconexión y mostrar el overlay correspondiente.
+#
+# CASO 2 – Sesión ACTIVA que el servidor decide cerrar
+#   El servidor envía un frame de control sin payload (7 bytes) y luego cierra:
+#
+#   byte 0    : tipo
+#                 0x06 = tKick    → admin eliminó/modificó el usuario
+#                 0x07 = tExpired → usuario venció mientras estaba conectado
+#   bytes 1-4 : 0x00000000 (sid = 0, frame global)
+#   bytes 5-6 : 0x0000 (sin payload)
+#
+#   Tras recibir tKick o tExpired el cliente NO debe reconectar
+#   y debe mostrar el overlay apropiado.
+#
+# RESUMEN DE TIPOS DE FRAME
+#   0x01 tOpen    abrir stream
+#   0x02 tData    datos de stream
+#   0x03 tClose   cerrar stream
+#   0x04 tPing    keepalive ping
+#   0x05 tPong    keepalive pong
+#   0x06 tKick    sesión terminada por admin   → NO reconectar
+#   0x07 tExpired sesión terminada por venc.   → NO reconectar
+# ─────────────────────────────────────────────────────────────────────────────
 
 info "Escribiendo btserver.go..."
 cat > /opt/btserver/btserver.go << 'GOEOF'
@@ -125,6 +163,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -144,12 +183,16 @@ const (
 	tClose       = byte(0x03)
 	tPing        = byte(0x04)
 	tPong        = byte(0x05)
+	tKick        = byte(0x06)
+	tExpired     = byte(0x07)
 	maxStreams   = 8192
 	queueSize    = 64
 	dialTimeout  = 100 * time.Millisecond
 	writeTimeout = 5 * time.Second
 	maxPayload   = 16384
 )
+
+// ─── caché de usuarios ────────────────────────────────────────────────────────
 
 type userEntry struct {
 	name    string
@@ -231,6 +274,8 @@ func checkAuth(id string) (string, int, authResult) {
 	return e.name, int(time.Until(e.expires).Hours()/24) + 1, authOK
 }
 
+// ─── pools ────────────────────────────────────────────────────────────────────
+
 var (
 	framePool = sync.Pool{New: func() interface{} {
 		b := make([]byte, 7+maxPayload)
@@ -250,6 +295,8 @@ func getFrame() []byte    { return *framePool.Get().(*[]byte) }
 func putFrame(b []byte)   { framePool.Put(&b) }
 func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
 func putPayload(b []byte) { payloadPool.Put(&b) }
+
+// ─── mux ─────────────────────────────────────────────────────────────────────
 
 type stream struct {
 	q      chan []byte
@@ -303,13 +350,6 @@ func (m *mux) writeLoop() {
 	}
 }
 
-func (m *mux) kill() {
-	if m.dead.CompareAndSwap(0, 1) {
-		m.conn.Close()
-		close(m.writeQ)
-	}
-}
-
 func (m *mux) trySend(buf []byte) (ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -322,6 +362,14 @@ func (m *mux) trySend(buf []byte) (ok bool) {
 	default:
 		return false
 	}
+}
+
+func (m *mux) buildHdr(t byte, sid uint32) []byte {
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5], buf[6] = 0, 0
+	return buf[:7]
 }
 
 func (m *mux) send(t byte, sid uint32, data []byte) {
@@ -345,13 +393,42 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	if m.dead.Load() == 1 {
 		return
 	}
-	buf := getFrame()
-	buf[0] = t
-	binary.BigEndian.PutUint32(buf[1:5], sid)
-	buf[5], buf[6] = 0, 0
-	if !m.trySend(buf[:7]) {
-		putFrame(buf)
+	buf := m.buildHdr(t, sid)
+	if !m.trySend(buf) {
+		putFrame(buf[:cap(buf)])
 	}
+}
+
+// sendNotify envía un frame de control global (sid=0) y espera que el
+// writeLoop lo entregue antes de que kill() cierre la conexión.
+func (m *mux) sendNotify(t byte) {
+	if m.dead.Load() == 1 {
+		return
+	}
+	buf := m.buildHdr(t, 0)
+	// Envío directo bloqueante para garantizar entrega antes de cerrar.
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(buf)
+	m.conn.SetWriteDeadline(time.Time{})
+	putFrame(buf[:cap(buf)])
+}
+
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
+	}
+}
+
+// killWithReason envía el frame de notificación al cliente y luego cierra.
+func (m *mux) killWithReason(t byte) {
+	if !m.dead.CompareAndSwap(0, 1) {
+		return
+	}
+	m.sendNotify(t)
+	time.Sleep(50 * time.Millisecond) // margen para que el SO envíe el frame
+	m.conn.Close()
+	close(m.writeQ)
 }
 
 func (m *mux) addStream(sid uint32, s *stream) bool {
@@ -520,13 +597,23 @@ func (m *mux) run() {
 	m.mu.Unlock()
 }
 
+// ─── sesiones activas ─────────────────────────────────────────────────────────
+
+var activeSessions = sync.Map{}
+
+func kickSession(id string, reason byte) {
+	if v, ok := activeSessions.LoadAndDelete(id); ok {
+		v.(*mux).killWithReason(reason)
+		log.Printf("session closed id=%s reason=0x%02x", id, reason)
+	}
+}
+
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
 var (
-	activeSessions = sync.Map{}
-	needleAction   = []byte("action:")
-	needleID       = []byte("x-internal-id:")
-	needleEnd      = []byte("\r\n\r\n")
-	resp403NotReg  = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\n\r\nnot_registered")
-	resp403Expired = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\n\r\nexpired")
+	needleAction = []byte("action:")
+	needleID     = []byte("x-internal-id:")
+	needleEnd    = []byte("\r\n\r\n")
 )
 
 func bytesIndex(s, sub []byte) int {
@@ -593,6 +680,14 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
+func write403(conn net.Conn, reason, body string) {
+	resp := "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: " + reason +
+		"\r\nContent-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+	conn.Write([]byte(resp))
+}
+
+// ─── handler principal ────────────────────────────────────────────────────────
+
 func handle(conn net.Conn) {
 	defer conn.Close()
 	tc := conn.(*net.TCPConn)
@@ -627,17 +722,17 @@ func handle(conn net.Conn) {
 
 	userID := extractHeader(raw, needleID)
 	if userID == "" {
-		conn.Write(resp403NotReg)
+		write403(conn, "not_registered", "not_registered")
 		return
 	}
 
 	name, days, res := checkAuth(userID)
 	switch res {
 	case authNotFound:
-		conn.Write(resp403NotReg)
+		write403(conn, "not_registered", "not_registered")
 		return
 	case authExpired:
-		conn.Write(resp403Expired)
+		write403(conn, "expired", "expired")
 		return
 	}
 
@@ -646,21 +741,95 @@ func handle(conn net.Conn) {
 
 	m := newMux(conn)
 	if prev, loaded := activeSessions.Swap(userID, m); loaded {
-		prev.(*mux).kill()
+		// Otro dispositivo tomó la sesión: notificar al anterior con tKick.
+		go prev.(*mux).killWithReason(tKick)
 	}
 	m.run()
 	activeSessions.CompareAndDelete(userID, m)
 }
 
+// ─── kick API (interno) ───────────────────────────────────────────────────────
+
+func kickHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	reason := tKick
+	if r.URL.Query().Get("reason") == "expired" {
+		reason = tExpired
+	}
+	if id == "" {
+		w.WriteHeader(400)
+		w.Write([]byte("missing_id"))
+		return
+	}
+	if _, ok := activeSessions.Load(id); ok {
+		kickSession(id, byte(reason))
+		w.Write([]byte("kicked"))
+		return
+	}
+	w.Write([]byte("not_connected"))
+}
+
+// ─── chequeo medianoche ───────────────────────────────────────────────────────
+
+func nextMidnight() time.Time {
+	now := time.Now()
+	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.Local)
+}
+
+func checkExpiredSessions() {
+	kicked := 0
+	activeSessions.Range(func(key, value any) bool {
+		userID := key.(string)
+		_, _, res := checkAuth(userID)
+		if res != authOK {
+			reason := tExpired
+			if res == authNotFound {
+				reason = tKick
+			}
+			kickSession(userID, byte(reason))
+			kicked++
+		}
+		return true
+	})
+	if kicked > 0 {
+		log.Printf("midnight check: kicked %d sessions", kicked)
+	}
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────────
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetMemoryLimit(768 << 20)
 	cache.reload()
+
 	go func() {
 		t := time.NewTicker(cacheReload)
 		defer t.Stop()
 		for range t.C {
 			cache.reload()
+		}
+	}()
+
+	go func() {
+		for {
+			time.Sleep(time.Until(nextMidnight()))
+			checkExpiredSessions()
+		}
+	}()
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/kick", kickHandler)
+		srv := &http.Server{
+			Addr:         "127.0.0.1:8091",
+			Handler:      mux,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+		}
+		log.Printf("kick api on 127.0.0.1:8091")
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("kick api error: %v", err)
 		}
 	}()
 
@@ -689,6 +858,11 @@ func main() {
 }
 GOEOF
 
+# ─────────────────────────────────────────────────────────────────────────────
+# panel.go  (panel API – sin cambios de lógica, refactorizado)
+# El panel llama a kick con ?reason=kicked (default) o ?reason=expired.
+# Al eliminar un usuario → tKick; al vencer → tExpired (lo hace btserver solo).
+# ─────────────────────────────────────────────────────────────────────────────
 info "Escribiendo panel.go..."
 cat > /opt/btserver/panel.go << 'GOEOF'
 package main
@@ -711,6 +885,7 @@ const (
 	panelAddr = "0.0.0.0:8090"
 	usersPath = "/opt/btserver/users.txt"
 	tokenPath = "/opt/btserver/token.txt"
+	kickBase  = "http://127.0.0.1:8091/kick?id="
 )
 
 var (
@@ -719,6 +894,7 @@ var (
 	usersMu   sync.Mutex
 	rateMu    sync.Mutex
 	rateHits  = map[string][]int64{}
+	kickCli   = &http.Client{Timeout: 2 * time.Second}
 )
 
 func getToken() string {
@@ -861,6 +1037,17 @@ func userRow(id string, u *user) map[string]any {
 	return map[string]any{"id": id, "name": u.Name, "expires": u.Expires, "days_left": dl, "active": dl > 0}
 }
 
+// kickUser envía señal al btserver con la razón correcta.
+// reason: "kicked" (eliminado por admin) | "expired" (venció)
+func kickUser(id, reason string) {
+	go func() {
+		resp, err := kickCli.Get(kickBase + id + "&reason=" + reason)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+}
+
 func handleClients(w http.ResponseWriter, r *http.Request) {
 	usersMu.Lock()
 	users := loadUsers()
@@ -923,14 +1110,16 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
-	defer usersMu.Unlock()
 	users := loadUsers()
 	if _, ok := users[id]; !ok {
+		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
 	delete(users, id)
 	saveUsers(users)
+	usersMu.Unlock()
+	kickUser(id, "kicked") // eliminado por admin → tKick
 	jsonResp(w, 200, map[string]any{"ok": true})
 }
 
@@ -943,10 +1132,10 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
-	defer usersMu.Unlock()
 	users := loadUsers()
 	u, ok := users[id]
 	if !ok {
+		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
@@ -968,12 +1157,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	case body["set_date"] != nil:
 		u.Expires = strings.TrimSpace(str(body["set_date"]))
 	}
-	if newID := strings.TrimSpace(str(body["new_id"])); newID != "" && newID != id {
+	newID := strings.TrimSpace(str(body["new_id"]))
+	if newID != "" && newID != id {
 		delete(users, id)
+		kickUser(id, "kicked")
 		id = newID
 	}
 	users[id] = u
 	saveUsers(users)
+	usersMu.Unlock()
+	if daysLeft(u.Expires) <= 0 {
+		kickUser(id, "expired")
+	}
 	jsonResp(w, 200, userRow(id, u))
 }
 
@@ -990,7 +1185,7 @@ func main() {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
-	log.Printf("panel api escuchando %s", panelAddr)
+	log.Printf("panel api on %s", panelAddr)
 	log.Fatal(srv.ListenAndServe())
 }
 GOEOF
