@@ -56,6 +56,7 @@ chmod +x /opt/btserver/hev-socks5-server
 info "hev-socks5-server OK"
 
 NWORKERS=$(nproc 2>/dev/null || echo 1)
+info "HEV workers: $NWORKERS"
 
 cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
 main:
@@ -103,6 +104,7 @@ net.ipv4.tcp_max_tw_buckets=2000000
 SYSCTL
 modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
+info "Sysctl aplicado"
 
 cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
 *    soft nofile 1000000
@@ -123,11 +125,9 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -144,8 +144,6 @@ const (
 	tClose       = byte(0x03)
 	tPing        = byte(0x04)
 	tPong        = byte(0x05)
-	tKick        = byte(0x06)
-	tExpired     = byte(0x07)
 	maxStreams   = 8192
 	queueSize    = 64
 	dialTimeout  = 100 * time.Millisecond
@@ -191,15 +189,11 @@ func (c *userCache) reload() {
 		if n < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 			continue
 		}
-		exp, err := time.ParseInLocation("2006-01-02", parts[2], time.UTC)
+		exp, err := time.ParseInLocation("2006-01-02", parts[2], time.Local)
 		if err != nil {
 			continue
 		}
 		t[parts[0]] = &userEntry{name: parts[1], expires: exp.Add(24*time.Hour - time.Second)}
-	}
-	if err := sc.Err(); err != nil {
-		log.Printf("error reading users file: %v", err)
-		return
 	}
 	c.mu.Lock()
 	c.table = t
@@ -234,17 +228,28 @@ func checkAuth(id string) (string, int, authResult) {
 	if time.Now().After(e.expires) {
 		return e.name, 0, authExpired
 	}
-	days := int(time.Until(e.expires).Hours()/24) + 1
-	return e.name, days, authOK
+	return e.name, int(time.Until(e.expires).Hours()/24) + 1, authOK
 }
 
-var bufPool = sync.Pool{New: func() interface{} {
-	b := make([]byte, 7+maxPayload)
-	return &b
-}}
+var (
+	framePool = sync.Pool{New: func() interface{} {
+		b := make([]byte, 7+maxPayload)
+		return &b
+	}}
+	payloadPool = sync.Pool{New: func() interface{} {
+		b := make([]byte, maxPayload)
+		return &b
+	}}
+	readBufPool = sync.Pool{New: func() interface{} {
+		b := make([]byte, maxPayload)
+		return &b
+	}}
+)
 
-func getBuf() []byte  { return *bufPool.Get().(*[]byte) }
-func putBuf(b []byte) { bufPool.Put(&b) }
+func getFrame() []byte    { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte)   { framePool.Put(&b) }
+func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
+func putPayload(b []byte) { payloadPool.Put(&b) }
 
 type stream struct {
 	q      chan []byte
@@ -255,13 +260,12 @@ func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
 func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
-	conn      net.Conn
-	writeQ    chan []byte
-	mu        sync.RWMutex
-	streams   map[uint32]*stream
-	count     atomic.Int32
-	dead      atomic.Uint32
-	closeOnce sync.Once
+	conn    net.Conn
+	writeQ  chan []byte
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   atomic.Int32
+	dead    atomic.Uint32
 }
 
 func newMux(conn net.Conn) *mux {
@@ -272,10 +276,6 @@ func newMux(conn net.Conn) *mux {
 	}
 	go m.writeLoop()
 	return m
-}
-
-func (m *mux) closeWriteQ() {
-	m.closeOnce.Do(func() { close(m.writeQ) })
 }
 
 func (m *mux) writeLoop() {
@@ -298,8 +298,15 @@ func (m *mux) writeLoop() {
 		bufs.WriteTo(m.conn)
 		m.conn.SetWriteDeadline(time.Time{})
 		for _, b := range toFree {
-			putBuf(b[:cap(b)])
+			putFrame(b[:cap(b)])
 		}
+	}
+}
+
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
 	}
 }
 
@@ -317,20 +324,12 @@ func (m *mux) trySend(buf []byte) (ok bool) {
 	}
 }
 
-func (m *mux) buildHdr(t byte, sid uint32) []byte {
-	buf := getBuf()
-	buf[0] = t
-	binary.BigEndian.PutUint32(buf[1:5], sid)
-	buf[5], buf[6] = 0, 0
-	return buf[:7]
-}
-
 func (m *mux) send(t byte, sid uint32, data []byte) {
 	if m.dead.Load() == 1 {
 		return
 	}
 	ln := len(data)
-	buf := getBuf()
+	buf := getFrame()
 	buf[0] = t
 	binary.BigEndian.PutUint32(buf[1:5], sid)
 	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
@@ -338,7 +337,7 @@ func (m *mux) send(t byte, sid uint32, data []byte) {
 		copy(buf[7:7+ln], data)
 	}
 	if !m.trySend(buf[:7+ln]) {
-		putBuf(buf)
+		putFrame(buf)
 	}
 }
 
@@ -346,38 +345,13 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	if m.dead.Load() == 1 {
 		return
 	}
-	buf := m.buildHdr(t, sid)
-	if !m.trySend(buf) {
-		putBuf(buf[:cap(buf)])
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5], buf[6] = 0, 0
+	if !m.trySend(buf[:7]) {
+		putFrame(buf)
 	}
-}
-
-func (m *mux) sendNotify(t byte) {
-	if m.dead.Load() == 1 {
-		return
-	}
-	buf := m.buildHdr(t, 0)
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	m.conn.Write(buf)
-	m.conn.SetWriteDeadline(time.Time{})
-	putBuf(buf[:cap(buf)])
-}
-
-func (m *mux) kill() {
-	if m.dead.CompareAndSwap(0, 1) {
-		m.conn.Close()
-		m.closeWriteQ()
-	}
-}
-
-func (m *mux) killWithReason(t byte) {
-	if !m.dead.CompareAndSwap(0, 1) {
-		return
-	}
-	m.sendNotify(t)
-	time.Sleep(50 * time.Millisecond)
-	m.conn.Close()
-	m.closeWriteQ()
 }
 
 func (m *mux) addStream(sid uint32, s *stream) bool {
@@ -453,7 +427,7 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 		defer wg.Done()
 		for d := range s.q {
 			_, err := hev.Write(d)
-			putBuf(d[:cap(d)])
+			putPayload(d[:cap(d)])
 			if err != nil {
 				break
 			}
@@ -463,8 +437,8 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 
 	go func() {
 		defer wg.Done()
-		buf := getBuf()
-		defer putBuf(buf)
+		buf := *readBufPool.Get().(*[]byte)
+		defer readBufPool.Put(&buf)
 		for {
 			n, err := hev.Read(buf)
 			if n > 0 {
@@ -520,12 +494,12 @@ func (m *mux) run() {
 			if s == nil || s.isClosed() {
 				continue
 			}
-			p := getBuf()[:ln]
+			p := getPayload()[:ln]
 			copy(p, rb[:ln])
 			select {
 			case s.q <- p:
 			default:
-				putBuf(p[:cap(p)])
+				putPayload(p[:cap(p)])
 				if s.tryClose() {
 					m.delStream(sid)
 					close(s.q)
@@ -546,35 +520,81 @@ func (m *mux) run() {
 	m.mu.Unlock()
 }
 
-var activeSessions = sync.Map{}
+var (
+	activeSessions = sync.Map{}
+	needleAction   = []byte("action:")
+	needleID       = []byte("x-internal-id:")
+	needleEnd      = []byte("\r\n\r\n")
+	resp403NotReg  = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\n\r\nnot_registered")
+	resp403Expired = []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\n\r\nexpired")
+)
 
-func kickSession(id string, reason byte) {
-	if v, ok := activeSessions.LoadAndDelete(id); ok {
-		v.(*mux).killWithReason(reason)
-		log.Printf("session closed id=%s reason=0x%02x", id, reason)
+func bytesIndex(s, sub []byte) int {
+	if len(sub) == 0 || len(s) < len(sub) {
+		return -1
 	}
+	f := sub[0] | 0x20
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i]|0x20 != f {
+			continue
+		}
+		ok := true
+		for j := 1; j < len(sub); j++ {
+			if s[i+j]|0x20 != sub[j]|0x20 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
 }
 
-func readHandshake(conn net.Conn) (action, userID string, err error) {
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		return "", "", err
+func extractHeader(raw, needle []byte) string {
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\n' {
+			continue
+		}
+		end := i
+		if end > start && raw[end-1] == '\r' {
+			end--
+		}
+		line := raw[start:end]
+		start = i + 1
+		if len(line) <= len(needle) || bytesIndex(line[:len(needle)], needle) != 0 {
+			continue
+		}
+		val := line[len(needle):]
+		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+			val = val[1:]
+		}
+		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+			val = val[:len(val)-1]
+		}
+		return string(val)
 	}
-	action = req.Header.Get("Action")
-	userID = req.Header.Get("X-Internal-Id")
-	return action, userID, nil
+	return ""
 }
 
-func write403(conn net.Conn, reason, body string) {
-	resp := "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: " + reason +
-		"\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
-	conn.Write([]byte(resp))
-	conn.Close()
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	b := make([]byte, 20)
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
 
 func handle(conn net.Conn) {
+	defer conn.Close()
 	tc := conn.(*net.TCPConn)
 	tc.SetNoDelay(true)
 	tc.SetReadBuffer(262144)
@@ -582,123 +602,67 @@ func handle(conn net.Conn) {
 	tc.SetKeepAlive(true)
 	tc.SetKeepAlivePeriod(30 * time.Second)
 
-	action, userID, err := readHandshake(conn)
-	if err != nil {
-		conn.Close()
-		return
+	buf := make([]byte, 4096)
+	n := 0
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for n < len(buf) {
+		nr, err := conn.Read(buf[n:])
+		if nr > 0 {
+			n += nr
+			if bytesIndex(buf[:n], needleAction) >= 0 && bytesIndex(buf[:n], needleEnd) >= 0 {
+				break
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
+	conn.SetReadDeadline(time.Time{})
+
+	raw := buf[:n]
+	action := extractHeader(raw, needleAction)
 	if action != "tunnel" && action != "tunnel-tcp" {
-		conn.Close()
 		return
 	}
+
+	userID := extractHeader(raw, needleID)
 	if userID == "" {
-		write403(conn, "not_registered", "not_registered")
+		conn.Write(resp403NotReg)
 		return
 	}
 
 	name, days, res := checkAuth(userID)
 	switch res {
 	case authNotFound:
-		write403(conn, "not_registered", "not_registered")
+		conn.Write(resp403NotReg)
 		return
 	case authExpired:
-		write403(conn, "expired", "expired")
+		conn.Write(resp403Expired)
 		return
 	}
 
 	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: " +
-		name + "\r\nX-User-Days: " + strconv.Itoa(days) + "\r\n\r\n"))
+		name + "\r\nX-User-Days: " + itoa(days) + "\r\n\r\n"))
 
 	m := newMux(conn)
 	if prev, loaded := activeSessions.Swap(userID, m); loaded {
-		go prev.(*mux).killWithReason(tKick)
+		prev.(*mux).kill()
 	}
 	m.run()
 	activeSessions.CompareAndDelete(userID, m)
-}
-
-func kickHandler(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	reason := tKick
-	if r.URL.Query().Get("reason") == "expired" {
-		reason = tExpired
-	}
-	if id == "" {
-		w.WriteHeader(400)
-		w.Write([]byte("missing_id"))
-		return
-	}
-	if _, ok := activeSessions.Load(id); ok {
-		kickSession(id, byte(reason))
-		w.Write([]byte("kicked"))
-		return
-	}
-	w.Write([]byte("not_connected"))
-}
-
-func nextMidnight() time.Time {
-	now := time.Now().UTC()
-	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
-}
-
-func checkExpiredSessions() {
-	kicked := 0
-	activeSessions.Range(func(key, value any) bool {
-		userID := key.(string)
-		_, _, res := checkAuth(userID)
-		if res != authOK {
-			reason := tExpired
-			if res == authNotFound {
-				reason = tKick
-			}
-			kickSession(userID, byte(reason))
-			kicked++
-		}
-		return true
-	})
-	if kicked > 0 {
-		log.Printf("midnight check: kicked %d sessions", kicked)
-	}
-}
-
-func startCacheReloader() {
-	t := time.NewTicker(cacheReload)
-	defer t.Stop()
-	for range t.C {
-		cache.reload()
-	}
-}
-
-func startMidnightChecker() {
-	for {
-		time.Sleep(time.Until(nextMidnight()))
-		checkExpiredSessions()
-	}
-}
-
-func startKickAPI() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/kick", kickHandler)
-	srv := &http.Server{
-		Addr:         "127.0.0.1:8091",
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
-	}
-	log.Printf("kick api on 127.0.0.1:8091")
-	if err := srv.ListenAndServe(); err != nil {
-		log.Printf("kick api error: %v", err)
-	}
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetMemoryLimit(768 << 20)
 	cache.reload()
-
-	go startCacheReloader()
-	go startMidnightChecker()
-	go startKickAPI()
+	go func() {
+		t := time.NewTicker(cacheReload)
+		defer t.Stop()
+		for range t.C {
+			cache.reload()
+		}
+	}()
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -709,6 +673,7 @@ func main() {
 			raw.Control(func(fd uintptr) {
 				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
 			})
 		}
 	}
@@ -746,7 +711,6 @@ const (
 	panelAddr = "0.0.0.0:8090"
 	usersPath = "/opt/btserver/users.txt"
 	tokenPath = "/opt/btserver/token.txt"
-	kickBase  = "http://127.0.0.1:8091/kick?id="
 )
 
 var (
@@ -755,7 +719,6 @@ var (
 	usersMu   sync.Mutex
 	rateMu    sync.Mutex
 	rateHits  = map[string][]int64{}
-	kickCli   = &http.Client{Timeout: 2 * time.Second}
 )
 
 func getToken() string {
@@ -785,19 +748,7 @@ func rateOK(ip string) bool {
 	}
 	rateHits[ip] = append(valid, now)
 	if len(rateHits) > 1000 {
-		pruned := map[string][]int64{}
-		for k, v := range rateHits {
-			fresh := v[:0]
-			for _, ts := range v {
-				if now-ts < 60 {
-					fresh = append(fresh, ts)
-				}
-			}
-			if len(fresh) > 0 {
-				pruned[k] = fresh
-			}
-		}
-		rateHits = pruned
+		rateHits = map[string][]int64{}
 	}
 	return true
 }
@@ -829,48 +780,30 @@ func loadUsers() map[string]*user {
 			Expires: strings.TrimSpace(p[2]),
 		}
 	}
-	if err := sc.Err(); err != nil {
-		log.Printf("error reading users file: %v", err)
-		return map[string]*user{}
-	}
 	return out
 }
 
-func saveUsers(users map[string]*user) error {
+func saveUsers(users map[string]*user) {
 	tmp, err := os.CreateTemp(filepath.Dir(usersPath), ".users_tmp")
 	if err != nil {
-		return err
+		return
 	}
-	tmpName := tmp.Name()
-	defer func() {
-		if err != nil {
-			os.Remove(tmpName)
-		}
-	}()
 	w := bufio.NewWriter(tmp)
 	w.WriteString("# formato: id:nombre:YYYY-MM-DD\n")
 	for id, u := range users {
 		w.WriteString(id + ":" + u.Name + ":" + u.Expires + "\n")
 	}
-	if err = w.Flush(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(tmpName, usersPath); err != nil {
-		return err
-	}
-	return nil
+	w.Flush()
+	tmp.Close()
+	os.Rename(tmp.Name(), usersPath)
 }
 
 func daysLeft(exp string) int {
-	t, err := time.ParseInLocation("2006-01-02", exp, time.UTC)
+	t, err := time.ParseInLocation("2006-01-02", exp, time.Local)
 	if err != nil {
 		return 0
 	}
-	d := int(time.Until(t.Add(24*time.Hour-time.Second)).Hours() / 24)
+	d := int(time.Until(t.Add(24*time.Hour - time.Second)).Hours() / 24)
 	if d < 0 {
 		return 0
 	}
@@ -928,15 +861,6 @@ func userRow(id string, u *user) map[string]any {
 	return map[string]any{"id": id, "name": u.Name, "expires": u.Expires, "days_left": dl, "active": dl > 0}
 }
 
-func kickUser(id, reason string) {
-	go func() {
-		resp, err := kickCli.Get(kickBase + id + "&reason=" + reason)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}()
-}
-
 func handleClients(w http.ResponseWriter, r *http.Request) {
 	usersMu.Lock()
 	users := loadUsers()
@@ -985,12 +909,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	usersMu.Lock()
 	users := loadUsers()
 	users[id] = &user{Name: name, Expires: exp}
-	if err := saveUsers(users); err != nil {
-		usersMu.Unlock()
-		log.Printf("saveUsers error: %v", err)
-		jsonResp(w, 500, map[string]any{"error": "error guardando usuarios"})
-		return
-	}
+	saveUsers(users)
 	usersMu.Unlock()
 	jsonResp(w, 200, map[string]any{"ok": true, "id": id, "name": name, "expires": exp, "days": days})
 }
@@ -1004,21 +923,14 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
+	defer usersMu.Unlock()
 	users := loadUsers()
 	if _, ok := users[id]; !ok {
-		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
 	delete(users, id)
-	if err := saveUsers(users); err != nil {
-		usersMu.Unlock()
-		log.Printf("saveUsers error: %v", err)
-		jsonResp(w, 500, map[string]any{"error": "error guardando usuarios"})
-		return
-	}
-	usersMu.Unlock()
-	kickUser(id, "kicked")
+	saveUsers(users)
 	jsonResp(w, 200, map[string]any{"ok": true})
 }
 
@@ -1031,49 +943,37 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
+	defer usersMu.Unlock()
 	users := loadUsers()
 	u, ok := users[id]
 	if !ok {
-		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
 	if n := strings.TrimSpace(str(body["name"])); n != "" {
 		u.Name = n
 	}
-	base, err := time.ParseInLocation("2006-01-02", u.Expires, time.UTC)
+	base, err := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
 	if err != nil || base.Before(time.Now()) {
-		log.Printf("add_days on expired/invalid user id=%s expires=%s, using today as base", id, u.Expires)
 		base = time.Now()
 	}
 	switch {
 	case body["add_days"] != nil:
 		u.Expires = addDate(base, intVal(body["add_days"], 0))
 	case body["sub_days"] != nil:
-		orig, _ := time.ParseInLocation("2006-01-02", u.Expires, time.UTC)
+		orig, _ := time.ParseInLocation("2006-01-02", u.Expires, time.Local)
 		u.Expires = addDate(orig, -intVal(body["sub_days"], 0))
 	case body["set_days"] != nil:
 		u.Expires = addDate(time.Now(), intVal(body["set_days"], 0))
 	case body["set_date"] != nil:
 		u.Expires = strings.TrimSpace(str(body["set_date"]))
 	}
-	newID := strings.TrimSpace(str(body["new_id"]))
-	if newID != "" && newID != id {
+	if newID := strings.TrimSpace(str(body["new_id"])); newID != "" && newID != id {
 		delete(users, id)
-		kickUser(id, "kicked")
 		id = newID
 	}
 	users[id] = u
-	if err := saveUsers(users); err != nil {
-		usersMu.Unlock()
-		log.Printf("saveUsers error: %v", err)
-		jsonResp(w, 500, map[string]any{"error": "error guardando usuarios"})
-		return
-	}
-	usersMu.Unlock()
-	if daysLeft(u.Expires) <= 0 {
-		kickUser(id, "expired")
-	}
+	saveUsers(users)
 	jsonResp(w, 200, userRow(id, u))
 }
 
@@ -1090,7 +990,7 @@ func main() {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
-	log.Printf("panel api on %s", panelAddr)
+	log.Printf("panel api escuchando %s", panelAddr)
 	log.Fatal(srv.ListenAndServe())
 }
 GOEOF
