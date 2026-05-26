@@ -144,11 +144,11 @@ const (
 	tPong        = byte(0x05)
 	tKick        = byte(0x06)
 	tExpired     = byte(0x07)
-	maxStreams   = 8192
-	queueSize    = 64
-	dialTimeout  = 100 * time.Millisecond
-	writeTimeout = 5 * time.Second
-	maxPayload   = 16384
+	maxStreams    = 8192
+	queueSize     = 64
+	dialTimeout   = 100 * time.Millisecond
+	writeTimeout  = 5 * time.Second
+	maxPayload    = 16384
 )
 
 type authResult int
@@ -211,9 +211,9 @@ var (
 	}}
 )
 
-func getFrame() []byte    { return *framePool.Get().(*[]byte) }
-func putFrame(b []byte)   { framePool.Put(&b) }
-func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
+func getFrame() []byte   { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte)  { framePool.Put(&b) }
+func getPayload() []byte { return *payloadPool.Get().(*[]byte) }
 func putPayload(b []byte) { payloadPool.Put(&b) }
 
 type stream struct {
@@ -268,6 +268,27 @@ func (m *mux) writeLoop() {
 	}
 }
 
+func (m *mux) kill() {
+	if m.dead.CompareAndSwap(0, 1) {
+		m.conn.Close()
+		close(m.writeQ)
+	}
+}
+
+func (m *mux) killWithReason(t byte) {
+	if !m.dead.CompareAndSwap(0, 1) {
+		return
+	}
+	buf := make([]byte, 7)
+	buf[0] = t
+	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.Write(buf)
+	m.conn.SetWriteDeadline(time.Time{})
+	time.Sleep(50 * time.Millisecond)
+	m.conn.Close()
+	close(m.writeQ)
+}
+
 func (m *mux) trySend(buf []byte) (ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -280,14 +301,6 @@ func (m *mux) trySend(buf []byte) (ok bool) {
 	default:
 		return false
 	}
-}
-
-func (m *mux) buildHdr(t byte, sid uint32) []byte {
-	buf := getFrame()
-	buf[0] = t
-	binary.BigEndian.PutUint32(buf[1:5], sid)
-	buf[5], buf[6] = 0, 0
-	return buf[:7]
 }
 
 func (m *mux) send(t byte, sid uint32, data []byte) {
@@ -311,35 +324,13 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	if m.dead.Load() == 1 {
 		return
 	}
-	buf := m.buildHdr(t, sid)
-	if !m.trySend(buf) {
+	buf := getFrame()
+	buf[0] = t
+	binary.BigEndian.PutUint32(buf[1:5], sid)
+	buf[5], buf[6] = 0, 0
+	if !m.trySend(buf[:7]) {
 		putFrame(buf[:cap(buf)])
 	}
-}
-
-func (m *mux) sendNotify(t byte) {
-	buf := m.buildHdr(t, 0)
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	m.conn.Write(buf)
-	m.conn.SetWriteDeadline(time.Time{})
-	putFrame(buf[:cap(buf)])
-}
-
-func (m *mux) kill() {
-	if m.dead.CompareAndSwap(0, 1) {
-		m.conn.Close()
-		close(m.writeQ)
-	}
-}
-
-func (m *mux) killWithReason(t byte) {
-	if !m.dead.CompareAndSwap(0, 1) {
-		return
-	}
-	m.sendNotify(t)
-	time.Sleep(50 * time.Millisecond)
-	m.conn.Close()
-	close(m.writeQ)
 }
 
 func (m *mux) addStream(sid uint32, s *stream) bool {
@@ -507,9 +498,8 @@ var activeSessions = sync.Map{}
 
 func kickSession(id string, reason byte) bool {
 	if v, ok := activeSessions.LoadAndDelete(id); ok {
-		m := v.(*mux)
-		m.killWithReason(reason)
-		log.Printf("session kicked id=%s reason=0x%02x streams=%d", id, reason, m.count.Load())
+		go v.(*mux).killWithReason(reason)
+		log.Printf("session kicked id=%s reason=0x%02x", id, reason)
 		return true
 	}
 	return false
@@ -652,21 +642,19 @@ func handle(conn net.Conn) {
 
 func kickHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	reason := tKick
-	if r.URL.Query().Get("reason") == "expired" {
-		reason = tExpired
-	}
 	if id == "" {
 		w.WriteHeader(400)
 		w.Write([]byte("missing_id"))
 		return
 	}
-	if kickSession(id, byte(reason)) {
-		log.Printf("kick api: session %s terminated", id)
+	reason := tKick
+	if r.URL.Query().Get("reason") == "expired" {
+		reason = tExpired
+	}
+	if kickSession(id, reason) {
 		w.Write([]byte("kicked"))
 		return
 	}
-	log.Printf("kick api: session %s not found", id)
 	w.Write([]byte("not_connected"))
 }
 
@@ -685,13 +673,13 @@ func checkExpiredSessions() {
 			if res == authNotFound {
 				reason = tKick
 			}
-			kickSession(userID, byte(reason))
+			kickSession(userID, reason)
 			kicked++
 		}
 		return true
 	})
 	if kicked > 0 {
-		log.Printf("midnight check: kicked %d sessions", kicked)
+		log.Printf("midnight sweep: kicked %d sessions", kicked)
 	}
 }
 
