@@ -163,10 +163,10 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -178,21 +178,20 @@ const (
 	listenAddr   = "0.0.0.0:80"
 	usersFile    = "/opt/btserver/users.txt"
 	cacheReload  = 30 * time.Second
-	tOpen        = byte(0x01)
-	tData        = byte(0x02)
-	tClose       = byte(0x03)
-	tPing        = byte(0x04)
-	tPong        = byte(0x05)
-	tKick        = byte(0x06)
-	tExpired     = byte(0x07)
+
+	tOpen  = byte(0x01)
+	tData  = byte(0x02)
+	tClose = byte(0x03)
+	tPing  = byte(0x04)
+	tPong  = byte(0x05)
+	tKick  = byte(0x06)
+
 	maxStreams   = 8192
 	queueSize    = 64
-	dialTimeout  = 100 * time.Millisecond
-	writeTimeout = 5 * time.Second
+	dialTimeout  = 5 * time.Second
+	writeTimeout = 30 * time.Second
 	maxPayload   = 16384
 )
-
-// ─── caché de usuarios ────────────────────────────────────────────────────────
 
 type userEntry struct {
 	name    string
@@ -205,7 +204,9 @@ type userCache struct {
 	loadedAt time.Time
 }
 
-var cache = &userCache{table: make(map[string]*userEntry)}
+var cache = &userCache{
+	table: make(map[string]*userEntry),
+}
 
 func (c *userCache) reload() {
 	f, err := os.Open(usersFile)
@@ -213,31 +214,51 @@ func (c *userCache) reload() {
 		return
 	}
 	defer f.Close()
+
 	t := make(map[string]*userEntry, 64)
+
 	sc := bufio.NewScanner(f)
+
 	for sc.Scan() {
+
 		line := sc.Text()
+
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
+
 		parts := [3]string{}
 		n, start := 0, 0
+
 		for i := 0; i <= len(line) && n < 3; i++ {
+
 			if i == len(line) || line[i] == ':' {
 				parts[n] = line[start:i]
 				n++
 				start = i + 1
 			}
 		}
-		if n < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+
+		if n < 3 {
 			continue
 		}
-		exp, err := time.ParseInLocation("2006-01-02", parts[2], time.Local)
+
+		exp, err := time.ParseInLocation(
+			"2006-01-02",
+			parts[2],
+			time.Local,
+		)
+
 		if err != nil {
 			continue
 		}
-		t[parts[0]] = &userEntry{name: parts[1], expires: exp.Add(24*time.Hour - time.Second)}
+
+		t[parts[0]] = &userEntry{
+			name:    parts[1],
+			expires: exp.Add(24*time.Hour - time.Second),
+		}
 	}
+
 	c.mu.Lock()
 	c.table = t
 	c.loadedAt = time.Now()
@@ -245,370 +266,432 @@ func (c *userCache) reload() {
 }
 
 func (c *userCache) lookup(id string) (*userEntry, bool) {
+
 	c.mu.RLock()
+
 	stale := time.Since(c.loadedAt) > cacheReload
 	e, ok := c.table[id]
+
 	c.mu.RUnlock()
+
 	if stale {
 		go c.reload()
 	}
+
 	return e, ok
 }
 
 type authResult int
 
 const (
-	authOK       authResult = iota
+	authOK authResult = iota
 	authNotFound
 	authExpired
 )
 
 func checkAuth(id string) (string, int, authResult) {
+
 	e, ok := cache.lookup(id)
+
 	if !ok {
 		return "", 0, authNotFound
 	}
+
 	if time.Now().After(e.expires) {
 		return e.name, 0, authExpired
 	}
-	return e.name, int(time.Until(e.expires).Hours()/24) + 1, authOK
+
+	return e.name,
+		int(time.Until(e.expires).Hours()/24) + 1,
+		authOK
 }
 
-// ─── pools ────────────────────────────────────────────────────────────────────
-
 var (
-	framePool = sync.Pool{New: func() interface{} {
-		b := make([]byte, 7+maxPayload)
-		return &b
-	}}
-	payloadPool = sync.Pool{New: func() interface{} {
-		b := make([]byte, maxPayload)
-		return &b
-	}}
-	readBufPool = sync.Pool{New: func() interface{} {
-		b := make([]byte, maxPayload)
-		return &b
-	}}
+	framePool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 7+maxPayload)
+			return &b
+		},
+	}
+
+	payloadPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, maxPayload)
+			return &b
+		},
+	}
 )
 
-func getFrame() []byte    { return *framePool.Get().(*[]byte) }
-func putFrame(b []byte)   { framePool.Put(&b) }
-func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
-func putPayload(b []byte) { payloadPool.Put(&b) }
+func getFrame() []byte {
+	return *framePool.Get().(*[]byte)
+}
 
-// ─── mux ─────────────────────────────────────────────────────────────────────
+func putFrame(b []byte) {
+	framePool.Put(&b)
+}
+
+func getPayload() []byte {
+	return *payloadPool.Get().(*[]byte)
+}
+
+func putPayload(b []byte) {
+	payloadPool.Put(&b)
+}
 
 type stream struct {
 	q      chan []byte
 	closed atomic.Uint32
 }
 
-func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
-func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
+func (s *stream) tryClose() bool {
+	return s.closed.CompareAndSwap(0, 1)
+}
+
+func (s *stream) isClosed() bool {
+	return s.closed.Load() == 1
+}
 
 type mux struct {
 	conn    net.Conn
 	writeQ  chan []byte
+
 	mu      sync.RWMutex
 	streams map[uint32]*stream
-	count   atomic.Int32
-	dead    atomic.Uint32
+
+	count atomic.Int32
+	dead  atomic.Uint32
 }
 
 func newMux(conn net.Conn) *mux {
+
 	m := &mux{
 		conn:    conn,
 		writeQ:  make(chan []byte, 4096),
 		streams: make(map[uint32]*stream, 256),
 	}
+
 	go m.writeLoop()
+
 	return m
 }
 
 func (m *mux) writeLoop() {
-	var bufs net.Buffers
-	var toFree [][]byte
+
 	for buf := range m.writeQ {
-		bufs = append(bufs[:0], buf)
-		toFree = append(toFree[:0], buf)
-	drain:
-		for {
-			select {
-			case b := <-m.writeQ:
-				bufs = append(bufs, b)
-				toFree = append(toFree, b)
-			default:
-				break drain
-			}
-		}
-		m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		bufs.WriteTo(m.conn)
+
+		m.conn.SetWriteDeadline(
+			time.Now().Add(writeTimeout),
+		)
+
+		_, err := m.conn.Write(buf)
+
 		m.conn.SetWriteDeadline(time.Time{})
-		for _, b := range toFree {
-			putFrame(b[:cap(b)])
+
+		putFrame(buf[:cap(buf)])
+
+		if err != nil {
+			return
 		}
 	}
 }
 
+func (m *mux) kill() {
+
+	if m.dead.CompareAndSwap(0, 1) {
+
+		m.conn.Close()
+
+		close(m.writeQ)
+	}
+}
+
+func (m *mux) killWithReason(t byte) {
+
+	if m.dead.CompareAndSwap(0, 1) {
+
+		buf := getFrame()
+
+		buf[0] = t
+		buf[1] = 0
+		buf[2] = 0
+		buf[3] = 0
+		buf[4] = 0
+		buf[5] = 0
+		buf[6] = 0
+
+		select {
+		case m.writeQ <- buf[:7]:
+		default:
+			putFrame(buf)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+
+		m.conn.Close()
+
+		close(m.writeQ)
+	}
+}
+
 func (m *mux) trySend(buf []byte) (ok bool) {
+
 	defer func() {
 		if recover() != nil {
 			ok = false
 		}
 	}()
+
 	select {
+
 	case m.writeQ <- buf:
 		return true
+
 	default:
 		return false
 	}
 }
 
-func (m *mux) buildHdr(t byte, sid uint32) []byte {
-	buf := getFrame()
-	buf[0] = t
-	binary.BigEndian.PutUint32(buf[1:5], sid)
-	buf[5], buf[6] = 0, 0
-	return buf[:7]
-}
-
 func (m *mux) send(t byte, sid uint32, data []byte) {
+
 	if m.dead.Load() == 1 {
 		return
 	}
+
 	ln := len(data)
+
 	buf := getFrame()
+
 	buf[0] = t
+
 	binary.BigEndian.PutUint32(buf[1:5], sid)
 	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
-	if ln > 0 {
-		copy(buf[7:7+ln], data)
-	}
+
+	copy(buf[7:], data)
+
 	if !m.trySend(buf[:7+ln]) {
 		putFrame(buf)
 	}
 }
 
 func (m *mux) sendHdr(t byte, sid uint32) {
+
 	if m.dead.Load() == 1 {
 		return
 	}
-	buf := m.buildHdr(t, sid)
-	if !m.trySend(buf) {
-		putFrame(buf[:cap(buf)])
-	}
-}
 
-// sendNotify envía un frame de control global (sid=0) y espera que el
-// writeLoop lo entregue antes de que kill() cierre la conexión.
-func (m *mux) sendNotify(t byte) {
-	if m.dead.Load() == 1 {
-		return
-	}
-	buf := m.buildHdr(t, 0)
-	// Envío directo bloqueante para garantizar entrega antes de cerrar.
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	m.conn.Write(buf)
-	m.conn.SetWriteDeadline(time.Time{})
-	putFrame(buf[:cap(buf)])
-}
+	buf := getFrame()
 
-func (m *mux) kill() {
-	if m.dead.CompareAndSwap(0, 1) {
-		m.conn.Close()
-		close(m.writeQ)
-	}
-}
+	buf[0] = t
 
-// killWithReason envía el frame de notificación al cliente y luego cierra.
-func (m *mux) killWithReason(t byte) {
-	if !m.dead.CompareAndSwap(0, 1) {
-		return
-	}
-	m.sendNotify(t)
-	time.Sleep(50 * time.Millisecond) // margen para que el SO envíe el frame
-	m.conn.Close()
-	close(m.writeQ)
-}
+	binary.BigEndian.PutUint32(buf[1:5], sid)
 
-func (m *mux) addStream(sid uint32, s *stream) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if int(m.count.Load()) >= maxStreams {
-		return false
-	}
-	m.streams[sid] = s
-	m.count.Add(1)
-	return true
-}
+	buf[5] = 0
+	buf[6] = 0
 
-func (m *mux) getStream(sid uint32) *stream {
-	m.mu.RLock()
-	s := m.streams[sid]
-	m.mu.RUnlock()
-	return s
-}
-
-func (m *mux) delStream(sid uint32) {
-	m.mu.Lock()
-	if _, ok := m.streams[sid]; ok {
-		delete(m.streams, sid)
-		m.count.Add(-1)
+	if !m.trySend(buf[:7]) {
+		putFrame(buf)
 	}
-	m.mu.Unlock()
 }
 
 func (m *mux) closeStream(sid uint32) {
-	s := m.getStream(sid)
-	if s != nil && s.tryClose() {
-		m.delStream(sid)
+
+	m.mu.Lock()
+
+	s, ok := m.streams[sid]
+
+	if ok {
+		delete(m.streams, sid)
+	}
+
+	m.mu.Unlock()
+
+	if ok && s.tryClose() {
 		close(s.q)
-		go func() {
-			for range s.q {
-			}
-		}()
+		m.count.Add(-1)
 	}
 }
 
-func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
-	defer func() {
-		if s.tryClose() {
-			m.delStream(sid)
-			m.sendHdr(tClose, sid)
-			for range s.q {
-			}
-		}
-	}()
+func (m *mux) openStream(sid uint32, first []byte) {
 
-	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	if m.count.Load() >= maxStreams {
+		return
+	}
+
+	tc, err := net.DialTimeout(
+		"tcp",
+		hevAddr,
+		dialTimeout,
+	)
+
 	if err != nil {
 		return
 	}
-	defer hev.Close()
 
-	tc := hev.(*net.TCPConn)
-	tc.SetNoDelay(true)
-	tc.SetReadBuffer(262144)
-	tc.SetWriteBuffer(262144)
+	hev := tc.(*net.TCPConn)
+
+	hev.SetNoDelay(true)
+	hev.SetReadBuffer(262144)
+	hev.SetWriteBuffer(262144)
+	hev.SetKeepAlive(true)
+	hev.SetKeepAlivePeriod(30 * time.Second)
+
+	s := &stream{
+		q: make(chan []byte, queueSize),
+	}
+
+	m.mu.Lock()
+
+	m.streams[sid] = s
+
+	m.mu.Unlock()
+
+	m.count.Add(1)
 
 	if len(first) > 0 {
+
 		if _, err := hev.Write(first); err != nil {
+			hev.Close()
+			m.closeStream(sid)
 			return
 		}
 	}
 
 	var wg sync.WaitGroup
+
 	wg.Add(2)
 
 	go func() {
+
 		defer wg.Done()
+
 		for d := range s.q {
+
 			_, err := hev.Write(d)
+
 			putPayload(d[:cap(d)])
+
 			if err != nil {
 				break
 			}
 		}
-		tc.CloseWrite()
 	}()
 
 	go func() {
+
 		defer wg.Done()
-		buf := *readBufPool.Get().(*[]byte)
-		defer readBufPool.Put(&buf)
+
+		buf := getPayload()
+
+		defer putPayload(buf)
+
 		for {
+
 			n, err := hev.Read(buf)
+
 			if n > 0 {
 				m.send(tData, sid, buf[:n])
 			}
+
 			if err != nil {
-				return
+				break
 			}
 		}
 	}()
 
 	wg.Wait()
+
+	hev.Close()
+
+	m.sendHdr(tClose, sid)
+
+	m.closeStream(sid)
 }
 
 func (m *mux) run() {
-	hdr := make([]byte, 7)
-	rb := make([]byte, maxPayload)
+
+	rb := make([]byte, 7+maxPayload)
 
 	for {
-		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+
+		_, err := io.ReadFull(m.conn, rb[:7])
+
+		if err != nil {
 			break
 		}
-		ft := hdr[0]
-		sid := binary.BigEndian.Uint32(hdr[1:5])
-		ln := int(binary.BigEndian.Uint16(hdr[5:7]))
+
+		t := rb[0]
+
+		sid := binary.BigEndian.Uint32(rb[1:5])
+
+		ln := int(binary.BigEndian.Uint16(rb[5:7]))
+
 		if ln > maxPayload {
 			break
 		}
+
 		if ln > 0 {
-			if _, err := io.ReadFull(m.conn, rb[:ln]); err != nil {
+
+			_, err = io.ReadFull(m.conn, rb[7:7+ln])
+
+			if err != nil {
 				break
 			}
 		}
 
-		switch ft {
-		case tPing:
-			m.sendHdr(tPong, sid)
-		case tPong:
+		switch t {
+
 		case tOpen:
-			s := &stream{q: make(chan []byte, queueSize)}
-			if !m.addStream(sid, s) {
-				m.sendHdr(tClose, sid)
-				continue
-			}
-			var first []byte
-			if ln > 0 {
-				first = make([]byte, ln)
-				copy(first, rb[:ln])
-			}
-			go m.handleStream(sid, s, first)
-		case tData:
-			s := m.getStream(sid)
-			if s == nil || s.isClosed() {
-				continue
-			}
+
 			p := getPayload()[:ln]
-			copy(p, rb[:ln])
-			select {
-			case s.q <- p:
-			default:
-				putPayload(p[:cap(p)])
-				if s.tryClose() {
-					m.delStream(sid)
-					close(s.q)
-					m.sendHdr(tClose, sid)
+
+			copy(p, rb[7:7+ln])
+
+			go m.openStream(sid, p)
+
+		case tData:
+
+			m.mu.RLock()
+
+			s := m.streams[sid]
+
+			m.mu.RUnlock()
+
+			if s == nil || s.isClosed() {
+
+				if ln > 0 {
+					continue
 				}
+
+				break
 			}
+
+			p := getPayload()[:ln]
+
+			copy(p, rb[7:7+ln])
+
+			select {
+
+			case s.q <- p:
+
+			default:
+				putPayload(p)
+				m.closeStream(sid)
+			}
+
 		case tClose:
+
 			m.closeStream(sid)
+
+		case tPing:
+
+			m.sendHdr(tPong, sid)
 		}
 	}
 
-	m.mu.Lock()
-	for _, s := range m.streams {
-		if s.tryClose() {
-			close(s.q)
-		}
-	}
-	m.mu.Unlock()
+	m.kill()
 }
 
-// ─── sesiones activas ─────────────────────────────────────────────────────────
-
-var activeSessions = sync.Map{}
-
-func kickSession(id string, reason byte) {
-	if v, ok := activeSessions.LoadAndDelete(id); ok {
-		v.(*mux).killWithReason(reason)
-		log.Printf("session closed id=%s reason=0x%02x", id, reason)
-	}
-}
-
-// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+var activeSessions sync.Map
 
 var (
 	needleAction = []byte("action:")
@@ -617,80 +700,86 @@ var (
 )
 
 func bytesIndex(s, sub []byte) int {
+
 	if len(sub) == 0 || len(s) < len(sub) {
 		return -1
 	}
+
 	f := sub[0] | 0x20
+
 	for i := 0; i <= len(s)-len(sub); i++ {
+
 		if s[i]|0x20 != f {
 			continue
 		}
+
 		ok := true
+
 		for j := 1; j < len(sub); j++ {
+
 			if s[i+j]|0x20 != sub[j]|0x20 {
 				ok = false
 				break
 			}
 		}
+
 		if ok {
 			return i
 		}
 	}
+
 	return -1
 }
 
 func extractHeader(raw, needle []byte) string {
+
 	start := 0
+
 	for i := 0; i < len(raw); i++ {
+
 		if raw[i] != '\n' {
 			continue
 		}
+
 		end := i
+
 		if end > start && raw[end-1] == '\r' {
 			end--
 		}
+
 		line := raw[start:end]
+
 		start = i + 1
-		if len(line) <= len(needle) || bytesIndex(line[:len(needle)], needle) != 0 {
+
+		if len(line) <= len(needle) ||
+			bytesIndex(line[:len(needle)], needle) != 0 {
 			continue
 		}
+
 		val := line[len(needle):]
-		for len(val) > 0 && (val[0] == ' ' || val[0] == '\t') {
+
+		for len(val) > 0 &&
+			(val[0] == ' ' || val[0] == '\t') {
 			val = val[1:]
 		}
-		for len(val) > 0 && (val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
+
+		for len(val) > 0 &&
+			(val[len(val)-1] == ' ' || val[len(val)-1] == '\r') {
 			val = val[:len(val)-1]
 		}
+
 		return string(val)
 	}
+
 	return ""
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	b := make([]byte, 20)
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}
-
-func write403(conn net.Conn, reason, body string) {
-	resp := "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: " + reason +
-		"\r\nContent-Length: " + itoa(len(body)) + "\r\n\r\n" + body
-	conn.Write([]byte(resp))
-}
-
-// ─── handler principal ────────────────────────────────────────────────────────
-
 func handle(conn net.Conn) {
+
 	defer conn.Close()
+
 	tc := conn.(*net.TCPConn)
+
 	tc.SetNoDelay(true)
 	tc.SetReadBuffer(262144)
 	tc.SetWriteBuffer(262144)
@@ -698,161 +787,150 @@ func handle(conn net.Conn) {
 	tc.SetKeepAlivePeriod(30 * time.Second)
 
 	buf := make([]byte, 4096)
+
 	n := 0
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	conn.SetReadDeadline(
+		time.Now().Add(10 * time.Second),
+	)
+
 	for n < len(buf) {
+
 		nr, err := conn.Read(buf[n:])
+
 		if nr > 0 {
+
 			n += nr
-			if bytesIndex(buf[:n], needleAction) >= 0 && bytesIndex(buf[:n], needleEnd) >= 0 {
+
+			if bytesIndex(buf[:n], needleAction) >= 0 &&
+				bytesIndex(buf[:n], needleEnd) >= 0 {
 				break
 			}
 		}
+
 		if err != nil {
 			return
 		}
 	}
+
 	conn.SetReadDeadline(time.Time{})
 
 	raw := buf[:n]
+
 	action := extractHeader(raw, needleAction)
-	if action != "tunnel" && action != "tunnel-tcp" {
+
+	if action != "tunnel" &&
+		action != "tunnel-tcp" {
 		return
 	}
 
 	userID := extractHeader(raw, needleID)
+
 	if userID == "" {
-		write403(conn, "not_registered", "not_registered")
+
+		conn.Write([]byte(
+			"HTTP/1.1 403 Forbidden\r\n" +
+				"Content-Length: 14\r\n\r\n" +
+				"not_registered",
+		))
+
 		return
 	}
 
 	name, days, res := checkAuth(userID)
+
 	switch res {
+
 	case authNotFound:
-		write403(conn, "not_registered", "not_registered")
+
+		conn.Write([]byte(
+			"HTTP/1.1 403 Forbidden\r\n" +
+				"Content-Length: 14\r\n\r\n" +
+				"not_registered",
+		))
+
 		return
+
 	case authExpired:
-		write403(conn, "expired", "expired")
+
+		conn.Write([]byte(
+			"HTTP/1.1 403 Forbidden\r\n" +
+				"Content-Length: 7\r\n\r\n" +
+				"expired",
+		))
+
 		return
 	}
 
-	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: " +
-		name + "\r\nX-User-Days: " + itoa(days) + "\r\n\r\n"))
+	conn.Write([]byte(
+		"HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"X-User-Name: " + name + "\r\n" +
+			"X-User-Days: " + strconv.Itoa(days) + "\r\n\r\n",
+	))
 
 	m := newMux(conn)
+
 	if prev, loaded := activeSessions.Swap(userID, m); loaded {
-		// Otro dispositivo tomó la sesión: notificar al anterior con tKick.
 		go prev.(*mux).killWithReason(tKick)
 	}
+
 	m.run()
+
 	activeSessions.CompareAndDelete(userID, m)
 }
 
-// ─── kick API (interno) ───────────────────────────────────────────────────────
-
-func kickHandler(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	reason := tKick
-	if r.URL.Query().Get("reason") == "expired" {
-		reason = tExpired
-	}
-	if id == "" {
-		w.WriteHeader(400)
-		w.Write([]byte("missing_id"))
-		return
-	}
-	if _, ok := activeSessions.Load(id); ok {
-		kickSession(id, byte(reason))
-		w.Write([]byte("kicked"))
-		return
-	}
-	w.Write([]byte("not_connected"))
-}
-
-// ─── chequeo medianoche ───────────────────────────────────────────────────────
-
-func nextMidnight() time.Time {
-	now := time.Now()
-	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.Local)
-}
-
-func checkExpiredSessions() {
-	kicked := 0
-	activeSessions.Range(func(key, value any) bool {
-		userID := key.(string)
-		_, _, res := checkAuth(userID)
-		if res != authOK {
-			reason := tExpired
-			if res == authNotFound {
-				reason = tKick
-			}
-			kickSession(userID, byte(reason))
-			kicked++
-		}
-		return true
-	})
-	if kicked > 0 {
-		log.Printf("midnight check: kicked %d sessions", kicked)
-	}
-}
-
-// ─── main ─────────────────────────────────────────────────────────────────────
-
 func main() {
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	debug.SetMemoryLimit(768 << 20)
+
+	debug.SetGCPercent(200)
+
 	cache.reload()
 
-	go func() {
-		t := time.NewTicker(cacheReload)
-		defer t.Stop()
-		for range t.C {
-			cache.reload()
-		}
-	}()
+	lnCfg := net.ListenConfig{
+		Control: func(_, _ string, rc syscall.RawConn) error {
 
-	go func() {
-		for {
-			time.Sleep(time.Until(nextMidnight()))
-			checkExpiredSessions()
-		}
-	}()
+			return rc.Control(func(fd uintptr) {
 
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/kick", kickHandler)
-		srv := &http.Server{
-			Addr:         "127.0.0.1:8091",
-			Handler:      mux,
-			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 5 * time.Second,
-		}
-		log.Printf("kick api on 127.0.0.1:8091")
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("kick api error: %v", err)
-		}
-	}()
+				syscall.SetsockoptInt(
+					int(fd),
+					syscall.IPPROTO_TCP,
+					syscall.TCP_NODELAY,
+					1,
+				)
 
-	ln, err := net.Listen("tcp", listenAddr)
+				syscall.SetsockoptInt(
+					int(fd),
+					syscall.SOL_SOCKET,
+					syscall.SO_REUSEADDR,
+					1,
+				)
+			})
+		},
+	}
+
+	ln, err := lnCfg.Listen(
+		nil,
+		"tcp",
+		listenAddr,
+	)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	if tc, ok := ln.(*net.TCPListener); ok {
-		if raw, err := tc.SyscallConn(); err == nil {
-			raw.Control(func(fd uintptr) {
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15, 1)
-			})
-		}
-	}
 
-	log.Printf("btserver %s -> hev %s (go=%s cpus=%d)", listenAddr, hevAddr, runtime.Version(), runtime.NumCPU())
+	log.Println("btserver listening on", listenAddr)
+
 	for {
+
 		conn, err := ln.Accept()
+
 		if err != nil {
 			continue
 		}
+
 		go handle(conn)
 	}
 }
