@@ -137,7 +137,6 @@ const (
 	hevAddr      = "127.0.0.1:1080"
 	listenAddr   = "0.0.0.0:80"
 	usersFile    = "/opt/btserver/users.txt"
-	cacheReload  = 30 * time.Second
 	tOpen        = byte(0x01)
 	tData        = byte(0x02)
 	tClose       = byte(0x03)
@@ -152,26 +151,20 @@ const (
 	maxPayload   = 16384
 )
 
-type userEntry struct {
-	name    string
-	expires time.Time
-}
+type authResult int
 
-type userCache struct {
-	mu       sync.RWMutex
-	table    map[string]*userEntry
-	loadedAt time.Time
-}
+const (
+	authOK       authResult = iota
+	authNotFound
+	authExpired
+)
 
-var cache = &userCache{table: make(map[string]*userEntry)}
-
-func (c *userCache) reload() {
+func checkAuth(id string) (string, int, authResult) {
 	f, err := os.Open(usersFile)
 	if err != nil {
-		return
+		return "", 0, authNotFound
 	}
 	defer f.Close()
-	t := make(map[string]*userEntry, 64)
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := sc.Text()
@@ -187,49 +180,20 @@ func (c *userCache) reload() {
 				start = i + 1
 			}
 		}
-		if n < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		if n < 3 || parts[0] != id {
 			continue
 		}
 		exp, err := time.ParseInLocation("2006-01-02", parts[2], time.Local)
 		if err != nil {
 			continue
 		}
-		t[parts[0]] = &userEntry{name: parts[1], expires: exp.Add(24*time.Hour - time.Second)}
+		expires := exp.Add(24*time.Hour - time.Second)
+		if time.Now().After(expires) {
+			return parts[1], 0, authExpired
+		}
+		return parts[1], int(time.Until(expires).Hours()/24) + 1, authOK
 	}
-	c.mu.Lock()
-	c.table = t
-	c.loadedAt = time.Now()
-	c.mu.Unlock()
-}
-
-func (c *userCache) lookup(id string) (*userEntry, bool) {
-	c.mu.RLock()
-	stale := time.Since(c.loadedAt) > cacheReload
-	e, ok := c.table[id]
-	c.mu.RUnlock()
-	if stale {
-		go c.reload()
-	}
-	return e, ok
-}
-
-type authResult int
-
-const (
-	authOK       authResult = iota
-	authNotFound
-	authExpired
-)
-
-func checkAuth(id string) (string, int, authResult) {
-	e, ok := cache.lookup(id)
-	if !ok {
-		return "", 0, authNotFound
-	}
-	if time.Now().After(e.expires) {
-		return e.name, 0, authExpired
-	}
-	return e.name, int(time.Until(e.expires).Hours()/24) + 1, authOK
+	return "", 0, authNotFound
 }
 
 var (
@@ -363,7 +327,6 @@ func (m *mux) sendNotify(t byte) {
 
 func (m *mux) kill() {
 	if m.dead.CompareAndSwap(0, 1) {
-		m.closeAllStreams()
 		m.conn.Close()
 		close(m.writeQ)
 	}
@@ -373,23 +336,10 @@ func (m *mux) killWithReason(t byte) {
 	if !m.dead.CompareAndSwap(0, 1) {
 		return
 	}
-	m.closeAllStreams()
 	m.sendNotify(t)
 	time.Sleep(50 * time.Millisecond)
 	m.conn.Close()
 	close(m.writeQ)
-}
-
-func (m *mux) closeAllStreams() {
-	m.mu.Lock()
-	for sid, s := range m.streams {
-		if s.tryClose() {
-			close(s.q)
-		}
-		delete(m.streams, sid)
-	}
-	m.count.Store(0)
-	m.mu.Unlock()
 }
 
 func (m *mux) addStream(sid uint32, s *stream) bool {
@@ -428,20 +378,6 @@ func (m *mux) closeStream(sid uint32) {
 			for range s.q {
 			}
 		}()
-	}
-}
-
-func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
 	}
 }
 
@@ -502,7 +438,7 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 		}
 	}()
 
-	waitWithTimeout(&wg, 30*time.Second)
+	wg.Wait()
 }
 
 func (m *mux) run() {
@@ -552,11 +488,6 @@ func (m *mux) run() {
 			case s.q <- p:
 			default:
 				putPayload(p[:cap(p)])
-				if s.tryClose() {
-					m.delStream(sid)
-					close(s.q)
-					m.sendHdr(tClose, sid)
-				}
 			}
 		case tClose:
 			m.closeStream(sid)
@@ -767,15 +698,6 @@ func checkExpiredSessions() {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetMemoryLimit(768 << 20)
-	cache.reload()
-
-	go func() {
-		t := time.NewTicker(cacheReload)
-		defer t.Stop()
-		for range t.C {
-			cache.reload()
-		}
-	}()
 
 	go func() {
 		for {
