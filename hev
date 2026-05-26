@@ -354,9 +354,6 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 }
 
 func (m *mux) sendNotify(t byte) {
-	if m.dead.Load() == 1 {
-		return
-	}
 	buf := m.buildHdr(t, 0)
 	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	m.conn.Write(buf)
@@ -366,6 +363,7 @@ func (m *mux) sendNotify(t byte) {
 
 func (m *mux) kill() {
 	if m.dead.CompareAndSwap(0, 1) {
+		m.closeAllStreams()
 		m.conn.Close()
 		close(m.writeQ)
 	}
@@ -375,10 +373,23 @@ func (m *mux) killWithReason(t byte) {
 	if !m.dead.CompareAndSwap(0, 1) {
 		return
 	}
+	m.closeAllStreams()
 	m.sendNotify(t)
-	time.Sleep(25 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 	m.conn.Close()
 	close(m.writeQ)
+}
+
+func (m *mux) closeAllStreams() {
+	m.mu.Lock()
+	for sid, s := range m.streams {
+		if s.tryClose() {
+			close(s.q)
+		}
+		delete(m.streams, sid)
+	}
+	m.count.Store(0)
+	m.mu.Unlock()
 }
 
 func (m *mux) addStream(sid uint32, s *stream) bool {
@@ -563,11 +574,14 @@ func (m *mux) run() {
 
 var activeSessions = sync.Map{}
 
-func kickSession(id string, reason byte) {
+func kickSession(id string, reason byte) bool {
 	if v, ok := activeSessions.LoadAndDelete(id); ok {
-		v.(*mux).killWithReason(reason)
-		log.Printf("session closed id=%s reason=0x%02x", id, reason)
+		m := v.(*mux)
+		m.killWithReason(reason)
+		log.Printf("session kicked id=%s reason=0x%02x streams=%d", id, reason, m.count.Load())
+		return true
 	}
+	return false
 }
 
 var (
@@ -716,11 +730,12 @@ func kickHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("missing_id"))
 		return
 	}
-	if _, ok := activeSessions.Load(id); ok {
-		kickSession(id, byte(reason))
+	if kickSession(id, byte(reason)) {
+		log.Printf("kick api: session %s terminated", id)
 		w.Write([]byte("kicked"))
 		return
 	}
+	log.Printf("kick api: session %s not found", id)
 	w.Write([]byte("not_connected"))
 }
 
@@ -983,13 +998,18 @@ func userRow(id string, u *user) map[string]any {
 	return map[string]any{"id": id, "name": u.Name, "expires": u.Expires, "days_left": dl, "active": dl > 0}
 }
 
-func kickUser(id, reason string) {
-	go func() {
-		resp, err := kickCli.Get(kickBase + id + "&reason=" + reason)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}()
+func kickUser(id, reason string) bool {
+	resp, err := kickCli.Get(kickBase + id + "&reason=" + reason)
+	if err != nil {
+		log.Printf("kickUser error: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	body := make([]byte, 64)
+	n, _ := resp.Body.Read(body)
+	result := string(body[:n])
+	log.Printf("kickUser id=%s reason=%s result=%s", id, reason, result)
+	return result == "kicked"
 }
 
 func handleClients(w http.ResponseWriter, r *http.Request) {
