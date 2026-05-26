@@ -125,6 +125,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -652,15 +653,81 @@ func handle(conn net.Conn) {
 	activeSessions.CompareAndDelete(userID, m)
 }
 
+func kickHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		w.WriteHeader(400)
+		w.Write([]byte("missing_id"))
+		return
+	}
+	if m, ok := activeSessions.Load(id); ok {
+		m.(*mux).kill()
+		activeSessions.Delete(id)
+		log.Printf("kicked session: %s", id)
+		w.Write([]byte("kicked"))
+		return
+	}
+	w.Write([]byte("not_connected"))
+}
+
+func nextMidnight() time.Time {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.Local)
+	return next
+}
+
+func checkExpiredSessions() {
+	kicked := 0
+	activeSessions.Range(func(key, value any) bool {
+		userID := key.(string)
+		_, _, res := checkAuth(userID)
+		if res != authOK {
+			m := value.(*mux)
+			m.kill()
+			activeSessions.Delete(userID)
+			kicked++
+		}
+		return true
+	})
+	if kicked > 0 {
+		log.Printf("midnight check: kicked %d expired sessions", kicked)
+	}
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetMemoryLimit(768 << 20)
 	cache.reload()
+
 	go func() {
 		t := time.NewTicker(cacheReload)
 		defer t.Stop()
 		for range t.C {
 			cache.reload()
+		}
+	}()
+
+	go func() {
+		for {
+			next := nextMidnight()
+			duration := time.Until(next)
+			time.Sleep(duration)
+			checkExpiredSessions()
+		}
+	}()
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/kick", kickHandler)
+		srv := &http.Server{
+			Addr:         "127.0.0.1:8091",
+			Handler:      mux,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+		}
+		log.Printf("kick api listening on 127.0.0.1:8091")
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("kick api error: %v", err)
 		}
 	}()
 
@@ -711,6 +778,7 @@ const (
 	panelAddr = "0.0.0.0:8090"
 	usersPath = "/opt/btserver/users.txt"
 	tokenPath = "/opt/btserver/token.txt"
+	kickURL   = "http://127.0.0.1:8091/kick?id="
 )
 
 var (
@@ -719,6 +787,7 @@ var (
 	usersMu   sync.Mutex
 	rateMu    sync.Mutex
 	rateHits  = map[string][]int64{}
+	kickCli   = &http.Client{Timeout: 2 * time.Second}
 )
 
 func getToken() string {
@@ -861,6 +930,15 @@ func userRow(id string, u *user) map[string]any {
 	return map[string]any{"id": id, "name": u.Name, "expires": u.Expires, "days_left": dl, "active": dl > 0}
 }
 
+func kickUser(id string) {
+	go func() {
+		resp, err := kickCli.Get(kickURL + id)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+}
+
 func handleClients(w http.ResponseWriter, r *http.Request) {
 	usersMu.Lock()
 	users := loadUsers()
@@ -923,14 +1001,16 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
-	defer usersMu.Unlock()
 	users := loadUsers()
 	if _, ok := users[id]; !ok {
+		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
 	delete(users, id)
 	saveUsers(users)
+	usersMu.Unlock()
+	kickUser(id)
 	jsonResp(w, 200, map[string]any{"ok": true})
 }
 
@@ -943,10 +1023,10 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usersMu.Lock()
-	defer usersMu.Unlock()
 	users := loadUsers()
 	u, ok := users[id]
 	if !ok {
+		usersMu.Unlock()
 		jsonResp(w, 404, map[string]any{"error": "no encontrado"})
 		return
 	}
@@ -970,10 +1050,15 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if newID := strings.TrimSpace(str(body["new_id"])); newID != "" && newID != id {
 		delete(users, id)
+		kickUser(id)
 		id = newID
 	}
 	users[id] = u
 	saveUsers(users)
+	usersMu.Unlock()
+	if daysLeft(u.Expires) <= 0 {
+		kickUser(id)
+	}
 	jsonResp(w, 200, userRow(id, u))
 }
 
