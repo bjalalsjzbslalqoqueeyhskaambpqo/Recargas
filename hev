@@ -146,15 +146,12 @@ const (
 	tKick        = byte(0x06)
 	tExpired     = byte(0x07)
 	maxStreams    = 8192
-	queueSize     = 64
-	dialTimeout   = 100 * time.Millisecond
-	writeTimeout  = 5 * time.Second
-	maxPayload    = 16384
-)
-
-const (
-	fmtDateTime = "2006-01-02 15:04"
-	fmtDateOnly = "2006-01-02"
+	queueSize    = 64
+	dialTimeout  = 100 * time.Millisecond
+	writeTimeout = 5 * time.Second
+	maxPayload   = 16384
+	fmtDateTime  = "2006-01-02 15:04"
+	fmtDateOnly  = "2006-01-02"
 )
 
 type authResult int
@@ -185,7 +182,7 @@ func checkAuth(id string) (string, time.Time, authResult) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := sc.Text()
+		line := strings.TrimSpace(sc.Text())
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
@@ -193,7 +190,7 @@ func checkAuth(id string) (string, time.Time, authResult) {
 		n, start := 0, 0
 		for i := 0; i <= len(line) && n < 3; i++ {
 			if i == len(line) || line[i] == ':' {
-				parts[n] = line[start:i]
+				parts[n] = strings.TrimSpace(line[start:i])
 				n++
 				start = i + 1
 			}
@@ -920,17 +917,16 @@ func str(v any) string {
 func userRow(id string, u *user) map[string]any {
 	days, hours, minutes := timeLeft(u.Expires)
 	expired := isExpired(u.Expires)
-	row := map[string]any{
-		"id":          id,
-		"name":        u.Name,
-		"expires":     u.Expires,
-		"days_left":   days,
-		"active":      !expired,
-		"expires_at":  u.Expires,
-		"hours_left":  hours,
+	return map[string]any{
+		"id":           id,
+		"name":         u.Name,
+		"expires":      u.Expires,
+		"expires_at":   u.Expires,
+		"days_left":    days,
+		"hours_left":   hours,
 		"minutes_left": minutes,
+		"active":       !expired,
 	}
-	return row
 }
 
 func kickUser(id, reason string) bool {
@@ -1044,9 +1040,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if n := strings.TrimSpace(str(body["name"])); n != "" {
 		u.Name = n
 	}
-
 	forceExpire := false
-
 	if v, ok := body["days"].(float64); ok {
 		days := int(v)
 		if days <= 0 {
@@ -1056,22 +1050,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			u.Expires = time.Now().Add(time.Duration(days) * 24 * time.Hour).Format(fmtDateTime)
 		}
 	}
-
 	newID := strings.TrimSpace(str(body["new_id"]))
 	if newID != "" && newID != id {
 		delete(users, id)
 		kickUser(id, "kicked")
 		id = newID
 	}
-
 	users[id] = u
 	saveUsers(users)
 	usersMu.Unlock()
-
 	if forceExpire {
 		kickUser(id, "expired")
 	}
-
 	jsonResp(w, 200, userRow(id, u))
 }
 
