@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
-GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 [ "$(id -u)" = "0" ] || die "Ejecutar como root"
@@ -76,12 +77,12 @@ YMLEOF
 
 info "Tuning TCP/kernel..."
 cat > /etc/sysctl.d/99-btserver.conf << 'SYSCTL'
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.core.rmem_default=262144
-net.core.wmem_default=262144
-net.ipv4.tcp_rmem=4096 262144 33554432
-net.ipv4.tcp_wmem=4096 262144 33554432
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=524288
+net.core.wmem_default=524288
+net.ipv4.tcp_rmem=4096 524288 67108864
+net.ipv4.tcp_wmem=4096 524288 67108864
 net.ipv4.tcp_notsent_lowat=4096
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
@@ -93,13 +94,17 @@ net.core.somaxconn=65535
 net.ipv4.tcp_max_syn_backlog=65535
 net.core.netdev_max_backlog=65535
 fs.file-max=1000000
-net.ipv4.tcp_mem=786432 1048576 33554432
+net.ipv4.tcp_mem=786432 1048576 67108864
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.ip_local_port_range=1024 65535
 net.ipv4.tcp_max_tw_buckets=2000000
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_ecn=1
 SYSCTL
 modprobe tcp_bbr 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
@@ -134,21 +139,26 @@ import (
 )
 
 const (
-	hevAddr      = "127.0.0.1:1080"
-	listenAddr   = "0.0.0.0:80"
-	usersFile    = "/opt/btserver/users.txt"
-	tOpen        = byte(0x01)
-	tData        = byte(0x02)
-	tClose       = byte(0x03)
-	tPing        = byte(0x04)
-	tPong        = byte(0x05)
-	tKick        = byte(0x06)
-	tExpired     = byte(0x07)
-	maxStreams    = 8192
-	queueSize     = 64
-	dialTimeout   = 100 * time.Millisecond
-	writeTimeout  = 5 * time.Second
-	maxPayload    = 16384
+	hevAddr           = "127.0.0.1:1080"
+	listenAddr        = "0.0.0.0:80"
+	usersFile         = "/opt/btserver/users.txt"
+	tOpen             = byte(0x01)
+	tData             = byte(0x02)
+	tClose            = byte(0x03)
+	tPing             = byte(0x04)
+	tPong             = byte(0x05)
+	tKick             = byte(0x06)
+	tExpired          = byte(0x07)
+	maxStreams        = 8192
+	queueSize         = 512
+	dialTimeout       = 800 * time.Millisecond
+	hevConnTimeout    = 3 * time.Second
+	writeTimeout      = 8 * time.Second
+	maxPayload        = 16384
+	streamIdleTimeout = 90 * time.Second
+	muxWriteQueueCap  = 8192
+	backpressureHigh  = 400
+	backpressureLow   = 128
 )
 
 type authResult int
@@ -211,35 +221,56 @@ var (
 	}}
 )
 
-func getFrame() []byte   { return *framePool.Get().(*[]byte) }
-func putFrame(b []byte)  { framePool.Put(&b) }
-func getPayload() []byte { return *payloadPool.Get().(*[]byte) }
+func getFrame() []byte    { return *framePool.Get().(*[]byte) }
+func putFrame(b []byte)   { framePool.Put(&b) }
+func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
 func putPayload(b []byte) { payloadPool.Put(&b) }
 
 type stream struct {
-	q      chan []byte
-	closed atomic.Uint32
+	q        chan []byte
+	resumeCh chan struct{}
+	closed   atomic.Uint32
+	lastAct  atomic.Int64
+}
+
+func newStream() *stream {
+	s := &stream{
+		q:        make(chan []byte, queueSize),
+		resumeCh: make(chan struct{}, 1),
+	}
+	s.touch()
+	return s
+}
+
+func (s *stream) touch() {
+	s.lastAct.Store(time.Now().UnixNano())
+}
+
+func (s *stream) idleSince() time.Duration {
+	return time.Duration(time.Now().UnixNano() - s.lastAct.Load())
 }
 
 func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
 func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
-	conn    net.Conn
-	writeQ  chan []byte
-	mu      sync.RWMutex
-	streams map[uint32]*stream
-	count   atomic.Int32
-	dead    atomic.Uint32
+	conn       net.Conn
+	writeQ     chan []byte
+	mu         sync.RWMutex
+	streams    map[uint32]*stream
+	count      atomic.Int32
+	dead       atomic.Uint32
+	queueDepth atomic.Int32
 }
 
 func newMux(conn net.Conn) *mux {
 	m := &mux{
 		conn:    conn,
-		writeQ:  make(chan []byte, 4096),
+		writeQ:  make(chan []byte, muxWriteQueueCap),
 		streams: make(map[uint32]*stream, 256),
 	}
 	go m.writeLoop()
+	go m.idleReaper()
 	return m
 }
 
@@ -247,12 +278,14 @@ func (m *mux) writeLoop() {
 	var bufs net.Buffers
 	var toFree [][]byte
 	for buf := range m.writeQ {
+		m.queueDepth.Add(-1)
 		bufs = append(bufs[:0], buf)
 		toFree = append(toFree[:0], buf)
 	drain:
 		for {
 			select {
 			case b := <-m.writeQ:
+				m.queueDepth.Add(-1)
 				bufs = append(bufs, b)
 				toFree = append(toFree, b)
 			default:
@@ -260,10 +293,46 @@ func (m *mux) writeLoop() {
 			}
 		}
 		m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		bufs.WriteTo(m.conn)
+		_, werr := bufs.WriteTo(m.conn)
 		m.conn.SetWriteDeadline(time.Time{})
 		for _, b := range toFree {
 			putFrame(b[:cap(b)])
+		}
+		if werr != nil {
+			m.kill()
+			return
+		}
+		if m.queueDepth.Load() <= int32(backpressureLow) {
+			m.mu.RLock()
+			for _, s := range m.streams {
+				select {
+				case s.resumeCh <- struct{}{}:
+				default:
+				}
+			}
+			m.mu.RUnlock()
+		}
+	}
+}
+
+func (m *mux) idleReaper() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if m.dead.Load() == 1 {
+			return
+		}
+		var stale []uint32
+		m.mu.RLock()
+		for sid, s := range m.streams {
+			if s.idleSince() > streamIdleTimeout {
+				stale = append(stale, sid)
+			}
+		}
+		m.mu.RUnlock()
+		for _, sid := range stale {
+			m.closeStream(sid)
+			m.sendHdr(tClose, sid)
 		}
 	}
 }
@@ -289,14 +358,13 @@ func (m *mux) killWithReason(t byte) {
 	close(m.writeQ)
 }
 
-func (m *mux) trySend(buf []byte) (ok bool) {
-	defer func() {
-		if recover() != nil {
-			ok = false
-		}
-	}()
+func (m *mux) trySend(buf []byte) bool {
+	if m.dead.Load() == 1 {
+		return false
+	}
 	select {
 	case m.writeQ <- buf:
+		m.queueDepth.Add(1)
 		return true
 	default:
 		return false
@@ -317,6 +385,10 @@ func (m *mux) send(t byte, sid uint32, data []byte) {
 	}
 	if !m.trySend(buf[:7+ln]) {
 		putFrame(buf)
+		if t == tData {
+			m.sendHdr(tClose, sid)
+			m.closeStream(sid)
+		}
 	}
 }
 
@@ -382,7 +454,8 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 		}
 	}()
 
-	hev, err := net.DialTimeout("tcp", hevAddr, dialTimeout)
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	hev, err := dialer.Dial("tcp", hevAddr)
 	if err != nil {
 		return
 	}
@@ -390,37 +463,66 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 
 	tc := hev.(*net.TCPConn)
 	tc.SetNoDelay(true)
-	tc.SetReadBuffer(262144)
-	tc.SetWriteBuffer(262144)
+	tc.SetReadBuffer(524288)
+	tc.SetWriteBuffer(524288)
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
 
 	if len(first) > 0 {
+		hev.SetWriteDeadline(time.Now().Add(hevConnTimeout))
 		if _, err := hev.Write(first); err != nil {
 			return
 		}
+		hev.SetWriteDeadline(time.Time{})
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// cliente -> hev: drena la queue del stream hacia hev-socks5
 	go func() {
 		defer wg.Done()
-		for d := range s.q {
-			_, err := hev.Write(d)
-			putPayload(d[:cap(d)])
-			if err != nil {
-				break
+		for {
+			select {
+			case d, ok := <-s.q:
+				if !ok {
+					tc.CloseWrite()
+					return
+				}
+				s.touch()
+				hev.SetWriteDeadline(time.Now().Add(writeTimeout))
+				_, err := hev.Write(d)
+				putPayload(d[:cap(d)])
+				hev.SetWriteDeadline(time.Time{})
+				if err != nil {
+					tc.CloseWrite()
+					return
+				}
+			case <-s.resumeCh:
+				// señal de backpressure liberada, continuar
 			}
 		}
-		tc.CloseWrite()
 	}()
 
+	// hev -> cliente: lee de hev-socks5 y envia al cliente via mux
 	go func() {
 		defer wg.Done()
-		buf := *readBufPool.Get().(*[]byte)
-		defer readBufPool.Put(&buf)
+		bufp := readBufPool.Get().(*[]byte)
+		buf := *bufp
+		defer readBufPool.Put(bufp)
 		for {
+			hev.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 			n, err := hev.Read(buf)
+			hev.SetReadDeadline(time.Time{})
 			if n > 0 {
+				s.touch()
+				// backpressure: si el mux esta saturado, esperar antes de enviar mas
+				if m.queueDepth.Load() > int32(backpressureHigh) {
+					select {
+					case <-s.resumeCh:
+					case <-time.After(500 * time.Millisecond):
+					}
+				}
 				m.send(tData, sid, buf[:n])
 			}
 			if err != nil {
@@ -437,9 +539,14 @@ func (m *mux) run() {
 	rb := make([]byte, maxPayload)
 
 	for {
-		if _, err := io.ReadFull(m.conn, hdr); err != nil {
+		// deadline generoso para keepalive: el cliente manda T_PING cada 3s
+		m.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		_, err := io.ReadFull(m.conn, hdr)
+		m.conn.SetReadDeadline(time.Time{})
+		if err != nil {
 			break
 		}
+
 		ft := hdr[0]
 		sid := binary.BigEndian.Uint32(hdr[1:5])
 		ln := int(binary.BigEndian.Uint16(hdr[5:7]))
@@ -447,7 +554,10 @@ func (m *mux) run() {
 			break
 		}
 		if ln > 0 {
-			if _, err := io.ReadFull(m.conn, rb[:ln]); err != nil {
+			m.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			_, err := io.ReadFull(m.conn, rb[:ln])
+			m.conn.SetReadDeadline(time.Time{})
+			if err != nil {
 				break
 			}
 		}
@@ -455,9 +565,12 @@ func (m *mux) run() {
 		switch ft {
 		case tPing:
 			m.sendHdr(tPong, sid)
+
 		case tPong:
+			// noop, el cliente trackea RTT
+
 		case tOpen:
-			s := &stream{q: make(chan []byte, queueSize)}
+			s := newStream()
 			if !m.addStream(sid, s) {
 				m.sendHdr(tClose, sid)
 				continue
@@ -468,23 +581,37 @@ func (m *mux) run() {
 				copy(first, rb[:ln])
 			}
 			go m.handleStream(sid, s, first)
+
 		case tData:
 			s := m.getStream(sid)
 			if s == nil || s.isClosed() {
 				continue
 			}
+			s.touch()
 			p := getPayload()[:ln]
 			copy(p, rb[:ln])
+			// si la queue del stream esta llena, cerrar limpiamente
+			// y notificar al cliente para que reconecte ese stream
+			if len(s.q) >= queueSize-1 {
+				putPayload(p[:cap(p)])
+				m.closeStream(sid)
+				m.sendHdr(tClose, sid)
+				continue
+			}
 			select {
 			case s.q <- p:
 			default:
 				putPayload(p[:cap(p)])
+				m.closeStream(sid)
+				m.sendHdr(tClose, sid)
 			}
+
 		case tClose:
 			m.closeStream(sid)
 		}
 	}
 
+	// tunnel caido: cerrar todos los streams activos
 	m.mu.Lock()
 	for _, s := range m.streams {
 		if s.tryClose() {
@@ -578,19 +705,21 @@ func itoa(n int) string {
 func write403(conn net.Conn, reason, body string) {
 	resp := "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: " + reason +
 		"\r\nContent-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	conn.Write([]byte(resp))
+	conn.SetWriteDeadline(time.Time{})
 }
 
 func handle(conn net.Conn) {
 	defer conn.Close()
 	tc := conn.(*net.TCPConn)
 	tc.SetNoDelay(true)
-	tc.SetReadBuffer(262144)
-	tc.SetWriteBuffer(262144)
+	tc.SetReadBuffer(524288)
+	tc.SetWriteBuffer(524288)
 	tc.SetKeepAlive(true)
 	tc.SetKeepAlivePeriod(30 * time.Second)
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 8192)
 	n := 0
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	for n < len(buf) {
@@ -629,8 +758,10 @@ func handle(conn net.Conn) {
 		return
 	}
 
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: " +
 		name + "\r\nX-User-Days: " + itoa(days) + "\r\n\r\n"))
+	conn.SetWriteDeadline(time.Time{})
 
 	m := newMux(conn)
 	if prev, loaded := activeSessions.Swap(userID, m); loaded {
