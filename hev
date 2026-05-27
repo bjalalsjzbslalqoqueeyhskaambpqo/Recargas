@@ -139,26 +139,27 @@ import (
 )
 
 const (
-	hevAddr           = "127.0.0.1:1080"
-	listenAddr        = "0.0.0.0:80"
-	usersFile         = "/opt/btserver/users.txt"
-	tOpen             = byte(0x01)
-	tData             = byte(0x02)
-	tClose            = byte(0x03)
-	tPing             = byte(0x04)
-	tPong             = byte(0x05)
-	tKick             = byte(0x06)
-	tExpired          = byte(0x07)
-	maxStreams        = 8192
-	queueSize         = 512
+	hevAddr          = "127.0.0.1:1080"
+	listenAddr       = "0.0.0.0:80"
+	usersFile        = "/opt/btserver/users.txt"
+	tOpen            = byte(0x01)
+	tData            = byte(0x02)
+	tClose           = byte(0x03)
+	tPing            = byte(0x04)
+	tPong            = byte(0x05)
+	tKick            = byte(0x06)
+	tExpired         = byte(0x07)
+	maxStreams        = 2048
+	queueSize         = 256
 	dialTimeout       = 800 * time.Millisecond
 	hevConnTimeout    = 3 * time.Second
-	writeTimeout      = 8 * time.Second
+	hevWriteTimeout   = 2 * time.Second
+	clientWriteTimeout = 30 * time.Second
 	maxPayload        = 16384
-	streamIdleTimeout = 90 * time.Second
-	muxWriteQueueCap  = 8192
-	backpressureHigh  = 400
-	backpressureLow   = 128
+	streamIdleTimeout = 300 * time.Second
+	muxWriteQueueCap  = 1024
+	ctrlQueueCap      = 64
+	maxBatchFrames    = 32
 )
 
 type authResult int
@@ -227,16 +228,15 @@ func getPayload() []byte  { return *payloadPool.Get().(*[]byte) }
 func putPayload(b []byte) { payloadPool.Put(&b) }
 
 type stream struct {
-	q        chan []byte
-	resumeCh chan struct{}
-	closed   atomic.Uint32
-	lastAct  atomic.Int64
+	q           chan []byte
+	closed      atomic.Uint32
+	lastAct     atomic.Int64
+	workerCount atomic.Int32
 }
 
 func newStream() *stream {
 	s := &stream{
-		q:        make(chan []byte, queueSize),
-		resumeCh: make(chan struct{}, 1),
+		q: make(chan []byte, queueSize),
 	}
 	s.touch()
 	return s
@@ -254,20 +254,21 @@ func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
 func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
-	conn       net.Conn
-	writeQ     chan []byte
-	mu         sync.RWMutex
-	streams    map[uint32]*stream
-	count      atomic.Int32
-	dead       atomic.Uint32
-	queueDepth atomic.Int32
+	conn     net.Conn
+	writeQ   chan []byte
+	ctrlQ    chan []byte
+	mu       sync.RWMutex
+	streams  map[uint32]*stream
+	count    atomic.Int32
+	dead     atomic.Uint32
 }
 
 func newMux(conn net.Conn) *mux {
 	m := &mux{
 		conn:    conn,
 		writeQ:  make(chan []byte, muxWriteQueueCap),
-		streams: make(map[uint32]*stream, 256),
+		ctrlQ:   make(chan []byte, ctrlQueueCap),
+		streams: make(map[uint32]*stream, 64),
 	}
 	go m.writeLoop()
 	go m.idleReaper()
@@ -277,46 +278,77 @@ func newMux(conn net.Conn) *mux {
 func (m *mux) writeLoop() {
 	var bufs net.Buffers
 	var toFree [][]byte
-	for buf := range m.writeQ {
-		m.queueDepth.Add(-1)
-		bufs = append(bufs[:0], buf)
-		toFree = append(toFree[:0], buf)
-	drain:
-		for {
-			select {
-			case b := <-m.writeQ:
-				m.queueDepth.Add(-1)
-				bufs = append(bufs, b)
-				toFree = append(toFree, b)
-			default:
-				break drain
-			}
-		}
-		m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
+	flush := func() bool {
+		m.conn.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
 		_, werr := bufs.WriteTo(m.conn)
 		m.conn.SetWriteDeadline(time.Time{})
 		for _, b := range toFree {
 			putFrame(b[:cap(b)])
 		}
-		if werr != nil {
-			m.kill()
-			return
-		}
-		if m.queueDepth.Load() <= int32(backpressureLow) {
-			m.mu.RLock()
-			for _, s := range m.streams {
+		bufs = bufs[:0]
+		toFree = toFree[:0]
+		return werr == nil
+	}
+
+	for {
+		select {
+		case buf, ok := <-m.ctrlQ:
+			if !ok {
+				return
+			}
+			bufs = append(bufs, buf)
+			toFree = append(toFree, buf)
+		drain_ctrl:
+			for {
 				select {
-				case s.resumeCh <- struct{}{}:
+				case b, ok := <-m.ctrlQ:
+					if !ok {
+						return
+					}
+					bufs = append(bufs, b)
+					toFree = append(toFree, b)
 				default:
+					break drain_ctrl
 				}
 			}
-			m.mu.RUnlock()
+			if !flush() {
+				m.kill()
+				return
+			}
+
+		case buf, ok := <-m.writeQ:
+			if !ok {
+				return
+			}
+			bufs = append(bufs, buf)
+			toFree = append(toFree, buf)
+			batch := 1
+		drain_data:
+			for batch < maxBatchFrames {
+				select {
+				case b, ok := <-m.writeQ:
+					if !ok {
+						flush()
+						return
+					}
+					bufs = append(bufs, b)
+					toFree = append(toFree, b)
+					batch++
+				default:
+					break drain_data
+				}
+			}
+			if !flush() {
+				m.kill()
+				return
+			}
 		}
 	}
 }
 
 func (m *mux) idleReaper() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		if m.dead.Load() == 1 {
@@ -325,14 +357,14 @@ func (m *mux) idleReaper() {
 		var stale []uint32
 		m.mu.RLock()
 		for sid, s := range m.streams {
-			if s.idleSince() > streamIdleTimeout {
+			if s.workerCount.Load() == 0 && s.idleSince() > streamIdleTimeout {
 				stale = append(stale, sid)
 			}
 		}
 		m.mu.RUnlock()
 		for _, sid := range stale {
 			m.closeStream(sid)
-			m.sendHdr(tClose, sid)
+			m.sendCtrl(tClose, sid)
 		}
 	}
 }
@@ -341,6 +373,7 @@ func (m *mux) kill() {
 	if m.dead.CompareAndSwap(0, 1) {
 		m.conn.Close()
 		close(m.writeQ)
+		close(m.ctrlQ)
 	}
 }
 
@@ -350,49 +383,37 @@ func (m *mux) killWithReason(t byte) {
 	}
 	buf := make([]byte, 7)
 	buf[0] = t
-	m.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	m.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	m.conn.Write(buf)
 	m.conn.SetWriteDeadline(time.Time{})
 	time.Sleep(50 * time.Millisecond)
 	m.conn.Close()
 	close(m.writeQ)
+	close(m.ctrlQ)
 }
 
-func (m *mux) trySend(buf []byte) bool {
-	if m.dead.Load() == 1 {
-		return false
-	}
-	select {
-	case m.writeQ <- buf:
-		m.queueDepth.Add(1)
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *mux) send(t byte, sid uint32, data []byte) {
+func (m *mux) sendData(sid uint32, data []byte) {
 	if m.dead.Load() == 1 {
 		return
 	}
 	ln := len(data)
 	buf := getFrame()
-	buf[0] = t
+	buf[0] = tData
 	binary.BigEndian.PutUint32(buf[1:5], sid)
 	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
 	if ln > 0 {
 		copy(buf[7:7+ln], data)
 	}
-	if !m.trySend(buf[:7+ln]) {
+	select {
+	case m.writeQ <- buf[:7+ln]:
+	default:
 		putFrame(buf)
-		if t == tData {
-			m.sendHdr(tClose, sid)
-			m.closeStream(sid)
-		}
+		m.sendCtrl(tClose, sid)
+		m.closeStream(sid)
 	}
 }
 
-func (m *mux) sendHdr(t byte, sid uint32) {
+func (m *mux) sendCtrl(t byte, sid uint32) {
 	if m.dead.Load() == 1 {
 		return
 	}
@@ -400,7 +421,9 @@ func (m *mux) sendHdr(t byte, sid uint32) {
 	buf[0] = t
 	binary.BigEndian.PutUint32(buf[1:5], sid)
 	buf[5], buf[6] = 0, 0
-	if !m.trySend(buf[:7]) {
+	select {
+	case m.ctrlQ <- buf[:7]:
+	default:
 		putFrame(buf[:cap(buf)])
 	}
 }
@@ -448,7 +471,7 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 	defer func() {
 		if s.tryClose() {
 			m.delStream(sid)
-			m.sendHdr(tClose, sid)
+			m.sendCtrl(tClose, sid)
 			for range s.q {
 			}
 		}
@@ -479,51 +502,40 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// cliente -> hev: drena la queue del stream hacia hev-socks5
 	go func() {
 		defer wg.Done()
+		s.workerCount.Add(1)
+		defer s.workerCount.Add(-1)
 		for {
-			select {
-			case d, ok := <-s.q:
-				if !ok {
-					tc.CloseWrite()
-					return
-				}
-				s.touch()
-				hev.SetWriteDeadline(time.Now().Add(writeTimeout))
-				_, err := hev.Write(d)
-				putPayload(d[:cap(d)])
-				hev.SetWriteDeadline(time.Time{})
-				if err != nil {
-					tc.CloseWrite()
-					return
-				}
-			case <-s.resumeCh:
-				// señal de backpressure liberada, continuar
+			d, ok := <-s.q
+			if !ok {
+				tc.CloseWrite()
+				return
+			}
+			s.touch()
+			hev.SetWriteDeadline(time.Now().Add(hevWriteTimeout))
+			_, err := hev.Write(d)
+			putPayload(d[:cap(d)])
+			hev.SetWriteDeadline(time.Time{})
+			if err != nil {
+				tc.CloseWrite()
+				return
 			}
 		}
 	}()
 
-	// hev -> cliente: lee de hev-socks5 y envia al cliente via mux
 	go func() {
 		defer wg.Done()
+		s.workerCount.Add(1)
+		defer s.workerCount.Add(-1)
 		bufp := readBufPool.Get().(*[]byte)
 		buf := *bufp
 		defer readBufPool.Put(bufp)
 		for {
-			hev.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 			n, err := hev.Read(buf)
-			hev.SetReadDeadline(time.Time{})
 			if n > 0 {
 				s.touch()
-				// backpressure: si el mux esta saturado, esperar antes de enviar mas
-				if m.queueDepth.Load() > int32(backpressureHigh) {
-					select {
-					case <-s.resumeCh:
-					case <-time.After(500 * time.Millisecond):
-					}
-				}
-				m.send(tData, sid, buf[:n])
+				m.sendData(sid, buf[:n])
 			}
 			if err != nil {
 				return
@@ -539,7 +551,6 @@ func (m *mux) run() {
 	rb := make([]byte, maxPayload)
 
 	for {
-		// deadline generoso para keepalive: el cliente manda T_PING cada 3s
 		m.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		_, err := io.ReadFull(m.conn, hdr)
 		m.conn.SetReadDeadline(time.Time{})
@@ -556,7 +567,7 @@ func (m *mux) run() {
 		if ln > 0 {
 			m.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			_, err := io.ReadFull(m.conn, rb[:ln])
-			m.conn.SetReadDeadline(time.Time{})
+			m.conn.SetReadDeadline(time.Time{}	)
 			if err != nil {
 				break
 			}
@@ -564,15 +575,14 @@ func (m *mux) run() {
 
 		switch ft {
 		case tPing:
-			m.sendHdr(tPong, sid)
+			m.sendCtrl(tPong, sid)
 
 		case tPong:
-			// noop, el cliente trackea RTT
 
 		case tOpen:
 			s := newStream()
 			if !m.addStream(sid, s) {
-				m.sendHdr(tClose, sid)
+				m.sendCtrl(tClose, sid)
 				continue
 			}
 			var first []byte
@@ -590,20 +600,12 @@ func (m *mux) run() {
 			s.touch()
 			p := getPayload()[:ln]
 			copy(p, rb[:ln])
-			// si la queue del stream esta llena, cerrar limpiamente
-			// y notificar al cliente para que reconecte ese stream
-			if len(s.q) >= queueSize-1 {
-				putPayload(p[:cap(p)])
-				m.closeStream(sid)
-				m.sendHdr(tClose, sid)
-				continue
-			}
 			select {
 			case s.q <- p:
 			default:
 				putPayload(p[:cap(p)])
 				m.closeStream(sid)
-				m.sendHdr(tClose, sid)
+				m.sendCtrl(tClose, sid)
 			}
 
 		case tClose:
@@ -611,7 +613,6 @@ func (m *mux) run() {
 		}
 	}
 
-	// tunnel caido: cerrar todos los streams activos
 	m.mu.Lock()
 	for _, s := range m.streams {
 		if s.tryClose() {
@@ -817,6 +818,7 @@ func checkExpiredSessions() {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	debug.SetMemoryLimit(768 << 20)
+	debug.SetGCPercent(20)
 
 	go func() {
 		for {
