@@ -149,16 +149,16 @@ const (
 	tPong            = byte(0x05)
 	tKick            = byte(0x06)
 	tExpired         = byte(0x07)
-	maxStreams        = 2048
+	maxStreams        = 5000
 	queueSize         = 256
-	dialTimeout       = 800 * time.Millisecond
+	dialTimeout       = 400 * time.Millisecond
 	hevConnTimeout    = 3 * time.Second
 	hevWriteTimeout   = 2 * time.Second
 	clientWriteTimeout = 30 * time.Second
 	maxPayload        = 16384
-	streamIdleTimeout = 300 * time.Second
+	streamIdleTimeout = 600 * time.Second
 	muxWriteQueueCap  = 1024
-	ctrlQueueCap      = 64
+	ctrlQueueCap      = 256
 	maxBatchFrames    = 32
 )
 
