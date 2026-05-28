@@ -139,27 +139,27 @@ import (
 )
 
 const (
-	hevAddr          = "127.0.0.1:1080"
-	listenAddr       = "0.0.0.0:80"
-	usersFile        = "/opt/btserver/users.txt"
-	tOpen            = byte(0x01)
-	tData            = byte(0x02)
-	tClose           = byte(0x03)
-	tPing            = byte(0x04)
-	tPong            = byte(0x05)
-	tKick            = byte(0x06)
-	tExpired         = byte(0x07)
-	maxStreams        = 7000
-	queueSize         = 256
-	dialTimeout       = 900 * time.Millisecond
-	hevConnTimeout    = 3 * time.Second
-	hevWriteTimeout   = 2 * time.Second
-	clientWriteTimeout = 30 * time.Second
-	maxPayload        = 16384
-	streamIdleTimeout = 600 * time.Second
-	muxWriteQueueCap  = 2048
-	ctrlQueueCap      = 300
-	maxBatchFrames    = 64
+	hevAddr            = "127.0.0.1:1080"
+	listenAddr         = "0.0.0.0:80"
+	usersFile          = "/opt/btserver/users.txt"
+	tOpen              = byte(0x01)
+	tData              = byte(0x02)
+	tClose             = byte(0x03)
+	tPing              = byte(0x04)
+	tPong              = byte(0x05)
+	tKick              = byte(0x06)
+	tExpired           = byte(0x07)
+	maxStreams          = 7000
+	queueSize           = 256
+	dialTimeout         = 200 * time.Millisecond
+	hevConnTimeout      = 1 * time.Second
+	hevWriteTimeout     = 2 * time.Second
+	clientWriteTimeout  = 30 * time.Second
+	maxPayload          = 16384
+	streamIdleTimeout   = 600 * time.Second
+	muxWriteQueueCap    = 2048
+	ctrlQueueCap        = 128
+	maxBatchFrames      = 64
 )
 
 type authResult int
@@ -235,9 +235,7 @@ type stream struct {
 }
 
 func newStream() *stream {
-	s := &stream{
-		q: make(chan []byte, queueSize),
-	}
+	s := &stream{q: make(chan []byte, queueSize)}
 	s.touch()
 	return s
 }
@@ -254,13 +252,13 @@ func (s *stream) tryClose() bool { return s.closed.CompareAndSwap(0, 1) }
 func (s *stream) isClosed() bool { return s.closed.Load() == 1 }
 
 type mux struct {
-	conn     net.Conn
-	writeQ   chan []byte
-	ctrlQ    chan []byte
-	mu       sync.RWMutex
-	streams  map[uint32]*stream
-	count    atomic.Int32
-	dead     atomic.Uint32
+	conn    net.Conn
+	writeQ  chan []byte
+	ctrlQ   chan []byte
+	mu      sync.RWMutex
+	streams map[uint32]*stream
+	count   atomic.Int32
+	dead    atomic.Uint32
 }
 
 func newMux(conn net.Conn) *mux {
@@ -268,7 +266,7 @@ func newMux(conn net.Conn) *mux {
 		conn:    conn,
 		writeQ:  make(chan []byte, muxWriteQueueCap),
 		ctrlQ:   make(chan []byte, ctrlQueueCap),
-		streams: make(map[uint32]*stream, 64),
+		streams: make(map[uint32]*stream, 128),
 	}
 	go m.writeLoop()
 	go m.idleReaper()
@@ -408,8 +406,8 @@ func (m *mux) sendData(sid uint32, data []byte) {
 	case m.writeQ <- buf[:7+ln]:
 	default:
 		putFrame(buf)
-		m.sendCtrl(tClose, sid)
 		m.closeStream(sid)
+		m.sendCtrl(tClose, sid)
 	}
 }
 
@@ -457,13 +455,23 @@ func (m *mux) delStream(sid uint32) {
 
 func (m *mux) closeStream(sid uint32) {
 	s := m.getStream(sid)
-	if s != nil && s.tryClose() {
-		m.delStream(sid)
-		close(s.q)
-		go func() {
-			for range s.q {
+	if s == nil || !s.tryClose() {
+		return
+	}
+	m.delStream(sid)
+	for {
+		select {
+		case p, ok := <-s.q:
+			if !ok {
+				return
 			}
-		}()
+			if p != nil {
+				putPayload(p[:cap(p)])
+			}
+		default:
+			close(s.q)
+			return
+		}
 	}
 }
 
@@ -472,7 +480,19 @@ func (m *mux) handleStream(sid uint32, s *stream, first []byte) {
 		if s.tryClose() {
 			m.delStream(sid)
 			m.sendCtrl(tClose, sid)
-			for range s.q {
+			for {
+				select {
+				case p, ok := <-s.q:
+					if !ok {
+						return
+					}
+					if p != nil {
+						putPayload(p[:cap(p)])
+					}
+				default:
+					close(s.q)
+					return
+				}
 			}
 		}
 	}()
@@ -567,7 +587,7 @@ func (m *mux) run() {
 		if ln > 0 {
 			m.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			_, err := io.ReadFull(m.conn, rb[:ln])
-			m.conn.SetReadDeadline(time.Time{}	)
+			m.conn.SetReadDeadline(time.Time{})
 			if err != nil {
 				break
 			}
@@ -614,12 +634,14 @@ func (m *mux) run() {
 	}
 
 	m.mu.Lock()
-	for _, s := range m.streams {
-		if s.tryClose() {
-			close(s.q)
-		}
+	sids := make([]uint32, 0, len(m.streams))
+	for sid := range m.streams {
+		sids = append(sids, sid)
 	}
 	m.mu.Unlock()
+	for _, sid := range sids {
+		m.closeStream(sid)
+	}
 }
 
 var activeSessions = sync.Map{}
