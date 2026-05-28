@@ -149,17 +149,17 @@ const (
 	tPong            = byte(0x05)
 	tKick            = byte(0x06)
 	tExpired         = byte(0x07)
-	maxStreams        = 5000
+	maxStreams        = 7000
 	queueSize         = 256
-	dialTimeout       = 400 * time.Millisecond
+	dialTimeout       = 900 * time.Millisecond
 	hevConnTimeout    = 3 * time.Second
 	hevWriteTimeout   = 2 * time.Second
 	clientWriteTimeout = 30 * time.Second
 	maxPayload        = 16384
 	streamIdleTimeout = 600 * time.Second
-	muxWriteQueueCap  = 1024
-	ctrlQueueCap      = 256
-	maxBatchFrames    = 32
+	muxWriteQueueCap  = 2048
+	ctrlQueueCap      = 300
+	maxBatchFrames    = 64
 )
 
 type authResult int
