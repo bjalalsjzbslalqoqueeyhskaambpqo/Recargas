@@ -64,6 +64,12 @@ misc:
   limit-nofile: 1000000
 YMLEOF
 
+info "Instalando dependencias del sistema..."
+apt-get update -qq --fix-missing 2>/dev/null || true
+apt-get install -y -qq build-essential pkg-config libssl-dev 2>/dev/null \
+    || die "No se pudo instalar build-essential"
+info "build-essential OK"
+
 info "Verificando Rust..."
 if ! command -v cargo >/dev/null 2>&1; then
     info "Instalando Rust (rustup)..."
