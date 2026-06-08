@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,13 +28,8 @@ jobs:
         run: |
           mkdir -p btsrc/src/bin
 
-          # Extraer Cargo.toml
           sed -n '/^cat > "\$PROJ\/Cargo.toml"/,/^TOMLEOF$/{ /^cat /d; /^TOMLEOF$/d; p }' Rusthevsocks5.sh > btsrc/Cargo.toml
-
-          # Extraer btserver.rs
           sed -n "/^cat > \"\$PROJ\/src\/bin\/btserver.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/btserver.rs
-
-          # Extraer panel.rs
           sed -n "/^cat > \"\$PROJ\/src\/bin\/panel.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/panel.rs
 
           echo "--- Cargo.toml preview ---"
@@ -77,7 +75,7 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: "Build #${{ github.run_number }}"
           body: |
-            Binarios compilados automáticamente desde `Rusthevsocks5.sh`
+            Binarios compilados desde Rusthevsocks5.sh
             Commit: ${{ github.sha }}
           files: |
             dist/btserver
