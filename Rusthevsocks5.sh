@@ -456,8 +456,7 @@ async fn write_loop(
     mut ctrl_rx:  mpsc::Receiver<Bytes>,
     mux:          Arc<Mux>,
 ) {
-    let mut batch: Vec<Bytes>      = Vec::with_capacity(MAX_BATCH);
-    let mut slices: Vec<IoSlice>   = Vec::with_capacity(MAX_BATCH);
+    let mut batch: Vec<Bytes>       = Vec::with_capacity(MAX_BATCH);
     let mut leftover: Option<Bytes> = None;
 
     'outer: loop {
@@ -491,14 +490,16 @@ async fn write_loop(
         let total: usize = batch.iter().map(|b| b.len()).sum();
 
         loop {
-            slices.clear();
-            let mut off = 0usize;
-            for b in &batch {
-                if off + b.len() <= written { off += b.len(); continue; }
-                let skip = written.saturating_sub(off);
-                slices.push(IoSlice::new(&b[skip..]));
-                off += b.len();
-            }
+            let slices: Vec<IoSlice> = {
+                let mut off = 0usize;
+                batch.iter().filter_map(|b| {
+                    let start = off;
+                    off += b.len();
+                    if start + b.len() <= written { return None; }
+                    let skip = written.saturating_sub(start);
+                    Some(IoSlice::new(&b[skip..]))
+                }).collect()
+            };
             if slices.is_empty() { break; }
 
             match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_vectored(&slices)).await {
