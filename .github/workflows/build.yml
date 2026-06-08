@@ -11,20 +11,24 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: debian:12
 
     steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y build-essential pkg-config libssl-dev curl git ca-certificates
+
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential pkg-config libssl-dev
-
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Extract Cargo.toml and source files from scripty
+      - name: Extract source files from script
         run: |
           mkdir -p btsrc/src/bin
 
@@ -46,13 +50,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             btsrc/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('btsrc/Cargo.toml') }}
+          key: debian12-cargo-${{ hashFiles('btsrc/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            debian12-cargo-
 
       - name: Build release binaries
         working-directory: btsrc
-        run: cargo build --release
+        run: ~/.cargo/bin/cargo build --release
 
       - name: Prepare artifacts
         run: |
@@ -61,11 +65,12 @@ jobs:
           cp btsrc/target/release/panel    dist/panel
           chmod +x dist/btserver dist/panel
           ls -lh dist/
+          ldd dist/btserver | grep libc
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: btserver-binaries
+          name: btserver-binaries-debian12
           path: dist/
           retention-days: 30
 
@@ -73,9 +78,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: "Build #${{ github.run_number }}"
+          name: "Build #${{ github.run_number }} (Debian 12)"
           body: |
-            Binarios compilados desde Rusthevsocks5.sh
+            Binarios compilados en Debian 12 (GLIBC 2.36)
             Commit: ${{ github.sha }}
           files: |
             dist/btserver
