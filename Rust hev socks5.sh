@@ -184,9 +184,13 @@ const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
-    let out = std::process::Command::new("date").arg("+%z").output().unwrap_or_default();
-    let s = String::from_utf8_lossy(&out.stdout);
-    let s = s.trim();
+    let stdout = std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let s = stdout.trim();
     if s.len() < 5 { return 0; }
     let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
     let h: i64 = s[1..3].parse().unwrap_or(0);
@@ -853,9 +857,13 @@ const TOKEN_PATH: &str = "/opt/btserver/token.txt";
 const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
-    let out = std::process::Command::new("date").arg("+%z").output().unwrap_or_default();
-    let s = String::from_utf8_lossy(&out.stdout);
-    let s = s.trim();
+    let stdout = std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let s = stdout.trim();
     if s.len() < 5 { return 0; }
     let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
     let h: i64 = s[1..3].parse().unwrap_or(0);
