@@ -24,7 +24,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Extract Cargo.toml and source files from script
+      - name: Extract Cargo.toml and source files from scripty
         run: |
           mkdir -p btsrc/src/bin
 
