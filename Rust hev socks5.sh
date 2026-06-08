@@ -522,16 +522,15 @@ async fn handle_stream(
     mut rx: mpsc::Receiver<Bytes>,
     first:  Bytes,
 ) {
-    let cleanup = || async {
-        if stream.try_close() {
-            mux.del_stream(sid).await;
-            mux.send_ctrl(T_CLOSE, sid).await;
-        }
-    };
-
     let hev = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(HEV_ADDR)).await {
         Ok(Ok(c)) => c,
-        _ => { cleanup().await; return; }
+        _ => {
+            if stream.try_close() {
+                mux.del_stream(sid).await;
+                mux.send_ctrl(T_CLOSE, sid).await;
+            }
+            return;
+        }
     };
     tune_hev_fd(hev.as_raw_fd());
 
@@ -539,7 +538,10 @@ async fn handle_stream(
 
     if !first.is_empty() {
         if tokio::time::timeout(HEV_CONN_TIMEOUT, hev_w.write_all(&first)).await.is_err() {
-            cleanup().await;
+            if stream.try_close() {
+                mux.del_stream(sid).await;
+                mux.send_ctrl(T_CLOSE, sid).await;
+            }
             return;
         }
     }
@@ -571,7 +573,10 @@ async fn handle_stream(
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
-    cleanup().await;
+    if mux.get_stream(sid).await.map(|s| s.try_close()).unwrap_or(false) {
+        mux.del_stream(sid).await;
+        mux.send_ctrl(T_CLOSE, sid).await;
+    }
 }
 
 async fn idle_reaper(mux: Arc<Mux>) {
@@ -1236,7 +1241,7 @@ LIMITS
 
 info "Compilando (primera vez: 3-5 min)..."
 cd "$PROJ"
-cargo build --release 2>&1 | grep -E "^error|Compiling|Finished" || true
+cargo build --release 2>&1 | grep -E "^error|^warning.*unused|Compiling|Finished" || true
 
 [ -f "$PROJ/target/release/btserver" ] || die "Error compilando btserver"
 [ -f "$PROJ/target/release/panel"    ] || die "Error compilando panel"
