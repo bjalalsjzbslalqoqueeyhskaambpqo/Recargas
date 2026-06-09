@@ -1,4 +1,5 @@
 #!/bin/bash
+# Actualizado: 2026-06-09 10:30 - Nueva version btserver.rs (optimizado)
 set -e
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -93,7 +94,6 @@ PROJ=/opt/btserver/btsrc
 rm -rf "$PROJ"
 mkdir -p "$PROJ/src/bin"
 
-# ─── Cargo.toml ────────────────────────────────────────────────────────────────
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
@@ -131,17 +131,7 @@ strip         = true
 panic         = "abort"
 TOMLEOF
 
-# ─── btserver.rs ───────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-//! btserver v5 — correcciones de performance vs v4
-//!
-//! Problemas de v4 corregidos:
-//!   1. tokio::sync::RwLock en hot-path → sustituido por DashMap (síncrono, sin await)
-//!   2. Bytes::freeze() creaba un Arc oculto por cada frame → pool de Vec<u8> directo
-//!   3. Vec<IoSlice> re-allocado en cada retry del write loop → avance por offset
-//!   4. SessionMap con RwLock global → DashMap sin contención entre sesiones
-//!   5. send_data/get_stream eran async → ahora síncronos en todo el hot-path
-
 use std::{
     collections::HashMap,
     io::IoSlice,
@@ -155,7 +145,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
@@ -170,30 +160,27 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-// ── Constantes ──────────────────────────────────────────────────────────────────
-
-const HEV_ADDR:             &str     = "127.0.0.1:1080";
-const LISTEN_ADDR:          &str     = "0.0.0.0:80";
-const KICK_ADDR:            &str     = "127.0.0.1:8091";
+const HEV_ADDR:&str     = "127.0.0.1:1080";
+const LISTEN_ADDR:         &str     = "0.0.0.0:80";
+const KICK_ADDR:           &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 256;
+const QUEUE_SIZE:           usize    = 64;
 const MAX_PAYLOAD:          usize    = 16384;
 const DIAL_TIMEOUT:         Duration = Duration::from_millis(200);
-const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(1);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(2);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
-const MUX_WRITE_QUEUE:      usize    = 2048;
-const CTRL_QUEUE:           usize    = 128;
-const MAX_BATCH:            usize    = 64;
+const MUX_WRITE_QUEUE:      usize    = 4096;
+const CTRL_QUEUE:           usize    = 256;
+const MAX_BATCH:            usize    = 128;
 const READ_DEADLINE:        Duration = Duration::from_secs(120);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(30);
 const HEV_RCVBUF:           i32      = 524288;
 const HEV_SNDBUF:           i32      = 524288;
 const CLI_RCVBUF:           i32      = 524288;
 const CLI_SNDBUF:           i32      = 524288;
-const POOL_PREALLOC:        usize    = 4096;
+const POOL_PREALLOC:        usize    = 8192;
 
 const T_OPEN:    u8 = 0x01;
 const T_DATA:    u8 = 0x02;
@@ -202,8 +189,6 @@ const T_PING:    u8 = 0x04;
 const T_PONG:    u8 = 0x05;
 const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
-
-// ── Timezone ────────────────────────────────────────────────────────────────────
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
     let out = std::process::Command::new("date").arg("+%z").output()
@@ -220,8 +205,6 @@ static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
-
-// ── Calendarios ─────────────────────────────────────────────────────────────────
 
 fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
     let m2 = if m <= 2 { m + 12 } else { m };
@@ -259,11 +242,9 @@ fn ts_to_date(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-// ── Auth ────────────────────────────────────────────────────────────────────────
-
 enum AuthResult { Ok { name: String, days: i64 }, NotFound, Expired }
 
-fn check_auth(id: &str) -> AuthResult {
+fn check_auth(id:&str) -> AuthResult {
     let Ok(content) = std::fs::read_to_string(USERS_FILE) else {
         return AuthResult::NotFound;
     };
@@ -282,13 +263,6 @@ fn check_auth(id: &str) -> AuthResult {
     }
     AuthResult::NotFound
 }
-
-// ── BufPool ─────────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4 usaba BytesMut → freeze() que crea un Arc interno por cada frame.
-//   Aquí el pool maneja Vec<u8>. Solo hacemos Bytes::from(vec) al meter en el
-//   channel — un único Arc por frame, vida mínima, sin doble-alloc.
 
 #[derive(Clone)]
 struct BufPool(Arc<SegQueue<Vec<u8>>>);
@@ -318,31 +292,39 @@ impl BufPool {
     }
 
     #[inline(always)]
+    fn write_hdr(v: &mut Vec<u8>, t: u8, sid: u32, len: u16) {
+        let sid_b = sid.to_be_bytes();
+        let len_b = len.to_be_bytes();
+        unsafe {
+            let p = v.as_mut_ptr().add(v.len());
+            p.write(t);
+            p.add(1).copy_from(sid_b.as_ptr(), 4);
+            p.add(5).copy_from(len_b.as_ptr(), 2);
+            let new_len = v.len() + 7;
+            v.set_len(new_len);
+        }
+    }
+
+    #[inline(always)]
     fn ctrl(&self, t: u8, sid: u32) -> Bytes {
         let mut v = self.get(7);
-        v.push(t);
-        v.extend_from_slice(&sid.to_be_bytes());
-        v.push(0); v.push(0);
+        Self::write_hdr(&mut v, t, sid, 0);
         Bytes::from(v)
     }
 
     #[inline(always)]
     fn data_frame(&self, sid: u32, payload: &[u8]) -> Bytes {
         let mut v = self.get(7 + payload.len());
-        v.push(T_DATA);
-        v.extend_from_slice(&sid.to_be_bytes());
-        v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        Self::write_hdr(&mut v, T_DATA, sid, payload.len() as u16);
         v.extend_from_slice(payload);
         Bytes::from(v)
     }
 }
 
-// ── Syscall helpers ─────────────────────────────────────────────────────────────
-
 #[inline(always)]
 unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
     libc::setsockopt(fd, level, opt,
-        &val as *const i32 as *const libc::c_void,
+       &val as *const i32 as *const libc::c_void,
         std::mem::size_of::<i32>() as libc::socklen_t);
 }
 
@@ -357,7 +339,6 @@ fn tune_client_fd(fd: i32) {
 fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,   1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK,  1);
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,     HEV_RCVBUF);
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,     HEV_SNDBUF);
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE,  1);
@@ -367,39 +348,29 @@ fn tune_hev_fd(fd: i32) {
     }
 }
 
-// ── Stream ──────────────────────────────────────────────────────────────────────
-
 struct Stream {
-    tx:           mpsc::Sender<Bytes>,
-    closed:       AtomicBool,
-    last_act:     AtomicI64,
-    worker_count: AtomicI32,
+    tx:       mpsc::Sender<Bytes>,
+    closed:   AtomicBool,
+    last_act: AtomicI64,
+    workers:  AtomicI32,
 }
 
 impl Stream {
     fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
         Arc::new(Self {
             tx,
-            closed:       AtomicBool::new(false),
-            last_act:     AtomicI64::new(now_secs()),
-            worker_count: AtomicI32::new(0),
+            closed:   AtomicBool::new(false),
+            last_act: AtomicI64::new(now_secs()),
+            workers:  AtomicI32::new(0),
         })
     }
-    #[inline(always)] fn touch(&self) { self.last_act.store(now_secs(), Ordering::Relaxed); }
+    #[inline(always)] fn touch(&self)       { self.last_act.store(now_secs(), Ordering::Relaxed); }
     #[inline(always)] fn idle_secs(&self) -> i64 { now_secs() - self.last_act.load(Ordering::Relaxed) }
     #[inline(always)] fn try_close(&self) -> bool {
         self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
     #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
 }
-
-// ── Mux ─────────────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: RwLock<HashMap> → cada get_stream() era async, podía hacer yield al scheduler
-//   v5: DashMap → síncrono, sin await, lock-free por shards (igual que sync.Map de Go)
-//
-//   Así get_stream_sync/send_data_sync no tienen await en el hot-path de T_DATA.
 
 struct Mux {
     write_tx: mpsc::Sender<Bytes>,
@@ -423,43 +394,35 @@ impl Mux {
 
     #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
 
-    // HOT PATH — todo síncrono, sin await ─────────────────────────────────────
-
     #[inline(always)]
-    fn get_stream_sync(&self, sid: u32) -> Option<Arc<Stream>> {
+    fn get_stream(&self, sid: u32) -> Option<Arc<Stream>> {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
     #[inline(always)]
-    fn send_data_sync(&self, sid: u32, data: &[u8]) {
+    fn send_data(&self, sid: u32, data: &[u8]) {
         if self.is_dead() { return; }
         let frame = self.pool.data_frame(sid, data);
         if self.write_tx.try_send(frame).is_err() {
-            self.close_stream_sync(sid);
+            self.close_stream(sid);
             let _ = self.ctrl_tx.try_send(self.pool.ctrl(T_CLOSE, sid));
         }
     }
 
     #[inline(always)]
-    fn send_ctrl_sync(&self, t: u8, sid: u32) {
+    fn send_ctrl(&self, t: u8, sid: u32) {
         if self.is_dead() { return; }
         let _ = self.ctrl_tx.try_send(self.pool.ctrl(t, sid));
     }
 
-    fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
+    fn add_stream(&self, sid: u32, s: Arc<Stream>) -> bool {
         if self.count.load(Ordering::Relaxed) as usize >= MAX_STREAMS { return false; }
         self.streams.insert(sid, s);
         self.count.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    fn del_stream_sync(&self, sid: u32) {
-        if self.streams.remove(&sid).is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    fn close_stream_sync(&self, sid: u32) {
+    fn close_stream(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
             if s.try_close() {
                 self.count.fetch_sub(1, Ordering::Relaxed);
@@ -468,15 +431,9 @@ impl Mux {
     }
 }
 
-// ── SessionMap ──────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: RwLock<HashMap> → write lock global bloqueaba TODAS las sesiones
-//   v5: DashMap → cada shard es independiente, inserciones no se bloquean entre sí
-
 type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
 
-fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
+fn kick_session(sessions:&SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
         let _ = mux.ctrl_tx.try_send(mux.pool.ctrl(reason, 0));
         mux.dead.store(true, Ordering::Release);
@@ -486,12 +443,6 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
         false
     }
 }
-
-// ── Write loop ──────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: Vec<IoSlice> re-allocado en CADA iteración del retry loop
-//   v5: batch construido una vez, retry avanza con 'skip' aritmético sin re-alloc
 
 async fn write_loop(
     mut writer:   OwnedWriteHalf,
@@ -527,7 +478,6 @@ async fn write_loop(
         let mut skip = 0usize;
 
         loop {
-            // Construir IoSlices avanzando 'skip' — sin Vec allocation
             let mut off = 0usize;
             let slices: Vec<IoSlice<'_>> = batch.iter().filter_map(|b| {
                 let start = off;
@@ -544,7 +494,6 @@ async fn write_loop(
                 Ok(Ok(n)) => {
                     skip += n;
                     if skip >= total { break; }
-                    // write parcial — retry sin re-alloc del batch
                 }
                 _ => { mux.dead.store(true, Ordering::Release); break 'outer; }
             }
@@ -553,8 +502,6 @@ async fn write_loop(
 
     mux.dead.store(true, Ordering::Release);
 }
-
-// ── handle_stream ───────────────────────────────────────────────────────────────
 
 async fn handle_stream(
     mux:    Arc<Mux>,
@@ -566,8 +513,8 @@ async fn handle_stream(
     let hev = match time::timeout(DIAL_TIMEOUT, TcpStream::connect(HEV_ADDR)).await {
         Ok(Ok(c)) => c,
         _ => {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_sync(T_CLOSE, sid);
+            mux.close_stream(sid);
+            mux.send_ctrl(T_CLOSE, sid);
             return;
         }
     };
@@ -575,9 +522,9 @@ async fn handle_stream(
     let (mut hev_r, mut hev_w) = hev.into_split();
 
     if !first.is_empty() {
-        if time::timeout(HEV_CONN_TIMEOUT, hev_w.write_all(&first)).await.is_err() {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_sync(T_CLOSE, sid);
+        if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&first)).await.is_err() {
+            mux.close_stream(sid);
+            mux.send_ctrl(T_CLOSE, sid);
             return;
         }
     }
@@ -585,63 +532,59 @@ async fn handle_stream(
     let mux2    = mux.clone();
     let stream2 = stream.clone();
 
-    // client → hev
     let t_c2h = tokio::spawn(async move {
-        stream2.worker_count.fetch_add(1, Ordering::Relaxed);
+        stream2.workers.fetch_add(1, Ordering::Relaxed);
         while let Some(data) = rx.recv().await {
             stream2.touch();
             if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await.is_err() {
                 break;
             }
         }
-        stream2.worker_count.fetch_sub(1, Ordering::Relaxed);
+        stream2.workers.fetch_sub(1, Ordering::Relaxed);
     });
 
-    // hev → client  (send_data_sync: sin await, directo al try_send)
     let t_h2c = tokio::spawn(async move {
-        stream.worker_count.fetch_add(1, Ordering::Relaxed);
+        stream.workers.fetch_add(1, Ordering::Relaxed);
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
             match hev_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     stream.touch();
-                    mux2.send_data_sync(sid, &buf[..n]);
+                    mux2.send_data(sid, &buf[..n]);
                 }
             }
         }
-        stream.worker_count.fetch_sub(1, Ordering::Relaxed);
+        stream.workers.fetch_sub(1, Ordering::Relaxed);
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
-    mux.close_stream_sync(sid);
-    mux.send_ctrl_sync(T_CLOSE, sid);
+    mux.close_stream(sid);
+    mux.send_ctrl(T_CLOSE, sid);
 }
-
-// ── idle_reaper ─────────────────────────────────────────────────────────────────
 
 async fn idle_reaper(mux: Arc<Mux>) {
     let mut tick = time::interval(Duration::from_secs(60));
     loop {
         tick.tick().await;
         if mux.is_dead() { return; }
+
         let stale: Vec<u32> = mux.streams.iter()
             .filter(|r| {
                 let s = r.value();
-                s.worker_count.load(Ordering::Relaxed) == 0
+                s.workers.load(Ordering::Relaxed) == 0
                     && !s.is_closed()
                     && s.idle_secs() > STREAM_IDLE_TIMEOUT
             })
             .map(|r| *r.key())
             .collect();
+
         for sid in stale {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_sync(T_CLOSE, sid);
+            mux.close_stream(sid);
+            mux.send_ctrl(T_CLOSE, sid);
         }
     }
 }
-
-// ── mux_run ─────────────────────────────────────────────────────────────────────
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut hdr  = [0u8; 7];
@@ -666,7 +609,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
         }
 
         match ft {
-            T_PING => { mux.send_ctrl_sync(T_PONG, sid); }
+            T_PING => { mux.send_ctrl(T_PONG, sid); }
             T_PONG => {}
 
             T_OPEN => {
@@ -677,39 +620,36 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
                 let s = Stream::new(tx);
-                if !mux.add_stream_sync(sid, s.clone()) {
-                    mux.send_ctrl_sync(T_CLOSE, sid);
+                if !mux.add_stream(sid, s.clone()) {
+                    mux.send_ctrl(T_CLOSE, sid);
                     continue;
                 }
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
             }
 
-            // HOT PATH — todo síncrono, sin await
             T_DATA => {
-                if let Some(s) = mux.get_stream_sync(sid) {
+                if let Some(s) = mux.get_stream(sid) {
                     if !s.is_closed() {
                         s.touch();
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
                         if s.tx.try_send(payload).is_err() {
-                            mux.close_stream_sync(sid);
-                            mux.send_ctrl_sync(T_CLOSE, sid);
+                            mux.close_stream(sid);
+                            mux.send_ctrl(T_CLOSE, sid);
                         }
                     }
                 }
             }
 
-            T_CLOSE => { mux.close_stream_sync(sid); }
+            T_CLOSE => { mux.close_stream(sid); }
             _ => {}
         }
     }
 
     let sids: Vec<u32> = mux.streams.iter().map(|r| *r.key()).collect();
-    for sid in sids { mux.close_stream_sync(sid); }
+    for sid in sids { mux.close_stream(sid); }
 }
 
-// ── Parser HTTP ─────────────────────────────────────────────────────────────────
-
-fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
+fn extract_header<'a>(raw:&'a [u8], needle: &[u8]) -> Option<&'a str> {
     for line in raw.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() <= needle.len() { continue; }
@@ -726,8 +666,6 @@ async fn send_403(writer: &mut OwnedWriteHalf, reason: &str) {
     );
     let _ = writer.write_all(body.as_bytes()).await;
 }
-
-// ── handle_conn ─────────────────────────────────────────────────────────────────
 
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     tune_client_fd(tcp.as_raw_fd());
@@ -775,7 +713,6 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
     let mux = Mux::new(write_tx, ctrl_tx, pool);
 
-    // DashMap.insert() síncrono — sin write lock global
     if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
         let _ = prev_mux.ctrl_tx.try_send(prev_mux.pool.ctrl(T_KICK, 0));
         prev_mux.dead.store(true, Ordering::Release);
@@ -785,11 +722,8 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
     mux_run(mux.clone(), reader).await;
 
-    // remove_if síncrono — sin write lock global
     sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
 }
-
-// ── Kick API ────────────────────────────────────────────────────────────────────
 
 async fn kick_api(sessions: SessionMap) {
     use axum::{extract::{Query, State}, routing::get, Router};
@@ -806,7 +740,7 @@ async fn kick_api(sessions: SessionMap) {
         } else {
             T_KICK
         };
-        if kick_session_sync(&s, id, reason) { "kicked".into() } else { "not_connected".into() }
+        if kick_session(&s, id, reason) { "kicked".into() } else { "not_connected".into() }
     }
 
     let app = Router::new().route("/kick", get(kick_handler)).with_state(sessions);
@@ -814,8 +748,6 @@ async fn kick_api(sessions: SessionMap) {
     info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
 }
-
-// ── Midnight sweep ───────────────────────────────────────────────────────────────
 
 async fn midnight_sweep(sessions: SessionMap) {
     loop {
@@ -829,14 +761,12 @@ async fn midnight_sweep(sessions: SessionMap) {
                 AuthResult::Expired   => T_EXPIRED,
                 AuthResult::NotFound  => T_KICK,
             };
-            kick_session_sync(&sessions, &id, reason);
+            kick_session(&sessions, &id, reason);
             kicked += 1;
         }
         if kicked > 0 { info!("midnight sweep: kicked {kicked}"); }
     }
 }
-
-// ── Listener ────────────────────────────────────────────────────────────────────
 
 fn build_listener() -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
@@ -858,8 +788,6 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
     sock.listen(65535)?;
     Ok(sock.into())
 }
-
-// ── main ────────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -895,7 +823,6 @@ async fn main() -> Result<()> {
 }
 RSEOF
 
-# ─── panel.rs (sin cambios funcionales respecto a v4) ──────────────────────────
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
 use std::{
     collections::HashMap,
@@ -917,8 +844,8 @@ use tracing::info;
 
 const PANEL_ADDR: &str = "0.0.0.0:8090";
 const USERS_PATH: &str = "/opt/btserver/users.txt";
-const TOKEN_PATH: &str = "/opt/btserver/token.txt";
-const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
+const TOKEN_PATH:&str = "/opt/btserver/token.txt";
+const KICK_BASE: &str = "http://127.0.0.1:8091/kick?id=";
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
     let out = std::process::Command::new("date").arg("+%z").output()
