@@ -558,7 +558,7 @@ async fn write_loop(
 }
 
 async fn handle_conn(conn: TcpStream, sessions: SessionMap, pool: BufPool) {
-    let (reader, mut writer) = conn.into_split();
+    let (mut reader, mut writer) = conn.into_split();
     tune_client_fd(reader.as_ref().as_raw_fd());
 
     let mut buf = [0u8; 4096];
@@ -754,6 +754,7 @@ use anyhow::Result;
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -923,7 +924,7 @@ async fn handle_clients(
     State(st): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> ApiResult {
+) -> impl IntoResponse {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let _l = st.users_mu.lock().unwrap();
     let users = load_users();
@@ -940,7 +941,7 @@ async fn handle_client(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(p): Query<HashMap<String, String>>,
-) -> ApiResult {
+) -> impl IntoResponse {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = match p.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         Some(id) => id,
@@ -962,7 +963,7 @@ async fn handle_create(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateBody>,
-) -> ApiResult {
+) -> impl IntoResponse {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = body.id.trim().to_string();
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
@@ -987,7 +988,7 @@ async fn handle_delete(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<IdBody>,
-) -> ApiResult {
+) -> impl IntoResponse {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = body.id.trim().to_string();
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
@@ -1015,7 +1016,7 @@ async fn handle_update(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<UpdateBody>,
-) -> ApiResult {
+) -> impl IntoResponse {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = body.id.trim().to_string();
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
