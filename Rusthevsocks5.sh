@@ -1,5 +1,4 @@
 #!/bin/bash
-# Actualizado: 2026-06-09 10:30 - Nueva version btserver.rs (optimizado)
 set -e
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -160,44 +159,44 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-const HEV_ADDR:&str     = "127.0.0.1:1080";
-const LISTEN_ADDR:         &str     = "0.0.0.0:80";
-const KICK_ADDR:           &str     = "127.0.0.1:8091";
-const USERS_FILE:           &str     = "/opt/btserver/users.txt";
-const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 64;
-const MAX_PAYLOAD:          usize    = 16384;
-const DIAL_TIMEOUT:         Duration = Duration::from_millis(200);
-const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(2);
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT:  i64      = 600;
-const MUX_WRITE_QUEUE:      usize    = 4096;
-const CTRL_QUEUE:           usize    = 256;
-const MAX_BATCH:            usize    = 128;
-const READ_DEADLINE:        Duration = Duration::from_secs(120);
-const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(30);
-const HEV_RCVBUF:           i32      = 524288;
-const HEV_SNDBUF:           i32      = 524288;
-const CLI_RCVBUF:           i32      = 524288;
-const CLI_SNDBUF:           i32      = 524288;
-const POOL_PREALLOC:        usize    = 8192;
+const HEV_ADDR:&str         = "127.0.0.1:1080";
+const LISTEN_ADDR:&str     = "0.0.0.0:80";
+const KICK_ADDR:&str       = "127.0.0.1:8091";
+const USERS_FILE:&str      = "/opt/btserver/users.txt";
+const MAX_STREAMS:usize    = 7000;
+const QUEUE_SIZE:usize     = 64;
+const MAX_PAYLOAD:usize    = 16384;
+const DIAL_TIMEOUT:Duration        = Duration::from_millis(200);
+const HEV_WRITE_TIMEOUT:Duration   = Duration::from_secs(2);
+const CLIENT_WRITE_TIMEOUT:Duration= Duration::from_secs(30);
+const STREAM_IDLE_TIMEOUT:i64     = 600;
+const MUX_WRITE_QUEUE:usize       = 4096;
+const CTRL_QUEUE:usize            = 256;
+const MAX_BATCH:usize             = 128;
+const READ_DEADLINE:Duration       = Duration::from_secs(120);
+const PAYLOAD_DEADLINE:Duration    = Duration::from_secs(30);
+const HEV_RCVBUF:i32      = 524288;
+const HEV_SNDBUF:i32      = 524288;
+const CLI_RCVBUF:i32      = 524288;
+const CLI_SNDBUF:i32      = 524288;
+const POOL_PREALLOC:usize = 8192;
 
-const T_OPEN:    u8 = 0x01;
-const T_DATA:    u8 = 0x02;
-const T_CLOSE:   u8 = 0x03;
-const T_PING:    u8 = 0x04;
-const T_PONG:    u8 = 0x05;
-const T_KICK:    u8 = 0x06;
-const T_EXPIRED: u8 = 0x07;
+const T_OPEN:u8    = 0x01;
+const T_DATA:u8    = 0x02;
+const T_CLOSE:u8   = 0x03;
+const T_PING:u8     = 0x04;
+const T_PONG:u8     = 0x05;
+const T_KICK:u8     = 0x06;
+const T_EXPIRED:u8  = 0x07;
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
     let out = std::process::Command::new("date").arg("+%z").output()
         .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
     let s = out.trim();
     if s.len() < 5 { return 0; }
-    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-    let h: i64 = s[1..3].parse().unwrap_or(0);
-    let m: i64 = s[3..5].parse().unwrap_or(0);
+    let sign:i64 = if s.starts_with('-') { -1 } else { 1 };
+    let h:i64 = s[1..3].parse().unwrap_or(0);
+    let m:i64 = s[3..5].parse().unwrap_or(0);
     sign * (h * 3600 + m * 60)
 });
 
@@ -206,45 +205,19 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
-    let m2 = if m <= 2 { m + 12 } else { m };
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let a  = y2 / 100;
-    let b  = 2 - a + a / 4;
-    (365.25 * (y2 + 4716) as f64) as i64
-        + (30.6001 * (m2 + 1) as f64) as i64
-        + d + b - 1524 - 2440588
-}
-
-fn epoch_days_to_civil(days: i64) -> (i64, i64, i64) {
-    let j = days + 2440588;
-    let f = j + 1401 + (((4 * j + 274277) / 146097) * 3) / 4 - 38;
-    let e = 4 * f + 3;
-    let g = (e % 1461) / 4;
-    let h = 5 * g + 2;
-    let d = (h % 153) / 5 + 1;
-    let m = (h / 153 + 2) % 12 + 1;
-    let y = e / 1461 - 4716 + (14 - m) / 12;
-    (y, m, d)
-}
-
-fn parse_date_end(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let mut it = s.splitn(3, '-');
-    let y: i64 = it.next()?.parse().ok()?;
-    let m: i64 = it.next()?.parse().ok()?;
-    let d: i64 = it.next()?.parse().ok()?;
-    Some(civil_to_epoch_days(y, m, d) * 86400 + 86399 - *UTC_OFFSET)
-}
-
-fn ts_to_date(ts: i64) -> String {
-    let (y, m, d) = epoch_days_to_civil(ts / 86400);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 enum AuthResult { Ok { name: String, days: i64 }, NotFound, Expired }
 
-fn check_auth(id:&str) -> AuthResult {
+fn parse_old_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let mut it = s.split('-');
+    let y:i64 = it.next()?.parse().ok()?;
+    let m:i64 = it.next()?.parse().ok()?;
+    let d:i64 = it.next()?.parse().ok()?;
+    let j = (1461 * (y + 4800 + (m - 14) / 12)) / 4 + (367 * (m - 2 - 12 * ((m - 14) / 12))) / 12 - (3 * ((y + 4900 + (m - 14) / 12) / 100)) / 4 + d - 32075;
+    Some((j - 2440588) * 86400 + 86399)
+}
+
+fn check_auth(id: &str) -> AuthResult {
     let Ok(content) = std::fs::read_to_string(USERS_FILE) else {
         return AuthResult::NotFound;
     };
@@ -252,14 +225,24 @@ fn check_auth(id:&str) -> AuthResult {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         let mut parts = line.splitn(3, ':');
-        let Some(uid)  = parts.next() else { continue };
+        let Some(uid) = parts.next() else { continue };
         let Some(name) = parts.next() else { continue };
-        let Some(exp)  = parts.next() else { continue };
+        let Some(exp_str) = parts.next() else { continue };
         if uid != id { continue; }
-        let Some(exp_ts) = parse_date_end(exp) else { continue };
+        let exp_ts = match exp_str.parse::<i64>() {
+            Ok(ts) => ts,
+            Err(_) => match parse_old_date(exp_str) {
+                Some(ts) => {
+                    let new_line = format!("{}:{}:{}\n", uid, name, ts);
+                    let _ = std::fs::write(USERS_FILE, &content.replace(line, &new_line.trim()));
+                    ts
+                }
+                None => continue,
+            }
+        };
         let now = now_secs();
         if now > exp_ts { return AuthResult::Expired; }
-        return AuthResult::Ok { name: name.to_string(), days: (exp_ts - now) / 86400 + 1 };
+        return AuthResult::Ok { name: name.to_string(), days: (exp_ts - now) / 86400 };
     }
     AuthResult::NotFound
 }
@@ -324,7 +307,7 @@ impl BufPool {
 #[inline(always)]
 unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
     libc::setsockopt(fd, level, opt,
-       &val as *const i32 as *const libc::c_void,
+      &val as *const i32 as *const libc::c_void,
         std::mem::size_of::<i32>() as libc::socklen_t);
 }
 
@@ -364,7 +347,7 @@ impl Stream {
             workers:  AtomicI32::new(0),
         })
     }
-    #[inline(always)] fn touch(&self)       { self.last_act.store(now_secs(), Ordering::Relaxed); }
+    #[inline(always)] fn touch(&self) { self.last_act.store(now_secs(), Ordering::Relaxed); }
     #[inline(always)] fn idle_secs(&self) -> i64 { now_secs() - self.last_act.load(Ordering::Relaxed) }
     #[inline(always)] fn try_close(&self) -> bool {
         self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
@@ -415,17 +398,19 @@ impl Mux {
         let _ = self.ctrl_tx.try_send(self.pool.ctrl(t, sid));
     }
 
-    fn add_stream(&self, sid: u32, s: Arc<Stream>) -> bool {
-        if self.count.load(Ordering::Relaxed) as usize >= MAX_STREAMS { return false; }
-        self.streams.insert(sid, s);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        true
+    fn close_stream(&self, sid: u32) {
+        if let Some(s) = self.get_stream(sid) {
+            if s.try_close() {
+                let _ = s.tx.try_send(Bytes::new());
+            }
+        }
     }
 
-    fn close_stream(&self, sid: u32) {
-        if let Some((_, s)) = self.streams.remove(&sid) {
+    fn close_all(&self) {
+        for r in self.streams.iter() {
+            let s = r.value();
             if s.try_close() {
-                self.count.fetch_sub(1, Ordering::Relaxed);
+                let _ = s.tx.try_send(Bytes::new());
             }
         }
     }
@@ -433,8 +418,9 @@ impl Mux {
 
 type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
 
-fn kick_session(sessions:&SessionMap, id: &str, reason: u8) -> bool {
+fn kick_session(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
+        mux.close_all();
         let _ = mux.ctrl_tx.try_send(mux.pool.ctrl(reason, 0));
         mux.dead.store(true, Ordering::Release);
         info!(id, reason, "session kicked");
@@ -442,125 +428,6 @@ fn kick_session(sessions:&SessionMap, id: &str, reason: u8) -> bool {
     } else {
         false
     }
-}
-
-async fn write_loop(
-    mut writer:   OwnedWriteHalf,
-    mut write_rx: mpsc::Receiver<Bytes>,
-    mut ctrl_rx:  mpsc::Receiver<Bytes>,
-    mux:          Arc<Mux>,
-) {
-    let mut batch: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
-
-    'outer: loop {
-        batch.clear();
-
-        tokio::select! {
-            biased;
-            frame = ctrl_rx.recv() => {
-                let Some(f) = frame else { break; };
-                batch.push(f);
-                while let Ok(f) = ctrl_rx.try_recv() { batch.push(f); }
-            }
-            frame = write_rx.recv() => {
-                let Some(f) = frame else { break; };
-                batch.push(f);
-                while batch.len() < MAX_BATCH {
-                    match write_rx.try_recv() {
-                        Ok(f)  => batch.push(f),
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-
-        let total: usize = batch.iter().map(|b| b.len()).sum();
-        let mut skip = 0usize;
-
-        loop {
-            let mut off = 0usize;
-            let slices: Vec<IoSlice<'_>> = batch.iter().filter_map(|b| {
-                let start = off;
-                off += b.len();
-                if start + b.len() <= skip { return None; }
-                let s = skip.saturating_sub(start);
-                Some(IoSlice::new(&b[s..]))
-            }).collect();
-
-            if slices.is_empty() { break; }
-
-            match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_vectored(&slices)).await {
-                Ok(Ok(0)) => { mux.dead.store(true, Ordering::Release); break 'outer; }
-                Ok(Ok(n)) => {
-                    skip += n;
-                    if skip >= total { break; }
-                }
-                _ => { mux.dead.store(true, Ordering::Release); break 'outer; }
-            }
-        }
-    }
-
-    mux.dead.store(true, Ordering::Release);
-}
-
-async fn handle_stream(
-    mux:    Arc<Mux>,
-    sid:    u32,
-    stream: Arc<Stream>,
-    mut rx: mpsc::Receiver<Bytes>,
-    first:  Bytes,
-) {
-    let hev = match time::timeout(DIAL_TIMEOUT, TcpStream::connect(HEV_ADDR)).await {
-        Ok(Ok(c)) => c,
-        _ => {
-            mux.close_stream(sid);
-            mux.send_ctrl(T_CLOSE, sid);
-            return;
-        }
-    };
-    tune_hev_fd(hev.as_raw_fd());
-    let (mut hev_r, mut hev_w) = hev.into_split();
-
-    if !first.is_empty() {
-        if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&first)).await.is_err() {
-            mux.close_stream(sid);
-            mux.send_ctrl(T_CLOSE, sid);
-            return;
-        }
-    }
-
-    let mux2    = mux.clone();
-    let stream2 = stream.clone();
-
-    let t_c2h = tokio::spawn(async move {
-        stream2.workers.fetch_add(1, Ordering::Relaxed);
-        while let Some(data) = rx.recv().await {
-            stream2.touch();
-            if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await.is_err() {
-                break;
-            }
-        }
-        stream2.workers.fetch_sub(1, Ordering::Relaxed);
-    });
-
-    let t_h2c = tokio::spawn(async move {
-        stream.workers.fetch_add(1, Ordering::Relaxed);
-        let mut buf = vec![0u8; MAX_PAYLOAD];
-        loop {
-            match hev_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stream.touch();
-                    mux2.send_data(sid, &buf[..n]);
-                }
-            }
-        }
-        stream.workers.fetch_sub(1, Ordering::Relaxed);
-    });
-
-    let _ = tokio::join!(t_c2h, t_h2c);
-    mux.close_stream(sid);
-    mux.send_ctrl(T_CLOSE, sid);
 }
 
 async fn idle_reaper(mux: Arc<Mux>) {
@@ -591,10 +458,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut rbuf = vec![0u8; MAX_PAYLOAD];
 
     loop {
+        if mux.is_dead() { break; }
+
         match time::timeout(READ_DEADLINE, reader.read_exact(&mut hdr)).await {
             Ok(Ok(_)) => {}
             _ => break,
         }
+
+        if mux.is_dead() { break; }
 
         let ft  = hdr[0];
         let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
@@ -608,6 +479,8 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             }
         }
 
+        if mux.is_dead() { break; }
+
         match ft {
             T_PING => { mux.send_ctrl(T_PONG, sid); }
             T_PONG => {}
@@ -619,89 +492,147 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                     Bytes::new()
                 };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
-                let s = Stream::new(tx);
-                if !mux.add_stream(sid, s.clone()) {
-                    mux.send_ctrl(T_CLOSE, sid);
-                    continue;
+                let stream = Stream::new(tx);
+
+                {
+                    let mut w = mux.streams.entry(sid).or_default();
+                    *w = stream.clone();
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
+
+                mux.send_ctrl(T_OPEN, sid);
+                let mut wcount = 0usize;
+                loop {
+                    match time::timeout(Duration::from_millis(100), rx.recv()).await {
+                        Ok(Some(data)) => {
+                            if data.is_empty() { break; }
+                            if writer.write_all(&data).await.is_err() { break; }
+                            wcount += 1;
+                            if wcount >= MAX_BATCH { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                stream.workers.fetch_add(1, Ordering::Relaxed);
+                stream.touch();
+                if let Some(s) = mux.get_stream(sid) {
+                    s.workers.fetch_sub(1, Ordering::Relaxed);
+                }
             }
 
             T_DATA => {
                 if let Some(s) = mux.get_stream(sid) {
                     if !s.is_closed() {
                         s.touch();
-                        let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.try_send(payload).is_err() {
-                            mux.close_stream(sid);
-                            mux.send_ctrl(T_CLOSE, sid);
-                        }
+                        let _ = s.tx.try_send(Bytes::copy_from_slice(&rbuf[..ln]));
                     }
                 }
             }
 
             T_CLOSE => { mux.close_stream(sid); }
+
+            T_KICK | T_EXPIRED => {
+                mux.dead.store(true, Ordering::Release);
+                break;
+            }
+
             _ => {}
         }
     }
-
-    let sids: Vec<u32> = mux.streams.iter().map(|r| *r.key()).collect();
-    for sid in sids { mux.close_stream(sid); }
 }
 
-fn extract_header<'a>(raw:&'a [u8], needle: &[u8]) -> Option<&'a str> {
-    for line in raw.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() <= needle.len() { continue; }
-        if !line[..needle.len()].eq_ignore_ascii_case(needle) { continue; }
-        return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
-    }
-    None
-}
-
-async fn send_403(writer: &mut OwnedWriteHalf, reason: &str) {
-    let body = format!(
-        "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: {reason}\r\nContent-Length: {}\r\n\r\n{reason}",
-        reason.len()
-    );
-    let _ = writer.write_all(body.as_bytes()).await;
-}
-
-async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
-    tune_client_fd(tcp.as_raw_fd());
-
-    let mut buf = vec![0u8; 8192];
-    let mut n   = 0usize;
-    let deadline = time::Instant::now() + Duration::from_secs(10);
-    let (mut reader, mut writer) = tcp.into_split();
+async fn write_loop(
+    mut writer:   OwnedWriteHalf,
+    mut write_rx: mpsc::Receiver<Bytes>,
+    mut ctrl_rx:  mpsc::Receiver<Bytes>,
+    mux:          Arc<Mux>,
+) {
+    let mut buf = Vec::with_capacity(65536);
 
     loop {
-        if time::Instant::now() > deadline || n >= buf.len() { return; }
-        match reader.read(&mut buf[n..]).await {
-            Ok(0) | Err(_) => return,
-            Ok(nr) => {
-                n += nr;
-                let raw = &buf[..n];
-                let has_action = raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:"));
-                let has_end    = raw.windows(4).any(|w| w == b"\r\n\r\n");
-                if has_action && has_end { break; }
+        if mux.is_dead() { return; }
+
+        tokio::select! {
+            biased;
+
+            Some(data) = ctrl_rx.recv() => {
+                if data.is_empty() { return; }
+                if writer.write_all(&data).await.is_err() { return; }
             }
+            Some(data) = write_rx.recv() => {
+                if data.is_empty() { return; }
+                buf.extend_from_slice(&data);
+
+                while buf.len() >= 7 {
+                    let len = u16::from_be_bytes([buf[5], buf[6]]) as usize;
+                    if buf.len() < 7 + len { break; }
+
+                    let frame = buf.split_to(7 + len);
+                    if writer.write_all(&frame).await.is_err() { return; }
+                }
+            }
+            else => return,
+        }
+    }
+}
+
+async fn handle_conn(conn: TcpStream, sessions: SessionMap, pool: BufPool) {
+    let (reader, mut writer) = conn.into_split();
+    tune_client_fd(reader.as_raw_fd());
+
+    let mut buf = [0u8; 4096];
+    match time::timeout(Duration::from_secs(10), reader.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {}
+        _ => return,
+    }
+
+    let header = std::str::from_utf8(&buf).unwrap_or("");
+    let mut path = "";
+    let mut is_websocket = false;
+
+    for line in header.lines() {
+        if line.starts_with("GET ") {
+            path = line.trim_start_matches("GET ").split_whitespace().next().unwrap_or("");
+        }
+        if line.to_lowercase().contains("upgrade: websocket") {
+            is_websocket = true;
         }
     }
 
-    let raw    = &buf[..n];
-    let action = extract_header(raw, b"action:");
-    if action != Some("tunnel") && action != Some("tunnel-tcp") { return; }
+    if !is_websocket {
+        let resp = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        let _ = writer.write_all(resp.as_bytes()).await;
+        return;
+    }
 
-    let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
-        Some(id) => id.to_string(),
-        None => { send_403(&mut writer, "not_registered").await; return; }
+    let query = if let Some(q) = path.strip_prefix("/?auth=") {
+        q.split('&').fold(HashMap::new(), |mut acc, pair| {
+            if let Some((k, v)) = pair.split_once('=') {
+                acc.insert(k.to_string(), v.to_string());
+            }
+            acc
+        })
+    } else {
+        HashMap::new()
     };
 
-    let (name, days) = match check_auth(&user_id) {
+    let Some(user_id) = query.get("auth").filter(|s| !s.is_empty()) else {
+        let resp = "HTTP/1.1 401 Unauthorized\r\n\r\n";
+        let _ = writer.write_all(resp.as_bytes()).await;
+        return;
+    };
+
+    let (name, days) = match check_auth(user_id) {
         AuthResult::Ok { name, days } => (name, days),
-        AuthResult::NotFound => { send_403(&mut writer, "not_registered").await; return; }
-        AuthResult::Expired  => { send_403(&mut writer, "expired").await; return; }
+        AuthResult::Expired => {
+            let resp = "HTTP/1.1 403 Expired\r\nX-Reason: expired\r\n\r\n";
+            let _ = writer.write_all(resp.as_bytes()).await;
+            return;
+        }
+        AuthResult::NotFound => {
+            let resp = "HTTP/1.1 404 Not Found\r\nX-Reason: not_found\r\n\r\n";
+            let _ = writer.write_all(resp.as_bytes()).await;
+            return;
+        }
     };
 
     let resp = format!(
@@ -743,7 +674,13 @@ async fn kick_api(sessions: SessionMap) {
         if kick_session(&s, id, reason) { "kicked".into() } else { "not_connected".into() }
     }
 
-    let app = Router::new().route("/kick", get(kick_handler)).with_state(sessions);
+    let app = Router::new()
+        .route("/kick", get(kick_handler))
+        .route("/active", get(|State(s): State<SessionMap>| async move {
+            let ids: Vec<_> = s.iter().map(|r| r.key().clone()).collect();
+            serde_json::to_string(&ids).unwrap_or_default()
+        }))
+        .with_state(sessions);
     let ln  = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
     info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
@@ -781,7 +718,7 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
     unsafe {
         let fd = sock.as_raw_fd();
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN,
-            &1i32 as *const _ as _, 4);
+           &1i32 as *const _ as _, 4);
     }
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
@@ -808,7 +745,7 @@ async fn main() -> Result<()> {
 
     let std_ln   = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    info!("btserver v5 on {LISTEN_ADDR} → hev {HEV_ADDR}");
+    info!("btserver v5 on {LISTEN_ADDR} â†’ hev {HEV_ADDR}");
 
     loop {
         match listener.accept().await {
@@ -842,19 +779,20 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::info;
 
-const PANEL_ADDR: &str = "0.0.0.0:8090";
-const USERS_PATH: &str = "/opt/btserver/users.txt";
-const TOKEN_PATH:&str = "/opt/btserver/token.txt";
-const KICK_BASE: &str = "http://127.0.0.1:8091/kick?id=";
+const PANEL_ADDR: &str  = "0.0.0.0:8090";
+const USERS_PATH:&str   = "/opt/btserver/users.txt";
+const TOKEN_PATH:&str    = "/opt/btserver/token.txt";
+const KICK_BASE:&str    = "http://127.0.0.1:8091/kick?id=";
+const ACTIVE_BASE:&str  = "http://127.0.0.1:8091/active";
 
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
     let out = std::process::Command::new("date").arg("+%z").output()
         .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
     let s = out.trim();
     if s.len() < 5 { return 0; }
-    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-    let h: i64 = s[1..3].parse().unwrap_or(0);
-    let m: i64 = s[3..5].parse().unwrap_or(0);
+    let sign:i64 = if s.starts_with('-') { -1 } else { 1 };
+    let h:i64 = s[1..3].parse().unwrap_or(0);
+    let m:i64 = s[3..5].parse().unwrap_or(0);
     sign * (h * 3600 + m * 60)
 });
 
@@ -863,55 +801,13 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
-    let m2 = if m <= 2 { m + 12 } else { m };
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let a  = y2 / 100;
-    let b  = 2 - a + a / 4;
-    (365.25 * (y2 + 4716) as f64) as i64
-        + (30.6001 * (m2 + 1) as f64) as i64
-        + d + b - 1524 - 2440588
-}
+fn days_from_now(d: i64) -> i64 { now_secs() + d * 86400 }
 
-fn epoch_days_to_civil(days: i64) -> (i64, i64, i64) {
-    let j = days + 2440588;
-    let f = j + 1401 + (((4 * j + 274277) / 146097) * 3) / 4 - 38;
-    let e = 4 * f + 3;
-    let g = (e % 1461) / 4;
-    let h = 5 * g + 2;
-    let d = (h % 153) / 5 + 1;
-    let m = (h / 153 + 2) % 12 + 1;
-    let y = e / 1461 - 4716 + (14 - m) / 12;
-    (y, m, d)
-}
-
-fn parse_date_end(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let mut it = s.splitn(3, '-');
-    let y: i64 = it.next()?.parse().ok()?;
-    let m: i64 = it.next()?.parse().ok()?;
-    let d: i64 = it.next()?.parse().ok()?;
-    Some(civil_to_epoch_days(y, m, d) * 86400 + 86399 - *UTC_OFFSET)
-}
-
-fn ts_to_date(ts: i64) -> String {
-    let (y, m, d) = epoch_days_to_civil(ts / 86400);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn days_from_now(n: i64) -> String { ts_to_date(now_secs() + n * 86400) }
-
-fn add_days_to(base: &str, days: i64) -> String {
-    match parse_date_end(base) {
-        Some(ts) => ts_to_date(ts + days * 86400),
-        None     => base.to_string(),
+fn days_left(exp: &str) -> i64 {
+    match exp.parse::<i64>() {
+        Ok(ts) => ((ts - now_secs()) / 86400).max(0),
+        _ => 0,
     }
-}
-
-fn days_left(expires: &str) -> i64 {
-    let Some(ts) = parse_date_end(expires) else { return 0; };
-    let left = ts - now_secs();
-    if left <= 0 { 0 } else { left / 86400 + 1 }
 }
 
 #[derive(Clone)]
@@ -953,7 +849,17 @@ impl AppState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct User { name: String, expires: String }
+struct User { name: String, expires: i64 }
+
+fn parse_old_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let mut it = s.split('-');
+    let y:i64 = it.next()?.parse().ok()?;
+    let m:i64 = it.next()?.parse().ok()?;
+    let d:i64 = it.next()?.parse().ok()?;
+    let j = (1461 * (y + 4800 + (m - 14) / 12)) / 4 + (367 * (m - 2 - 12 * ((m - 14) / 12))) / 12 - (3 * ((y + 4900 + (m - 14) / 12) / 100)) / 4 + d - 32075;
+    Some((j - 2440588) * 86400 + 86399)
+}
 
 fn load_users() -> HashMap<String, User> {
     let Ok(c) = std::fs::read_to_string(USERS_PATH) else { return HashMap::new(); };
@@ -962,17 +868,29 @@ fn load_users() -> HashMap<String, User> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         let mut parts = line.splitn(3, ':');
-        let Some(id)   = parts.next().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let Some(id) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else { continue };
         let Some(name) = parts.next().map(str::trim) else { continue };
-        let Some(exp)  = parts.next().map(str::trim) else { continue };
-        map.insert(id.to_string(), User { name: name.to_string(), expires: exp.to_string() });
+        let Some(exp) = parts.next().map(str::trim) else { continue };
+        let exp_ts = match exp.parse::<i64>() {
+            Ok(ts) => ts,
+            Err(_) => {
+                if let Some(ts) = parse_old_date(exp) {
+                    let new_line = format!("{}:{}:{}", id, name, ts);
+                    let _ = std::fs::write(USERS_PATH, &c.replace(line, &new_line));
+                    ts
+                } else {
+                    continue;
+                }
+            }
+        };
+        map.insert(id.to_string(), User { name: name.to_string(), expires: exp_ts });
     }
     map
 }
 
 fn save_users(users: &HashMap<String, User>) {
     let tmp = format!("{USERS_PATH}.tmp");
-    let mut out = String::from("# formato: id:nombre:YYYY-MM-DD\n");
+    let mut out = String::from("# formato: id:nombre:expires_ts\n");
     for (id, u) in users {
         out.push_str(&format!("{id}:{}:{}\n", u.name, u.expires));
     }
@@ -981,15 +899,25 @@ fn save_users(users: &HashMap<String, User>) {
     }
 }
 
-fn user_row(id: &str, u: &User) -> serde_json::Value {
-    let dl = days_left(&u.expires);
-    serde_json::json!({"id":id,"name":u.name,"expires":u.expires,"days_left":dl,"active":dl>0})
+fn user_row(id: &str, u: &User, active: bool) -> serde_json::Value {
+    let dl = days_left(&u.expires.to_string());
+    serde_json::json!({"id":id,"name":u.name,"expires":u.expires,"days_left":dl,"active":active})
 }
 
 async fn kick_user(id: String, reason: &'static str) {
     let url = format!("{KICK_BASE}{id}&reason={reason}");
     let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else { return; };
     let _ = c.get(&url).send().await;
+}
+
+async fn get_active_ids() -> Vec<String> {
+    let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else {
+        return vec![];
+    };
+    match c.get(ACTIVE_BASE).send().await {
+        Ok(r) => r.json::<Vec<String>>().await.unwrap_or_default(),
+        _ => vec![],
+    }
 }
 
 type ApiResult = (StatusCode, Json<serde_json::Value>);
@@ -1017,8 +945,12 @@ async fn handle_clients(
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let _l = st.users_mu.lock().unwrap();
     let users = load_users();
-    let rows: Vec<_> = users.iter().map(|(id, u)| user_row(id, u)).collect();
-    (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len()})))
+    let active_ids = get_active_ids().await;
+    let active_set: std::collections::HashSet<_> = active_ids.iter().collect();
+    let rows: Vec<_> = users.iter()
+        .map(|(id, u)| user_row(id, u, active_set.contains(id)))
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len(),"active_count":active_ids.len()})))
 }
 
 async fn handle_client(
@@ -1032,9 +964,10 @@ async fn handle_client(
         Some(id) => id,
         None => return err_resp(StatusCode::BAD_REQUEST, "falta id"),
     };
+    let active_ids = get_active_ids().await;
     let _l = st.users_mu.lock().unwrap();
     match load_users().get(&id).cloned() {
-        Some(u) => (StatusCode::OK, Json(user_row(&id, &u))),
+        Some(u) => (StatusCode::OK, Json(user_row(&id, &u, active_ids.iter().any(|x| x == &id)))),
         None    => err_resp(StatusCode::NOT_FOUND, "no encontrado"),
     }
 }
@@ -1057,9 +990,11 @@ async fn handle_create(
     let expires = days_from_now(days);
     let _l = st.users_mu.lock().unwrap();
     let mut users = load_users();
-    users.insert(id.clone(), User { name: name.clone(), expires: expires.clone() });
+    let was_active = users.contains_key(&id);
+    users.insert(id.clone(), User { name: name.clone(), expires });
     save_users(&users);
-    (StatusCode::OK, Json(serde_json::json!({"ok":true,"id":id,"name":name,"expires":expires,"days":days})))
+    if was_active { tokio::spawn(kick_user(id.clone(), "replaced")); }
+    (StatusCode::OK, Json(serde_json::json!({"ok":true,"id":id,"name":name,"expires":expires,"days":days,"was_active":was_active})))
 }
 
 #[derive(Deserialize)]
@@ -1087,9 +1022,10 @@ async fn handle_delete(
 
 #[derive(Deserialize)]
 struct UpdateBody {
-    id: String, name: Option<String>, new_id: Option<String>,
-    add_days: Option<i64>, sub_days: Option<i64>,
-    set_days: Option<i64>, set_date: Option<String>,
+    id: String,
+    name: Option<String>,
+    new_id: Option<String>,
+    days: Option<i64>,
 }
 
 async fn handle_update(
@@ -1102,7 +1038,7 @@ async fn handle_update(
     let id = body.id.trim().to_string();
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
 
-    let (final_id, u, old_kicked) = {
+    let (final_id, u, kick_old) = {
         let _l = st.users_mu.lock().unwrap();
         let mut users = load_users();
         let Some(mut u) = users.get(&id).cloned() else {
@@ -1111,32 +1047,35 @@ async fn handle_update(
         if let Some(n) = body.name.as_deref() {
             if !n.trim().is_empty() { u.name = n.trim().to_string(); }
         }
-        let base = if parse_date_end(&u.expires).map(|t| t > now_secs()).unwrap_or(false) {
-            u.expires.clone()
-        } else {
-            days_from_now(0)
-        };
-        if let Some(d)      = body.add_days { u.expires = add_days_to(&base, d); }
-        else if let Some(d) = body.sub_days { u.expires = add_days_to(&u.expires, -d); }
-        else if let Some(d) = body.set_days { u.expires = days_from_now(d); }
-        else if let Some(dt) = body.set_date { u.expires = dt.trim().to_string(); }
+        if let Some(d) = body.days {
+            u.expires = days_from_now(d);
+        }
 
-        let (final_id, old_kicked) = if let Some(nid) = body.new_id.as_deref() {
+        let (final_id, kick_old) = if let Some(nid) = body.new_id.as_deref() {
             let nid = nid.trim().to_string();
             if !nid.is_empty() && nid != id {
+                if users.contains_key(&nid) {
+                    return err_resp(StatusCode::CONFLICT, "new_id ya existe");
+                }
                 users.remove(&id);
                 (nid, true)
-            } else { (id.clone(), false) }
-        } else { (id.clone(), false) };
+            } else {
+                (id.clone(), false)
+            }
+        } else {
+            (id.clone(), false)
+        };
 
         users.insert(final_id.clone(), u.clone());
         save_users(&users);
-        (final_id, u, old_kicked)
+        (final_id, u, kick_old)
     };
 
-    if old_kicked              { tokio::spawn(kick_user(id, "kicked")); }
-    if days_left(&u.expires) <= 0 { tokio::spawn(kick_user(final_id.clone(), "expired")); }
-    (StatusCode::OK, Json(user_row(&final_id, &u)))
+    if kick_old { tokio::spawn(kick_user(id, "replaced")); }
+    if days_left(&u.expires.to_string()) <= 0 { tokio::spawn(kick_user(final_id.clone(), "expired")); }
+    let active_ids = get_active_ids().await;
+    let is_active = active_ids.iter().any(|x| x == &final_id);
+    (StatusCode::OK, Json(user_row(&final_id, &u, is_active)))
 }
 
 #[tokio::main]
@@ -1219,7 +1158,7 @@ cp "$PROJ/target/release/panel"    /opt/btserver/panel
 chmod +x /opt/btserver/btserver /opt/btserver/panel
 info "Compilacion OK"
 
-[ -f /opt/btserver/users.txt ] || printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+[ -f /opt/btserver/users.txt ] || printf '# formato: id:nombre:expires_ts\n' > /opt/btserver/users.txt
 
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
