@@ -133,15 +133,6 @@ TOMLEOF
 
 # ─── btserver.rs ───────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-//! btserver v5 — correcciones de performance vs v4
-//!
-//! Problemas de v4 corregidos:
-//!   1. tokio::sync::RwLock en hot-path → sustituido por DashMap (síncrono, sin await)
-//!   2. Bytes::freeze() creaba un Arc oculto por cada frame → pool de Vec<u8> directo
-//!   3. Vec<IoSlice> re-allocado en cada retry del write loop → avance por offset
-//!   4. SessionMap con RwLock global → DashMap sin contención entre sesiones
-//!   5. send_data/get_stream eran async → ahora síncronos en todo el hot-path
-
 use std::{
     collections::HashMap,
     io::IoSlice,
@@ -155,7 +146,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::Bytes;
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
@@ -169,8 +160,6 @@ use tokio::{
     time,
 };
 use tracing::{info, warn};
-
-// ── Constantes ──────────────────────────────────────────────────────────────────
 
 const HEV_ADDR:             &str     = "127.0.0.1:1080";
 const LISTEN_ADDR:          &str     = "0.0.0.0:80";
@@ -203,8 +192,6 @@ const T_PONG:    u8 = 0x05;
 const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
 
-// ── Timezone ────────────────────────────────────────────────────────────────────
-
 static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
     let out = std::process::Command::new("date").arg("+%z").output()
         .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
@@ -221,8 +208,6 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-// ── Calendarios ─────────────────────────────────────────────────────────────────
-
 fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
     let m2 = if m <= 2 { m + 12 } else { m };
     let y2 = if m <= 2 { y - 1 } else { y };
@@ -233,18 +218,6 @@ fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
         + d + b - 1524 - 2440588
 }
 
-fn epoch_days_to_civil(days: i64) -> (i64, i64, i64) {
-    let j = days + 2440588;
-    let f = j + 1401 + (((4 * j + 274277) / 146097) * 3) / 4 - 38;
-    let e = 4 * f + 3;
-    let g = (e % 1461) / 4;
-    let h = 5 * g + 2;
-    let d = (h % 153) / 5 + 1;
-    let m = (h / 153 + 2) % 12 + 1;
-    let y = e / 1461 - 4716 + (14 - m) / 12;
-    (y, m, d)
-}
-
 fn parse_date_end(s: &str) -> Option<i64> {
     let s = s.trim();
     let mut it = s.splitn(3, '-');
@@ -253,13 +226,6 @@ fn parse_date_end(s: &str) -> Option<i64> {
     let d: i64 = it.next()?.parse().ok()?;
     Some(civil_to_epoch_days(y, m, d) * 86400 + 86399 - *UTC_OFFSET)
 }
-
-fn ts_to_date(ts: i64) -> String {
-    let (y, m, d) = epoch_days_to_civil(ts / 86400);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-// ── Auth ────────────────────────────────────────────────────────────────────────
 
 enum AuthResult { Ok { name: String, days: i64 }, NotFound, Expired }
 
@@ -283,13 +249,6 @@ fn check_auth(id: &str) -> AuthResult {
     AuthResult::NotFound
 }
 
-// ── BufPool ─────────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4 usaba BytesMut → freeze() que crea un Arc interno por cada frame.
-//   Aquí el pool maneja Vec<u8>. Solo hacemos Bytes::from(vec) al meter en el
-//   channel — un único Arc por frame, vida mínima, sin doble-alloc.
-
 #[derive(Clone)]
 struct BufPool(Arc<SegQueue<Vec<u8>>>);
 
@@ -307,14 +266,6 @@ impl BufPool {
             if v.capacity() >= needed { return v; }
         }
         Vec::with_capacity(needed.max(MAX_PAYLOAD + 7))
-    }
-
-    #[inline(always)]
-    fn put(&self, mut v: Vec<u8>) {
-        if v.capacity() <= (MAX_PAYLOAD + 7) * 2 {
-            v.clear();
-            self.0.push(v);
-        }
     }
 
     #[inline(always)]
@@ -336,8 +287,6 @@ impl BufPool {
         Bytes::from(v)
     }
 }
-
-// ── Syscall helpers ─────────────────────────────────────────────────────────────
 
 #[inline(always)]
 unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
@@ -367,8 +316,6 @@ fn tune_hev_fd(fd: i32) {
     }
 }
 
-// ── Stream ──────────────────────────────────────────────────────────────────────
-
 struct Stream {
     tx:           mpsc::Sender<Bytes>,
     closed:       AtomicBool,
@@ -393,14 +340,6 @@ impl Stream {
     #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
 }
 
-// ── Mux ─────────────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: RwLock<HashMap> → cada get_stream() era async, podía hacer yield al scheduler
-//   v5: DashMap → síncrono, sin await, lock-free por shards (igual que sync.Map de Go)
-//
-//   Así get_stream_sync/send_data_sync no tienen await en el hot-path de T_DATA.
-
 struct Mux {
     write_tx: mpsc::Sender<Bytes>,
     ctrl_tx:  mpsc::Sender<Bytes>,
@@ -422,8 +361,6 @@ impl Mux {
     }
 
     #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
-
-    // HOT PATH — todo síncrono, sin await ─────────────────────────────────────
 
     #[inline(always)]
     fn get_stream_sync(&self, sid: u32) -> Option<Arc<Stream>> {
@@ -453,12 +390,6 @@ impl Mux {
         true
     }
 
-    fn del_stream_sync(&self, sid: u32) {
-        if self.streams.remove(&sid).is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
     fn close_stream_sync(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
             if s.try_close() {
@@ -467,12 +398,6 @@ impl Mux {
         }
     }
 }
-
-// ── SessionMap ──────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: RwLock<HashMap> → write lock global bloqueaba TODAS las sesiones
-//   v5: DashMap → cada shard es independiente, inserciones no se bloquean entre sí
 
 type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
 
@@ -486,12 +411,6 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
         false
     }
 }
-
-// ── Write loop ──────────────────────────────────────────────────────────────────
-//
-// CORRECCIÓN vs v4:
-//   v4: Vec<IoSlice> re-allocado en CADA iteración del retry loop
-//   v5: batch construido una vez, retry avanza con 'skip' aritmético sin re-alloc
 
 async fn write_loop(
     mut writer:   OwnedWriteHalf,
@@ -527,7 +446,6 @@ async fn write_loop(
         let mut skip = 0usize;
 
         loop {
-            // Construir IoSlices avanzando 'skip' — sin Vec allocation
             let mut off = 0usize;
             let slices: Vec<IoSlice<'_>> = batch.iter().filter_map(|b| {
                 let start = off;
@@ -544,7 +462,6 @@ async fn write_loop(
                 Ok(Ok(n)) => {
                     skip += n;
                     if skip >= total { break; }
-                    // write parcial — retry sin re-alloc del batch
                 }
                 _ => { mux.dead.store(true, Ordering::Release); break 'outer; }
             }
@@ -553,8 +470,6 @@ async fn write_loop(
 
     mux.dead.store(true, Ordering::Release);
 }
-
-// ── handle_stream ───────────────────────────────────────────────────────────────
 
 async fn handle_stream(
     mux:    Arc<Mux>,
@@ -585,7 +500,6 @@ async fn handle_stream(
     let mux2    = mux.clone();
     let stream2 = stream.clone();
 
-    // client → hev
     let t_c2h = tokio::spawn(async move {
         stream2.worker_count.fetch_add(1, Ordering::Relaxed);
         while let Some(data) = rx.recv().await {
@@ -597,7 +511,6 @@ async fn handle_stream(
         stream2.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
-    // hev → client  (send_data_sync: sin await, directo al try_send)
     let t_h2c = tokio::spawn(async move {
         stream.worker_count.fetch_add(1, Ordering::Relaxed);
         let mut buf = vec![0u8; MAX_PAYLOAD];
@@ -617,8 +530,6 @@ async fn handle_stream(
     mux.close_stream_sync(sid);
     mux.send_ctrl_sync(T_CLOSE, sid);
 }
-
-// ── idle_reaper ─────────────────────────────────────────────────────────────────
 
 async fn idle_reaper(mux: Arc<Mux>) {
     let mut tick = time::interval(Duration::from_secs(60));
@@ -640,8 +551,6 @@ async fn idle_reaper(mux: Arc<Mux>) {
         }
     }
 }
-
-// ── mux_run ─────────────────────────────────────────────────────────────────────
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut hdr  = [0u8; 7];
@@ -684,7 +593,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
             }
 
-            // HOT PATH — todo síncrono, sin await
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
@@ -707,8 +615,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     for sid in sids { mux.close_stream_sync(sid); }
 }
 
-// ── Parser HTTP ─────────────────────────────────────────────────────────────────
-
 fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     for line in raw.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -726,8 +632,6 @@ async fn send_403(writer: &mut OwnedWriteHalf, reason: &str) {
     );
     let _ = writer.write_all(body.as_bytes()).await;
 }
-
-// ── handle_conn ─────────────────────────────────────────────────────────────────
 
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     tune_client_fd(tcp.as_raw_fd());
@@ -775,7 +679,6 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
     let mux = Mux::new(write_tx, ctrl_tx, pool);
 
-    // DashMap.insert() síncrono — sin write lock global
     if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
         let _ = prev_mux.ctrl_tx.try_send(prev_mux.pool.ctrl(T_KICK, 0));
         prev_mux.dead.store(true, Ordering::Release);
@@ -785,11 +688,8 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
     tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
     mux_run(mux.clone(), reader).await;
 
-    // remove_if síncrono — sin write lock global
     sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
 }
-
-// ── Kick API ────────────────────────────────────────────────────────────────────
 
 async fn kick_api(sessions: SessionMap) {
     use axum::{extract::{Query, State}, routing::get, Router};
@@ -815,8 +715,6 @@ async fn kick_api(sessions: SessionMap) {
     axum::serve(ln, app).await.expect("kick serve");
 }
 
-// ── Midnight sweep ───────────────────────────────────────────────────────────────
-
 async fn midnight_sweep(sessions: SessionMap) {
     loop {
         let secs = 86400 - (now_secs() % 86400);
@@ -835,8 +733,6 @@ async fn midnight_sweep(sessions: SessionMap) {
         if kicked > 0 { info!("midnight sweep: kicked {kicked}"); }
     }
 }
-
-// ── Listener ────────────────────────────────────────────────────────────────────
 
 fn build_listener() -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
@@ -858,8 +754,6 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
     sock.listen(65535)?;
     Ok(sock.into())
 }
-
-// ── main ────────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
