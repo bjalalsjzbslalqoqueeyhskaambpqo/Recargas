@@ -789,12 +789,12 @@ async fn main() -> Result<()> {
 }
 RSEOF
 
-# ─── panel.rs (sin cambios funcionales respecto a v4) ──────────────────────────
+# ─── panel.rs ──────────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -814,71 +814,38 @@ const USERS_PATH: &str = "/opt/btserver/users.txt";
 const TOKEN_PATH: &str = "/opt/btserver/token.txt";
 const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
 
-static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
-    let out = std::process::Command::new("date").arg("+%z").output()
-        .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-    let s = out.trim();
-    if s.len() < 5 { return 0; }
-    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-    let h: i64 = s[1..3].parse().unwrap_or(0);
-    let m: i64 = s[3..5].parse().unwrap_or(0);
-    sign * (h * 3600 + m * 60)
-});
-
 #[inline(always)]
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
-    let m2 = if m <= 2 { m + 12 } else { m };
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let a  = y2 / 100;
-    let b  = 2 - a + a / 4;
-    (365.25 * (y2 + 4716) as f64) as i64
-        + (30.6001 * (m2 + 1) as f64) as i64
-        + d + b - 1524 - 2440588
+fn expires_from_days(days: i64) -> i64 {
+    now_secs() + days * 86400
 }
 
-fn epoch_days_to_civil(days: i64) -> (i64, i64, i64) {
-    let j = days + 2440588;
-    let f = j + 1401 + (((4 * j + 274277) / 146097) * 3) / 4 - 38;
-    let e = 4 * f + 3;
-    let g = (e % 1461) / 4;
-    let h = 5 * g + 2;
-    let d = (h % 153) / 5 + 1;
-    let m = (h / 153 + 2) % 12 + 1;
-    let y = e / 1461 - 4716 + (14 - m) / 12;
-    (y, m, d)
-}
-
-fn parse_date_end(s: &str) -> Option<i64> {
+fn migrate_date_to_ts(s: &str) -> Option<i64> {
     let s = s.trim();
     let mut it = s.splitn(3, '-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
-    Some(civil_to_epoch_days(y, m, d) * 86400 + 86399 - *UTC_OFFSET)
+    if y < 2000 || y > 2100 { return None; }
+    let m2 = if m <= 2 { m + 12 } else { m };
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let a  = y2 / 100;
+    let b  = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64
+        + (30.6001 * (m2 + 1) as f64) as i64
+        + d + b - 1524 - 2440588;
+    Some(days * 86400 + 86399)
 }
 
-fn ts_to_date(ts: i64) -> String {
-    let (y, m, d) = epoch_days_to_civil(ts / 86400);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn days_from_now(n: i64) -> String { ts_to_date(now_secs() + n * 86400) }
-
-fn add_days_to(base: &str, days: i64) -> String {
-    match parse_date_end(base) {
-        Some(ts) => ts_to_date(ts + days * 86400),
-        None     => base.to_string(),
+fn parse_expires(s: &str) -> i64 {
+    let s = s.trim();
+    if let Ok(ts) = s.parse::<i64>() {
+        return ts;
     }
-}
-
-fn days_left(expires: &str) -> i64 {
-    let Some(ts) = parse_date_end(expires) else { return 0; };
-    let left = ts - now_secs();
-    if left <= 0 { 0 } else { left / 86400 + 1 }
+    migrate_date_to_ts(s).unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -920,7 +887,7 @@ impl AppState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct User { name: String, expires: String }
+struct User { name: String, expires_ts: i64 }
 
 fn load_users() -> HashMap<String, User> {
     let Ok(c) = std::fs::read_to_string(USERS_PATH) else { return HashMap::new(); };
@@ -932,16 +899,17 @@ fn load_users() -> HashMap<String, User> {
         let Some(id)   = parts.next().map(str::trim).filter(|s| !s.is_empty()) else { continue };
         let Some(name) = parts.next().map(str::trim) else { continue };
         let Some(exp)  = parts.next().map(str::trim) else { continue };
-        map.insert(id.to_string(), User { name: name.to_string(), expires: exp.to_string() });
+        let expires_ts = parse_expires(exp);
+        map.insert(id.to_string(), User { name: name.to_string(), expires_ts });
     }
     map
 }
 
 fn save_users(users: &HashMap<String, User>) {
     let tmp = format!("{USERS_PATH}.tmp");
-    let mut out = String::from("# formato: id:nombre:YYYY-MM-DD\n");
+    let mut out = String::new();
     for (id, u) in users {
-        out.push_str(&format!("{id}:{}:{}\n", u.name, u.expires));
+        out.push_str(&format!("{id}:{}:{}\n", u.name, u.expires_ts));
     }
     if std::fs::write(&tmp, &out).is_ok() {
         let _ = std::fs::rename(&tmp, USERS_PATH);
@@ -949,8 +917,14 @@ fn save_users(users: &HashMap<String, User>) {
 }
 
 fn user_row(id: &str, u: &User) -> serde_json::Value {
-    let dl = days_left(&u.expires);
-    serde_json::json!({"id":id,"name":u.name,"expires":u.expires,"days_left":dl,"active":dl>0})
+    let secs_left = (u.expires_ts - now_secs()).max(0);
+    serde_json::json!({
+        "id": id,
+        "name": u.name,
+        "expires_ts": u.expires_ts,
+        "secs_left": secs_left,
+        "active": secs_left > 0
+    })
 }
 
 async fn kick_user(id: String, reason: &'static str) {
@@ -1020,13 +994,17 @@ async fn handle_create(
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
     let name = body.name.as_deref().unwrap_or("").trim().to_string();
     let name = if name.is_empty() { "sin-nombre".to_string() } else { name };
-    let days = body.days.unwrap_or(30);
-    let expires = days_from_now(days);
+    let days = body.days.unwrap_or(30).max(0);
     let _l = st.users_mu.lock().unwrap();
     let mut users = load_users();
-    users.insert(id.clone(), User { name: name.clone(), expires: expires.clone() });
+    if users.contains_key(&id) {
+        return err_resp(StatusCode::CONFLICT, "ya existe");
+    }
+    let expires_ts = expires_from_days(days);
+    users.insert(id.clone(), User { name: name.clone(), expires_ts });
     save_users(&users);
-    (StatusCode::OK, Json(serde_json::json!({"ok":true,"id":id,"name":name,"expires":expires,"days":days})))
+    info!(id, name, days, "usuario creado");
+    (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
 }
 
 #[derive(Deserialize)]
@@ -1048,15 +1026,17 @@ async fn handle_delete(
         users.remove(&id);
         save_users(&users);
     }
+    info!(id, "usuario eliminado");
     tokio::spawn(kick_user(id, "kicked"));
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
 }
 
 #[derive(Deserialize)]
 struct UpdateBody {
-    id: String, name: Option<String>, new_id: Option<String>,
-    add_days: Option<i64>, sub_days: Option<i64>,
-    set_days: Option<i64>, set_date: Option<String>,
+    id:     String,
+    name:   Option<String>,
+    new_id: Option<String>,
+    days:   Option<i64>,
 }
 
 async fn handle_update(
@@ -1069,40 +1049,38 @@ async fn handle_update(
     let id = body.id.trim().to_string();
     if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
 
-    let (final_id, u, old_kicked) = {
+    let (final_id, u, kick_old) = {
         let _l = st.users_mu.lock().unwrap();
         let mut users = load_users();
         let Some(mut u) = users.get(&id).cloned() else {
             return err_resp(StatusCode::NOT_FOUND, "no encontrado");
         };
-        if let Some(n) = body.name.as_deref() {
-            if !n.trim().is_empty() { u.name = n.trim().to_string(); }
-        }
-        let base = if parse_date_end(&u.expires).map(|t| t > now_secs()).unwrap_or(false) {
-            u.expires.clone()
-        } else {
-            days_from_now(0)
-        };
-        if let Some(d)      = body.add_days { u.expires = add_days_to(&base, d); }
-        else if let Some(d) = body.sub_days { u.expires = add_days_to(&u.expires, -d); }
-        else if let Some(d) = body.set_days { u.expires = days_from_now(d); }
-        else if let Some(dt) = body.set_date { u.expires = dt.trim().to_string(); }
 
-        let (final_id, old_kicked) = if let Some(nid) = body.new_id.as_deref() {
-            let nid = nid.trim().to_string();
-            if !nid.is_empty() && nid != id {
+        if let Some(n) = body.name.as_deref() {
+            let n = n.trim();
+            if !n.is_empty() { u.name = n.to_string(); }
+        }
+
+        if let Some(d) = body.days {
+            u.expires_ts = expires_from_days(d.max(0));
+        }
+
+        let (final_id, kick_old) = match body.new_id.as_deref().map(str::trim) {
+            Some(nid) if !nid.is_empty() && nid != id => {
                 users.remove(&id);
-                (nid, true)
-            } else { (id.clone(), false) }
-        } else { (id.clone(), false) };
+                (nid.to_string(), true)
+            }
+            _ => (id.clone(), false),
+        };
 
         users.insert(final_id.clone(), u.clone());
         save_users(&users);
-        (final_id, u, old_kicked)
+        (final_id, u, kick_old)
     };
 
-    if old_kicked              { tokio::spawn(kick_user(id, "kicked")); }
-    if days_left(&u.expires) <= 0 { tokio::spawn(kick_user(final_id.clone(), "expired")); }
+    if kick_old { tokio::spawn(kick_user(id, "kicked")); }
+    if u.expires_ts <= now_secs() { tokio::spawn(kick_user(final_id.clone(), "expired")); }
+    info!(id = final_id, "usuario actualizado");
     (StatusCode::OK, Json(user_row(&final_id, &u)))
 }
 
@@ -1115,7 +1093,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let _ = *UTC_OFFSET;
     let state = AppState::new();
     let app = Router::new()
         .route("/clients",       get(handle_clients))
@@ -1186,7 +1163,7 @@ cp "$PROJ/target/release/panel"    /opt/btserver/panel
 chmod +x /opt/btserver/btserver /opt/btserver/panel
 info "Compilacion OK"
 
-[ -f /opt/btserver/users.txt ] || printf '# formato: id:nombre:YYYY-MM-DD\n' > /opt/btserver/users.txt
+[ -f /opt/btserver/users.txt ] || touch /opt/btserver/users.txt
 
 cat > /etc/systemd/system/hev-socks5.service << 'SVC'
 [Unit]
