@@ -486,32 +486,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PONG => {}
 
             T_OPEN => {
-                let payload = if ln > 0 {
-                    Bytes::copy_from_slice(&rbuf[..ln])
-                } else {
-                    Bytes::new()
-                };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
                 let stream = Stream::new(tx);
 
                 {
-                    let mut w = mux.streams.entry(sid).or_default();
-                    *w = stream.clone();
+                    mux.streams.insert(sid, stream.clone());
                 }
 
                 mux.send_ctrl(T_OPEN, sid);
-                let mut wcount = 0usize;
-                loop {
-                    match time::timeout(Duration::from_millis(100), rx.recv()).await {
-                        Ok(Some(data)) => {
-                            if data.is_empty() { break; }
-                            if writer.write_all(&data).await.is_err() { break; }
-                            wcount += 1;
-                            if wcount >= MAX_BATCH { break; }
-                        }
-                        _ => break,
-                    }
-                }
                 stream.workers.fetch_add(1, Ordering::Relaxed);
                 stream.touch();
                 if let Some(s) = mux.get_stream(sid) {
@@ -566,7 +548,7 @@ async fn write_loop(
                     let len = u16::from_be_bytes([buf[5], buf[6]]) as usize;
                     if buf.len() < 7 + len { break; }
 
-                    let frame = buf.split_to(7 + len);
+                    let frame = buf.drain(..7 + len).collect::<Vec<_>>();
                     if writer.write_all(&frame).await.is_err() { return; }
                 }
             }
@@ -577,7 +559,7 @@ async fn write_loop(
 
 async fn handle_conn(conn: TcpStream, sessions: SessionMap, pool: BufPool) {
     let (reader, mut writer) = conn.into_split();
-    tune_client_fd(reader.as_raw_fd());
+    tune_client_fd(reader.as_ref().as_raw_fd());
 
     let mut buf = [0u8; 4096];
     match time::timeout(Duration::from_secs(10), reader.read(&mut buf)).await {
@@ -653,7 +635,7 @@ async fn handle_conn(conn: TcpStream, sessions: SessionMap, pool: BufPool) {
     tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
     mux_run(mux.clone(), reader).await;
 
-    sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
+    sessions.remove_if(user_id.as_str(), |_, m| Arc::ptr_eq(m, &mux));
 }
 
 async fn kick_api(sessions: SessionMap) {
