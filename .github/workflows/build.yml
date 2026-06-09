@@ -28,32 +28,20 @@ jobs:
           curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Prepare source tree
+      - name: Extract source files from script
         run: |
           mkdir -p btsrc/src/bin
 
-          # Si existen archivos .rs sueltos en el repo, usarlos directamente
-          if [ -f Cargo.toml ] && [ -f btserver.rs ]; then
-            echo "Usando archivos fuente del repo directamente"
-            cp Cargo.toml btsrc/Cargo.toml
-            cp btserver.rs btsrc/src/bin/btserver.rs
-            # panel.rs: del repo si existe, si no extraer del script
-            if [ -f panel.rs ]; then
-              cp panel.rs btsrc/src/bin/panel.rs
-            else
-              sed -n "/^cat > \"\$PROJ\/src\/bin\/panel.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/panel.rs
-            fi
-          else
-            echo "Extrayendo fuentes del script .sh"
-            sed -n '/^cat > "\$PROJ\/Cargo.toml"/,/^TOMLEOF$/{ /^cat /d; /^TOMLEOF$/d; p }' Rusthevsocks5.sh > btsrc/Cargo.toml
-            sed -n "/^cat > \"\$PROJ\/src\/bin\/btserver.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/btserver.rs
-            sed -n "/^cat > \"\$PROJ\/src\/bin\/panel.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/panel.rs
-          fi
+          sed -n '/^cat > "\$PROJ\/Cargo.toml"/,/^TOMLEOF$/{ /^cat /d; /^TOMLEOF$/d; p }' Rusthevsocks5.sh > btsrc/Cargo.toml
+          sed -n "/^cat > \"\$PROJ\/src\/bin\/btserver.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/btserver.rs
+          sed -n "/^cat > \"\$PROJ\/src\/bin\/panel.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/panel.rs
 
-          echo "--- Cargo.toml ---"
-          cat btsrc/Cargo.toml
-          echo "--- btserver.rs lines: $(wc -l < btsrc/src/bin/btserver.rs)"
-          echo "--- panel.rs lines:    $(wc -l < btsrc/src/bin/panel.rs)"
+          echo "--- Cargo.toml preview ---"
+          head -10 btsrc/Cargo.toml
+          echo "--- btserver.rs lines ---"
+          wc -l btsrc/src/bin/btserver.rs
+          echo "--- panel.rs lines ---"
+          wc -l btsrc/src/bin/panel.rs
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -68,7 +56,7 @@ jobs:
 
       - name: Build release binaries
         working-directory: btsrc
-        run: ~/.cargo/bin/cargo build --release 2>&1
+        run: ~/.cargo/bin/cargo build --release
 
       - name: Prepare artifacts
         run: |
@@ -93,7 +81,6 @@ jobs:
           name: "Build #${{ github.run_number }} (Debian 12)"
           body: |
             Binarios compilados en Debian 12 (GLIBC 2.36)
-            Kernel mínimo requerido: cualquier Linux x86_64
             Commit: ${{ github.sha }}
           files: |
             dist/btserver
