@@ -140,7 +140,7 @@ use std::{
     os::unix::io::AsRawFd,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering},
-        Arc, LazyLock,
+        Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -192,42 +192,32 @@ const T_PONG:    u8 = 0x05;
 const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
 
-static UTC_OFFSET: LazyLock<i64> = LazyLock::new(|| {
-    let out = std::process::Command::new("date").arg("+%z").output()
-        .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-    let s = out.trim();
-    if s.len() < 5 { return 0; }
-    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-    let h: i64 = s[1..3].parse().unwrap_or(0);
-    let m: i64 = s[3..5].parse().unwrap_or(0);
-    sign * (h * 3600 + m * 60)
-});
-
 #[inline(always)]
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-fn civil_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
-    let m2 = if m <= 2 { m + 12 } else { m };
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let a  = y2 / 100;
-    let b  = 2 - a + a / 4;
-    (365.25 * (y2 + 4716) as f64) as i64
-        + (30.6001 * (m2 + 1) as f64) as i64
-        + d + b - 1524 - 2440588
-}
-
-fn parse_date_end(s: &str) -> Option<i64> {
+fn parse_expires(s: &str) -> Option<i64> {
     let s = s.trim();
+    if let Ok(ts) = s.parse::<i64>() {
+        return Some(ts);
+    }
     let mut it = s.splitn(3, '-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
-    Some(civil_to_epoch_days(y, m, d) * 86400 + 86399 - *UTC_OFFSET)
+    if y < 2000 || y > 2100 { return None; }
+    let m2 = if m <= 2 { m + 12 } else { m };
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let a  = y2 / 100;
+    let b  = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64
+        + (30.6001 * (m2 + 1) as f64) as i64
+        + d + b - 1524 - 2440588;
+    Some(days * 86400 + 86399)
 }
 
-enum AuthResult { Ok { name: String, days: i64 }, NotFound, Expired }
+enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 
 fn check_auth(id: &str) -> AuthResult {
     let Ok(content) = std::fs::read_to_string(USERS_FILE) else {
@@ -241,10 +231,10 @@ fn check_auth(id: &str) -> AuthResult {
         let Some(name) = parts.next() else { continue };
         let Some(exp)  = parts.next() else { continue };
         if uid != id { continue; }
-        let Some(exp_ts) = parse_date_end(exp) else { continue };
+        let Some(exp_ts) = parse_expires(exp) else { continue };
         let now = now_secs();
         if now > exp_ts { return AuthResult::Expired; }
-        return AuthResult::Ok { name: name.to_string(), days: (exp_ts - now) / 86400 + 1 };
+        return AuthResult::Ok { name: name.to_string(), secs_left: exp_ts - now };
     }
     AuthResult::NotFound
 }
@@ -664,14 +654,14 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
         None => { send_403(&mut writer, "not_registered").await; return; }
     };
 
-    let (name, days) = match check_auth(&user_id) {
-        AuthResult::Ok { name, days } => (name, days),
+    let (name, secs_left) = match check_auth(&user_id) {
+        AuthResult::Ok { name, secs_left } => (name, secs_left),
         AuthResult::NotFound => { send_403(&mut writer, "not_registered").await; return; }
         AuthResult::Expired  => { send_403(&mut writer, "expired").await; return; }
     };
 
     let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Days: {days}\r\n\r\n"
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n"
     );
     if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
@@ -763,8 +753,6 @@ async fn main() -> Result<()> {
                 .add_directive("btserver=info".parse()?),
         )
         .init();
-
-    let _ = *UTC_OFFSET;
 
     let sessions: SessionMap = Arc::new(DashMap::new());
     let pool = BufPool::new(POOL_PREALLOC, MAX_PAYLOAD + 7);
