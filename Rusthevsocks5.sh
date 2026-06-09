@@ -699,7 +699,18 @@ async fn kick_api(sessions: SessionMap) {
         if kick_session_sync(&s, id, reason) { "kicked".into() } else { "not_connected".into() }
     }
 
-    let app = Router::new().route("/kick", get(kick_handler)).with_state(sessions);
+    async fn active_handler(State(s): State<SessionMap>) -> String {
+        let ids: Vec<String> = s.iter()
+            .filter(|r| !r.value().dead.load(Ordering::Relaxed))
+            .map(|r| r.key().clone())
+            .collect();
+        serde_json::json!({ "active": ids, "count": ids.len() }).to_string()
+    }
+
+    let app = Router::new()
+        .route("/kick",   get(kick_handler))
+        .route("/active", get(active_handler))
+        .with_state(sessions);
     let ln  = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
     info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
@@ -938,15 +949,37 @@ fn auth_check(state: &AppState, headers: &HeaderMap, addr: &SocketAddr) -> Optio
     None
 }
 
+async fn fetch_active_ids() -> std::collections::HashSet<String> {
+    let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else {
+        return Default::default();
+    };
+    let Ok(resp) = c.get("http://127.0.0.1:8091/active").send().await else {
+        return Default::default();
+    };
+    let Ok(text) = resp.text().await else { return Default::default(); };
+    let Ok(val)  = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Default::default();
+    };
+    val["active"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
 async fn handle_clients(
     State(st): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> ApiResult {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let active = fetch_active_ids().await;
     let _l = st.users_mu.lock().unwrap();
     let users = load_users();
-    let rows: Vec<_> = users.iter().map(|(id, u)| user_row(id, u)).collect();
+    let rows: Vec<_> = users.iter().map(|(id, u)| {
+        let mut row = user_row(id, u);
+        row["connected"] = serde_json::json!(active.contains(id.as_str()));
+        row
+    }).collect();
     (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len()})))
 }
 
