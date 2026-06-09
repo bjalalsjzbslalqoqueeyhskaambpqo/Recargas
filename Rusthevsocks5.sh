@@ -924,8 +924,8 @@ async fn handle_clients(
     State(st): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> impl IntoResponse {
-    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return Err(e.0); }
     let _l = st.users_mu.lock().unwrap();
     let users = load_users();
     let active_ids = get_active_ids().await;
@@ -933,7 +933,7 @@ async fn handle_clients(
     let rows: Vec<_> = users.iter()
         .map(|(id, u)| user_row(id, u, active_set.contains(id)))
         .collect();
-    (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len(),"active_count":active_ids.len()})))
+    Ok((StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len(),"active_count":active_ids.len()}))))
 }
 
 async fn handle_client(
@@ -941,17 +941,17 @@ async fn handle_client(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(p): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return Err(e.0); }
     let id = match p.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         Some(id) => id,
-        None => return err_resp(StatusCode::BAD_REQUEST, "falta id"),
+        None => return Err(StatusCode::BAD_REQUEST),
     };
     let active_ids = get_active_ids().await;
     let _l = st.users_mu.lock().unwrap();
     match load_users().get(&id).cloned() {
-        Some(u) => (StatusCode::OK, Json(user_row(&id, &u, active_ids.iter().any(|x| x == &id)))),
-        None    => err_resp(StatusCode::NOT_FOUND, "no encontrado"),
+        Some(u) => Ok((StatusCode::OK, Json(user_row(&id, &u, active_ids.iter().any(|x| x == &id))))),
+        None    => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -963,10 +963,10 @@ async fn handle_create(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateBody>,
-) -> impl IntoResponse {
-    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return Err(e.0); }
     let id = body.id.trim().to_string();
-    if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    if id.is_empty() { return Err(StatusCode::BAD_REQUEST); }
     let name = body.name.as_deref().unwrap_or("").trim().to_string();
     let name = if name.is_empty() { "sin-nombre".to_string() } else { name };
     let days = body.days.unwrap_or(30);
@@ -977,7 +977,7 @@ async fn handle_create(
     users.insert(id.clone(), User { name: name.clone(), expires });
     save_users(&users);
     if was_active { tokio::spawn(kick_user(id.clone(), "replaced")); }
-    (StatusCode::OK, Json(serde_json::json!({"ok":true,"id":id,"name":name,"expires":expires,"days":days,"was_active":was_active})))
+    Ok((StatusCode::OK, Json(serde_json::json!({"ok":true,"id":id,"name":name,"expires":expires,"days":days,"was_active":was_active})))
 }
 
 #[derive(Deserialize)]
@@ -988,19 +988,19 @@ async fn handle_delete(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<IdBody>,
-) -> impl IntoResponse {
-    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return Err(e.0); }
     let id = body.id.trim().to_string();
-    if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    if id.is_empty() { return Err(StatusCode::BAD_REQUEST); }
     {
         let _l = st.users_mu.lock().unwrap();
         let mut users = load_users();
-        if !users.contains_key(&id) { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); }
+        if !users.contains_key(&id) { return Err(StatusCode::NOT_FOUND); }
         users.remove(&id);
         save_users(&users);
     }
     tokio::spawn(kick_user(id, "kicked"));
-    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    Ok((StatusCode::OK, Json(serde_json::json!({"ok":true})))
 }
 
 #[derive(Deserialize)]
@@ -1016,16 +1016,16 @@ async fn handle_update(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<UpdateBody>,
-) -> impl IntoResponse {
-    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return Err(e.0); }
     let id = body.id.trim().to_string();
-    if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    if id.is_empty() { return Err(StatusCode::BAD_REQUEST); }
 
     let (final_id, u, kick_old) = {
         let _l = st.users_mu.lock().unwrap();
         let mut users = load_users();
         let Some(mut u) = users.get(&id).cloned() else {
-            return err_resp(StatusCode::NOT_FOUND, "no encontrado");
+            return Err(StatusCode::NOT_FOUND);
         };
         if let Some(n) = body.name.as_deref() {
             if !n.trim().is_empty() { u.name = n.trim().to_string(); }
@@ -1038,7 +1038,7 @@ async fn handle_update(
             let nid = nid.trim().to_string();
             if !nid.is_empty() && nid != id {
                 if users.contains_key(&nid) {
-                    return err_resp(StatusCode::CONFLICT, "new_id ya existe");
+                    return Err(StatusCode::CONFLICT);
                 }
                 users.remove(&id);
                 (nid, true)
@@ -1058,7 +1058,7 @@ async fn handle_update(
     if days_left(&u.expires.to_string()) <= 0 { tokio::spawn(kick_user(final_id.clone(), "expired")); }
     let active_ids = get_active_ids().await;
     let is_active = active_ids.iter().any(|x| x == &final_id);
-    (StatusCode::OK, Json(user_row(&final_id, &u, is_active)))
+    Ok((StatusCode::OK, Json(user_row(&final_id, &u, is_active))))
 }
 
 #[tokio::main]
