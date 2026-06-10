@@ -97,7 +97,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "5.0.0"
+version = "6.0.0"
 edition = "2021"
 
 [[bin]]
@@ -156,7 +156,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::mpsc,
+    sync::{mpsc, watch},
     time,
 };
 use tracing::{info, warn};
@@ -497,17 +497,33 @@ async fn handle_stream(
         }
     }
 
+    let (close_tx, _) = tokio::sync::watch::channel(false);
+    let mut close_rx_c2h = close_tx.subscribe();
+    let close_tx_h2c = close_tx.clone();
+
     let mux2    = mux.clone();
     let stream2 = stream.clone();
 
     let t_c2h = tokio::spawn(async move {
         stream2.worker_count.fetch_add(1, Ordering::Relaxed);
-        while let Some(data) = rx.recv().await {
-            stream2.touch();
-            if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                _ = close_rx_c2h.changed() => break,
+                data = rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            stream2.touch();
+                            if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
+        let _ = hev_w.shutdown().await;
         stream2.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
@@ -526,6 +542,7 @@ async fn handle_stream(
             }
         }
         put_read_buf(buf);
+        let _ = close_tx_h2c.send(true);
         stream.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
@@ -857,7 +874,7 @@ async fn main() -> Result<()> {
 
     let std_ln   = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    info!("btserver v5 on {LISTEN_ADDR} → hev {HEV_ADDR}");
+    info!("btserver v6 on {LISTEN_ADDR} → hev {HEV_ADDR}");
 
     loop {
         match listener.accept().await {
@@ -1307,7 +1324,7 @@ SVC
 
 cat > /etc/systemd/system/btserver.service << 'SVC'
 [Unit]
-Description=BlackTunnel Server (Rust v5)
+Description=BlackTunnel Server (Rust v6)
 After=network.target hev-socks5.service
 Requires=hev-socks5.service
 
@@ -1328,7 +1345,7 @@ SVC
 
 cat > /etc/systemd/system/btpanel.service << 'SVC'
 [Unit]
-Description=BlackTunnel Panel (Rust v5)
+Description=BlackTunnel Panel (Rust v6)
 After=network.target
 
 [Service]
@@ -1365,7 +1382,7 @@ fi
 
 echo ""
 echo "================================================"
-echo "  INSTALACION COMPLETA (Rust v5)"
+echo "  INSTALACION COMPLETA (Rust v6)"
 echo "================================================"
 echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
 echo "  TOKEN:      ${PANEL_TOKEN}"
