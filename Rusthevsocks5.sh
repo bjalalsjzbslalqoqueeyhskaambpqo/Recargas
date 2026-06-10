@@ -55,13 +55,13 @@ main:
   listen-ipv6-only: false
   domain-address-type: unspec
 misc:
-  connect-timeout: 5000
-  tcp-read-write-timeout: 300000
+  connect-timeout: 2000
+  tcp-read-write-timeout: 120000
   udp-read-write-timeout: 60000
-  max-session-count: 0
+  max-session-count: 8000
   log-file: stderr
   log-level: warn
-  limit-nofile: 1000000
+  limit-nofile: 65536
 YMLEOF
 
 info "Instalando dependencias del sistema..."
