@@ -135,7 +135,7 @@ TOMLEOF
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
     collections::HashMap,
-    io::IoSlice,
+
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
@@ -405,6 +405,19 @@ impl Mux {
     }
 }
 
+static READ_BUF_POOL: std::sync::OnceLock<crossbeam_queue::ArrayQueue<Vec<u8>>> = std::sync::OnceLock::new();
+
+fn get_read_buf() -> Vec<u8> {
+    READ_BUF_POOL.get()
+        .and_then(|p| p.pop())
+        .unwrap_or_else(|| vec![0u8; MAX_PAYLOAD])
+}
+
+fn put_read_buf(mut b: Vec<u8>) {
+    b.clear();
+    if let Some(p) = READ_BUF_POOL.get() { let _ = p.push(b); }
+}
+
 type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
 
 fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
@@ -424,53 +437,34 @@ async fn write_loop(
     mut ctrl_rx:  mpsc::Receiver<Bytes>,
     mux:          Arc<Mux>,
 ) {
-    let mut batch: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
+    let mut buf = bytes::BytesMut::with_capacity(MAX_PAYLOAD * MAX_BATCH);
 
-    'outer: loop {
-        batch.clear();
+    loop {
+        buf.clear();
 
         tokio::select! {
             biased;
             frame = ctrl_rx.recv() => {
                 let Some(f) = frame else { break; };
-                batch.push(f);
-                while let Ok(f) = ctrl_rx.try_recv() { batch.push(f); }
+                buf.extend_from_slice(&f);
+                while let Ok(f) = ctrl_rx.try_recv() { buf.extend_from_slice(&f); }
             }
             frame = write_rx.recv() => {
                 let Some(f) = frame else { break; };
-                batch.push(f);
-                while batch.len() < MAX_BATCH {
+                buf.extend_from_slice(&f);
+                let mut count = 1;
+                while count < MAX_BATCH {
                     match write_rx.try_recv() {
-                        Ok(f)  => batch.push(f),
+                        Ok(f)  => { buf.extend_from_slice(&f); count += 1; }
                         Err(_) => break,
                     }
                 }
             }
         }
 
-        let total: usize = batch.iter().map(|b| b.len()).sum();
-        let mut skip = 0usize;
-
-        loop {
-            let mut off = 0usize;
-            let slices: Vec<IoSlice<'_>> = batch.iter().filter_map(|b| {
-                let start = off;
-                off += b.len();
-                if start + b.len() <= skip { return None; }
-                let s = skip.saturating_sub(start);
-                Some(IoSlice::new(&b[s..]))
-            }).collect();
-
-            if slices.is_empty() { break; }
-
-            match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_vectored(&slices)).await {
-                Ok(Ok(0)) => { mux.dead.store(true, Ordering::Release); break 'outer; }
-                Ok(Ok(n)) => {
-                    skip += n;
-                    if skip >= total { break; }
-                }
-                _ => { mux.dead.store(true, Ordering::Release); break 'outer; }
-            }
+        match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await {
+            Ok(Ok(())) => {}
+            _ => break,
         }
     }
 
@@ -519,7 +513,8 @@ async fn handle_stream(
 
     let t_h2c = tokio::spawn(async move {
         stream.worker_count.fetch_add(1, Ordering::Relaxed);
-        let mut buf = vec![0u8; MAX_PAYLOAD];
+        let mut buf = get_read_buf();
+        buf.resize(MAX_PAYLOAD, 0);
         loop {
             match hev_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -529,6 +524,7 @@ async fn handle_stream(
                 }
             }
         }
+        put_read_buf(buf);
         stream.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
@@ -859,6 +855,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    READ_BUF_POOL.set(crossbeam_queue::ArrayQueue::new(512)).ok();
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
