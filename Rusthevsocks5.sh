@@ -56,10 +56,10 @@ main:
   domain-address-type: unspec
 misc:
   connect-timeout: 10000
-  max-session-count: 8000
+  max-session-count: 0
   log-file: stderr
   log-level: warn
-  limit-nofile: 65536
+  limit-nofile: 1000000
 YMLEOF
 
 info "Instalando dependencias del sistema..."
@@ -95,7 +95,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "8.0.0"
+version = "6.0.0"
 edition = "2021"
 
 [[bin]]
@@ -164,22 +164,22 @@ const LISTEN_ADDR:          &str     = "0.0.0.0:80";
 const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 768;
+const QUEUE_SIZE:           usize    = 1024;
 const MAX_PAYLOAD:          usize    = 16384;
-const DIAL_TIMEOUT:         Duration = Duration::from_millis(1000);
+const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
-const MUX_WRITE_QUEUE:      usize    = 3072;
+const MUX_WRITE_QUEUE:      usize    = 4096;
 const CTRL_QUEUE:           usize    = 512;
-const MAX_BATCH:            usize    = 32;
+const MAX_BATCH:            usize    = 64;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
-const HEV_RCVBUF:           i32      = 262144;
-const HEV_SNDBUF:           i32      = 262144;
+const HEV_RCVBUF:           i32      = 524288;
+const HEV_SNDBUF:           i32      = 524288;
 const CLI_RCVBUF:           i32      = 524288;
-const CLI_SNDBUF:           i32      = 786432;
+const CLI_SNDBUF:           i32      = 524288;
 const POOL_PREALLOC:        usize    = 4096;
 
 const T_OPEN:    u8 = 0x01;
@@ -301,23 +301,22 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
 
 fn tune_client_fd(fd: i32) {
     unsafe {
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,   1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK,  1);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,     CLI_RCVBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,     CLI_SNDBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE,  1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,  120);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,   CLI_RCVBUF);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,   CLI_SNDBUF);
     }
 }
 
 fn tune_hev_fd(fd: i32) {
     unsafe {
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,    HEV_RCVBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,    HEV_SNDBUF);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,   1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK,  1);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,     HEV_RCVBUF);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,     HEV_SNDBUF);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE,  1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,  30);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
     }
 }
 
@@ -873,7 +872,7 @@ async fn main() -> Result<()> {
 
     let std_ln   = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    info!("btserver v8 on {LISTEN_ADDR} → hev {HEV_ADDR}");
+    info!("btserver v6 on {LISTEN_ADDR} → hev {HEV_ADDR}");
 
     loop {
         match listener.accept().await {
@@ -1323,7 +1322,7 @@ SVC
 
 cat > /etc/systemd/system/btserver.service << 'SVC'
 [Unit]
-Description=BlackTunnel Server (Rust v8)
+Description=BlackTunnel Server (Rust v6)
 After=network.target hev-socks5.service
 Requires=hev-socks5.service
 
@@ -1344,7 +1343,7 @@ SVC
 
 cat > /etc/systemd/system/btpanel.service << 'SVC'
 [Unit]
-Description=BlackTunnel Panel (Rust v8)
+Description=BlackTunnel Panel (Rust v6)
 After=network.target
 
 [Service]
@@ -1381,7 +1380,7 @@ fi
 
 echo ""
 echo "================================================"
-echo "  INSTALACION COMPLETA (Rust v8)"
+echo "  INSTALACION COMPLETA (Rust v6)"
 echo "================================================"
 echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
 echo "  TOKEN:      ${PANEL_TOKEN}"
