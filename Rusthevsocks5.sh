@@ -515,10 +515,11 @@ async fn handle_stream(
         stream.worker_count.fetch_add(1, Ordering::Relaxed);
         let mut buf = get_read_buf();
         buf.resize(MAX_PAYLOAD, 0);
+        let idle = Duration::from_secs(STREAM_IDLE_TIMEOUT as u64);
         loop {
-            match hev_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
+            match time::timeout(idle, hev_r.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
                     stream.touch();
                     mux2.send_data_sync(sid, &buf[..n]);
                 }
@@ -533,30 +534,12 @@ async fn handle_stream(
     mux.send_ctrl_sync(T_CLOSE, sid);
 }
 
-async fn idle_reaper(mux: Arc<Mux>) {
-    let mut tick = time::interval(Duration::from_secs(60));
-    loop {
-        tick.tick().await;
-        if mux.is_dead() { return; }
-        let stale: Vec<u32> = mux.streams.iter()
-            .filter(|r| {
-                let s = r.value();
-                s.worker_count.load(Ordering::Relaxed) == 0
-                    && !s.is_closed()
-                    && s.idle_secs() > STREAM_IDLE_TIMEOUT
-            })
-            .map(|r| *r.key())
-            .collect();
-        for sid in stale {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_sync(T_CLOSE, sid);
-        }
-    }
-}
+
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut hdr  = [0u8; 7];
-    let mut rbuf = vec![0u8; MAX_PAYLOAD];
+    let mut rbuf = get_read_buf();
+    rbuf.resize(MAX_PAYLOAD, 0);
 
     loop {
         match time::timeout(READ_DEADLINE, reader.read_exact(&mut hdr)).await {
@@ -600,9 +583,17 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                     if !s.is_closed() {
                         s.touch();
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.try_send(payload).is_err() {
-                            mux.close_stream_sync(sid);
-                            mux.send_ctrl_sync(T_CLOSE, sid);
+                        if s.tx.try_send(payload.clone()).is_err() {
+                            match time::timeout(
+                                Duration::from_millis(50),
+                                s.tx.send(payload)
+                            ).await {
+                                Ok(Ok(())) => {}
+                                _ => {
+                                    mux.close_stream_sync(sid);
+                                    mux.send_ctrl_sync(T_CLOSE, sid);
+                                }
+                            }
                         }
                     }
                 }
@@ -615,6 +606,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
 
     let sids: Vec<u32> = mux.streams.iter().map(|r| *r.key()).collect();
     for sid in sids { mux.close_stream_sync(sid); }
+    put_read_buf(rbuf);
 }
 
 fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
@@ -726,8 +718,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitro
                 prev_mux.dead.store(true, Ordering::Release);
             }
 
-            tokio::spawn(idle_reaper(mux.clone()));
-            tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
+                    tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
             mux_run(mux.clone(), reader).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
         }
