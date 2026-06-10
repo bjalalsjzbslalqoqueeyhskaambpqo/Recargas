@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: debian:12
+      image: debian:11
 
     steps:
       - name: Install system dependencies
@@ -31,11 +31,9 @@ jobs:
       - name: Extract source files from script
         run: |
           mkdir -p btsrc/src/bin
-
           sed -n '/^cat > "\$PROJ\/Cargo.toml"/,/^TOMLEOF$/{ /^cat /d; /^TOMLEOF$/d; p }' Rusthevsocks5.sh > btsrc/Cargo.toml
           sed -n "/^cat > \"\$PROJ\/src\/bin\/btserver.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/btserver.rs
           sed -n "/^cat > \"\$PROJ\/src\/bin\/panel.rs\"/,/^RSEOF\$/"'{ /^cat /d; /^RSEOF$/d; p }' Rusthevsocks5.sh > btsrc/src/bin/panel.rs
-
           echo "--- Cargo.toml preview ---"
           head -10 btsrc/Cargo.toml
           echo "--- btserver.rs lines ---"
@@ -50,9 +48,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             btsrc/target
-          key: debian12-cargo-${{ hashFiles('btsrc/Cargo.toml') }}
+          key: debian11-cargo-${{ hashFiles('btsrc/Cargo.toml') }}
           restore-keys: |
-            debian12-cargo-
+            debian11-cargo-
 
       - name: Build release binaries
         working-directory: btsrc
@@ -70,7 +68,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: btserver-binaries-debian12
+          name: btserver-binaries-debian11
           path: dist/
           retention-days: 30
 
@@ -78,9 +76,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: "Build #${{ github.run_number }} (Debian 12)"
+          name: "Build #${{ github.run_number }} (Debian 11)"
           body: |
-            Binarios compilados en Debian 12 (GLIBC 2.36)
+            Binarios compilados en Debian 11 (GLIBC 2.31)
             Commit: ${{ github.sha }}
           files: |
             dist/btserver
