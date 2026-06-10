@@ -647,7 +647,7 @@ async fn wait_room(
     waitroom: WaitRoom,
     ip_count: IpCount,
 ) {
-    let activated_msg = b"\x81\x10{\"status\":\"activated\"}";
+    let activated_msg = b"{\"status\":\"activated\"}\n";
 
     let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
 
