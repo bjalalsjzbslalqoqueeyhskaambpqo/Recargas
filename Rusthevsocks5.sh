@@ -55,11 +55,7 @@ main:
   listen-ipv6-only: false
   domain-address-type: unspec
 misc:
-  connect-timeout: 10000
-  max-session-count: 8000
-  log-file: stderr
-  log-level: warn
-  limit-nofile: 1000000
+  limit-nofile: 65536
 YMLEOF
 
 info "Instalando dependencias del sistema..."
@@ -164,16 +160,16 @@ const LISTEN_ADDR:          &str     = "0.0.0.0:80";
 const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 4096;
+const QUEUE_SIZE:           usize    = 8192;
 const MAX_PAYLOAD:          usize    = 16384;
 const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
-const MUX_WRITE_QUEUE:      usize    = 4096;
+const MUX_WRITE_QUEUE:      usize    = 8192;
 const CTRL_QUEUE:           usize    = 2048;
-const MAX_BATCH:            usize    = 128;
+const MAX_BATCH:            usize    = 64;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
 const HEV_RCVBUF:           i32      = 524288;
