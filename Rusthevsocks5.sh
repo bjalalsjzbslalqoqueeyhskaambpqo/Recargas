@@ -192,6 +192,22 @@ const T_PONG:    u8 = 0x05;
 const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
 
+const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
+const WAIT_MAX_PER_IP: usize    = 3;
+
+fn valid_id(id: &str) -> bool {
+    if let Some(rest) = id.strip_prefix("S-") {
+        return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = id.strip_prefix("STRK-") {
+        return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    false
+}
+
+type WaitRoom = Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>;
+type IpCount  = Arc<DashMap<String, usize>>;
+
 #[inline(always)]
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -623,8 +639,50 @@ async fn send_403(writer: &mut OwnedWriteHalf, reason: &str) {
     let _ = writer.write_all(body.as_bytes()).await;
 }
 
-async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
+async fn wait_room(
+    mut writer: OwnedWriteHalf,
+    mut reader: OwnedReadHalf,
+    user_id: String,
+    ip: String,
+    waitroom: WaitRoom,
+    ip_count: IpCount,
+) {
+    let activated_msg = b"\x81\x10{\"status\":\"activated\"}";
+
+    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
+
+    if let Some(prev_tx) = waitroom.insert(user_id.clone(), promote_tx) {
+        let _ = prev_tx.send(());
+    }
+
+    *ip_count.entry(ip.clone()).or_insert(0) += 1;
+
+    let result = tokio::select! {
+        _ = promote_rx => "promoted",
+        _ = time::sleep(WAIT_TIMEOUT) => "timeout",
+        _ = async {
+            let mut drain = [0u8; 256];
+            loop {
+                match reader.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        } => "disconnected",
+    };
+
+    if result == "promoted" {
+        let _ = writer.write_all(activated_msg).await;
+    }
+
+    waitroom.remove(&user_id);
+    ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
+}
+
+async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitroom: WaitRoom, ip_count: IpCount) {
     tune_client_fd(tcp.as_raw_fd());
+
+    let peer_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
 
     let mut buf = vec![0u8; 8192];
     let mut n   = 0usize;
@@ -651,41 +709,60 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool) {
 
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
-        None => { send_403(&mut writer, "not_registered").await; return; }
+        None => return,
     };
 
-    let (name, secs_left) = match check_auth(&user_id) {
-        AuthResult::Ok { name, secs_left } => (name, secs_left),
-        AuthResult::NotFound => { send_403(&mut writer, "not_registered").await; return; }
-        AuthResult::Expired  => { send_403(&mut writer, "expired").await; return; }
-    };
+    if !valid_id(&user_id) { return; }
 
-    let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n"
-    );
-    if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+    let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
-    let (write_tx, write_rx) = mpsc::channel::<Bytes>(MUX_WRITE_QUEUE);
-    let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
-    let mux = Mux::new(write_tx, ctrl_tx, pool);
+    match check_auth(&user_id) {
+        AuthResult::Ok { name, secs_left } => {
+            let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
+            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-    if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
-        let _ = prev_mux.ctrl_tx.try_send(prev_mux.pool.ctrl(T_KICK, 0));
-        prev_mux.dead.store(true, Ordering::Release);
+            let (write_tx, write_rx) = mpsc::channel::<Bytes>(MUX_WRITE_QUEUE);
+            let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
+            let mux = Mux::new(write_tx, ctrl_tx, pool);
+
+            if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
+                let _ = prev_mux.ctrl_tx.try_send(prev_mux.pool.ctrl(T_KICK, 0));
+                prev_mux.dead.store(true, Ordering::Release);
+            }
+
+            tokio::spawn(idle_reaper(mux.clone()));
+            tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
+            mux_run(mux.clone(), reader).await;
+            sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
+        }
+
+        AuthResult::NotFound | AuthResult::Expired => {
+            let ip_conns = ip_count.get(&peer_ip).map(|v| *v).unwrap_or(0);
+            if ip_conns >= WAIT_MAX_PER_IP { return; }
+
+            let status = match check_auth(&user_id) {
+                AuthResult::Expired  => "expired",
+                _                    => "waiting",
+            };
+            let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
+            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+
+            wait_room(writer, reader, user_id, peer_ip, waitroom, ip_count).await;
+        }
     }
-
-    tokio::spawn(idle_reaper(mux.clone()));
-    tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
-    mux_run(mux.clone(), reader).await;
-
-    sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
 }
 
-async fn kick_api(sessions: SessionMap) {
+#[derive(Clone)]
+struct InternalState {
+    sessions: SessionMap,
+    waitroom: WaitRoom,
+}
+
+async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
     use axum::{extract::{Query, State}, routing::get, Router};
 
     async fn kick_handler(
-        State(s): State<SessionMap>,
+        State(s): State<InternalState>,
         Query(p): Query<HashMap<String, String>>,
     ) -> String {
         let Some(id) = p.get("id").filter(|id| !id.is_empty()) else {
@@ -696,21 +773,38 @@ async fn kick_api(sessions: SessionMap) {
         } else {
             T_KICK
         };
-        if kick_session_sync(&s, id, reason) { "kicked".into() } else { "not_connected".into() }
+        if kick_session_sync(&s.sessions, id, reason) { "kicked".into() } else { "not_connected".into() }
     }
 
-    async fn active_handler(State(s): State<SessionMap>) -> String {
-        let ids: Vec<String> = s.iter()
+    async fn active_handler(State(s): State<InternalState>) -> String {
+        let ids: Vec<String> = s.sessions.iter()
             .filter(|r| !r.value().dead.load(Ordering::Relaxed))
             .map(|r| r.key().clone())
             .collect();
         serde_json::json!({ "active": ids, "count": ids.len() }).to_string()
     }
 
+    async fn promote_handler(
+        State(s): State<InternalState>,
+        Query(p): Query<HashMap<String, String>>,
+    ) -> String {
+        let Some(id) = p.get("id").filter(|id| !id.is_empty()) else {
+            return "missing_id".into();
+        };
+        if let Some((_, tx)) = s.waitroom.remove(id.as_str()) {
+            let _ = tx.send(());
+            "promoted".into()
+        } else {
+            "not_waiting".into()
+        }
+    }
+
+    let state = InternalState { sessions, waitroom };
     let app = Router::new()
-        .route("/kick",   get(kick_handler))
-        .route("/active", get(active_handler))
-        .with_state(sessions);
+        .route("/kick",    get(kick_handler))
+        .route("/active",  get(active_handler))
+        .route("/promote", get(promote_handler))
+        .with_state(state);
     let ln  = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
     info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
@@ -766,9 +860,11 @@ async fn main() -> Result<()> {
         .init();
 
     let sessions: SessionMap = Arc::new(DashMap::new());
+    let waitroom: WaitRoom   = Arc::new(DashMap::new());
+    let ip_count: IpCount    = Arc::new(DashMap::new());
     let pool = BufPool::new(POOL_PREALLOC, MAX_PAYLOAD + 7);
 
-    tokio::spawn(kick_api(sessions.clone()));
+    tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
     tokio::spawn(midnight_sweep(sessions.clone()));
 
     let std_ln   = build_listener().expect("listener");
@@ -778,9 +874,11 @@ async fn main() -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((conn, _)) => {
-                let s = sessions.clone();
-                let p = pool.clone();
-                tokio::spawn(handle_conn(conn, s, p));
+                let s  = sessions.clone();
+                let p  = pool.clone();
+                let wr = waitroom.clone();
+                let ic = ip_count.clone();
+                tokio::spawn(handle_conn(conn, s, p, wr, ic));
             }
             Err(e) => warn!("accept: {e}"),
         }
@@ -926,8 +1024,16 @@ fn user_row(id: &str, u: &User) -> serde_json::Value {
     })
 }
 
+const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
+
 async fn kick_user(id: String, reason: &'static str) {
     let url = format!("{KICK_BASE}{id}&reason={reason}");
+    let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else { return; };
+    let _ = c.get(&url).send().await;
+}
+
+async fn promote_user(id: String) {
+    let url = format!("{PROMOTE_BASE}{id}");
     let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else { return; };
     let _ = c.get(&url).send().await;
 }
@@ -1025,6 +1131,7 @@ async fn handle_create(
     users.insert(id.clone(), User { name: name.clone(), expires_ts });
     save_users(&users);
     info!(id, name, days, "usuario creado");
+    tokio::spawn(promote_user(id.clone()));
     (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
 }
 
@@ -1100,7 +1207,11 @@ async fn handle_update(
     };
 
     if kick_old { tokio::spawn(kick_user(id, "kicked")); }
-    if u.expires_ts <= now_secs() { tokio::spawn(kick_user(final_id.clone(), "expired")); }
+    if u.expires_ts <= now_secs() {
+        tokio::spawn(kick_user(final_id.clone(), "expired"));
+    } else {
+        tokio::spawn(promote_user(final_id.clone()));
+    }
     info!(id = final_id, "usuario actualizado");
     (StatusCode::OK, Json(user_row(&final_id, &u)))
 }
