@@ -55,8 +55,8 @@ main:
   listen-ipv6-only: false
   domain-address-type: unspec
 misc:
-  connect-timeout: 2000
-  tcp-read-write-timeout: 120000
+  connect-timeout: 4000
+  tcp-read-write-timeout: 240000
   udp-read-write-timeout: 60000
   max-session-count: 8000
   log-file: stderr
@@ -168,9 +168,9 @@ const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
 const QUEUE_SIZE:           usize    = 512;
 const MAX_PAYLOAD:          usize    = 8192;
-const DIAL_TIMEOUT:         Duration = Duration::from_millis(200);
-const HEV_CONN_TIMEOUT:     Duration = Duration::from_millis(500);
-const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(3);
+const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
+const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(3);
+const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(8);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT:  i64      = 300;
 const MUX_WRITE_QUEUE:      usize    = 2048;
