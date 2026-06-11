@@ -177,7 +177,7 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
 const MUX_WRITE_QUEUE:      usize    = 4096;
 const CTRL_QUEUE:           usize    = 2048;
-const BATCH_MIN:            usize    = 4;
+const BATCH_MIN:            usize    = 2;
 const BATCH_MAX:            usize    = 256;
 const MAX_BATCH:            usize    = BATCH_MAX;   // compatibilidad
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
@@ -479,24 +479,29 @@ async fn write_loop(
                 }
 
                 // ── Ajuste adaptativo ──────────────────────────────────────
-                // Costo: 2 comparaciones + 1 store atómico ocasional
-                // Se ejecuta solo cuando ya estamos procesando frames de datos
+                // Ratio: qué tan lleno está el batch
+                let ratio = (count * 100) / batch;
+
                 if count == batch {
-                    // Cola llena → duplica (hasta BATCH_MAX)
-                    // Señal: este cliente tiene alto throughput sostenido
-                    let next = (batch * 2).min(BATCH_MAX);
+                    // Cola llena → sube +1 (hasta BATCH_MAX)
+                    let next = (batch + 1).min(BATCH_MAX);
                     if next != batch {
                         mux.batch_size.store(next, Ordering::Relaxed);
                     }
-                } else if count < batch / 4 {
-                    // Menos del 25% del batch → divide (hasta BATCH_MIN)
-                    // Señal: tráfico esporádico, favorecer latencia baja
-                    let next = (batch / 2).max(BATCH_MIN);
-                    if next != batch {
-                        mux.batch_size.store(next, Ordering::Relaxed);
+                } else if ratio < 25 {
+                    // Menos del 25% → bajada adaptativa
+                    if batch > 32 {
+                        // Batch alto: drop directo a 32
+                        mux.batch_size.store(32, Ordering::Relaxed);
+                    } else {
+                        // Batch bajo: ajuste fino -1
+                        let next = (batch - 1).max(BATCH_MIN);
+                        if next != batch {
+                            mux.batch_size.store(next, Ordering::Relaxed);
+                        }
                     }
                 }
-                // Entre 25%-99%: zona neutra, no se toca nada
+                // 25%-99%: zona neutra, no se toca nada
                 // ──────────────────────────────────────────────────────────
             }
         }
