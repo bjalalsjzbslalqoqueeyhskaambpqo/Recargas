@@ -141,7 +141,7 @@ use std::{
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -177,7 +177,9 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
 const MUX_WRITE_QUEUE:      usize    = 4096;
 const CTRL_QUEUE:           usize    = 2048;
-const MAX_BATCH:            usize    = 128;
+const BATCH_MIN:            usize    = 4;
+const BATCH_MAX:            usize    = 256;
+const MAX_BATCH:            usize    = BATCH_MAX;   // compatibilidad
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
 const HEV_RCVBUF:           i32      = 524288;
@@ -350,22 +352,24 @@ impl Stream {
 }
 
 struct Mux {
-    write_tx: mpsc::Sender<Bytes>,
-    ctrl_tx:  mpsc::Sender<Bytes>,
-    streams:  Arc<DashMap<u32, Arc<Stream>>>,
-    count:    AtomicU32,
-    dead:     AtomicBool,
-    pool:     BufPool,
+    write_tx:   mpsc::Sender<Bytes>,
+    ctrl_tx:    mpsc::Sender<Bytes>,
+    streams:    Arc<DashMap<u32, Arc<Stream>>>,
+    count:      AtomicU32,
+    dead:       AtomicBool,
+    pool:       BufPool,
+    batch_size: AtomicUsize,   // ← NUEVO: batch adaptativo por conexión
 }
 
 impl Mux {
     fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>, pool: BufPool) -> Arc<Self> {
         Arc::new(Self {
             write_tx, ctrl_tx,
-            streams: Arc::new(DashMap::with_capacity(128)),
-            count:   AtomicU32::new(0),
-            dead:    AtomicBool::new(false),
+            streams:    Arc::new(DashMap::with_capacity(128)),
+            count:      AtomicU32::new(0),
+            dead:       AtomicBool::new(false),
             pool,
+            batch_size: AtomicUsize::new(BATCH_MIN),   // arranca conservador
         })
     }
 
@@ -440,35 +444,60 @@ async fn write_loop(
     mut ctrl_rx:  mpsc::Receiver<Bytes>,
     mux:          Arc<Mux>,
 ) {
-    let mut buf = bytes::BytesMut::with_capacity(MAX_PAYLOAD * MAX_BATCH);
+    let mut buf = bytes::BytesMut::with_capacity(MAX_PAYLOAD * BATCH_MAX);
 
     loop {
         buf.clear();
 
-        let batch = match mux.count.load(Ordering::Relaxed) {
-            0..=5   => 2,
-            6..=20  => 16,
-            21..=50 => 48,
-            _       => MAX_BATCH,
-        };
+        // Lee el batch_size actual — Relaxed es suficiente, es solo un hint
+        let batch = mux.batch_size.load(Ordering::Relaxed);
 
         tokio::select! {
             biased;
+
+            // Control tiene siempre prioridad (PING/PONG/KICK/CLOSE)
             frame = ctrl_rx.recv() => {
                 let Some(f) = frame else { break; };
                 buf.extend_from_slice(&f);
-                while let Ok(f) = ctrl_rx.try_recv() { buf.extend_from_slice(&f); }
+                while let Ok(f) = ctrl_rx.try_recv() {
+                    buf.extend_from_slice(&f);
+                }
+                // Los frames de control no cuentan para el ajuste de batch
             }
+
             frame = write_rx.recv() => {
                 let Some(f) = frame else { break; };
                 buf.extend_from_slice(&f);
-                let mut count = 1;
+                let mut count = 1usize;
+
+                // Drena hasta el batch actual
                 while count < batch {
                     match write_rx.try_recv() {
                         Ok(f)  => { buf.extend_from_slice(&f); count += 1; }
                         Err(_) => break,
                     }
                 }
+
+                // ── Ajuste adaptativo ──────────────────────────────────────
+                // Costo: 2 comparaciones + 1 store atómico ocasional
+                // Se ejecuta solo cuando ya estamos procesando frames de datos
+                if count == batch {
+                    // Cola llena → duplica (hasta BATCH_MAX)
+                    // Señal: este cliente tiene alto throughput sostenido
+                    let next = (batch * 2).min(BATCH_MAX);
+                    if next != batch {
+                        mux.batch_size.store(next, Ordering::Relaxed);
+                    }
+                } else if count < batch / 4 {
+                    // Menos del 25% del batch → divide (hasta BATCH_MIN)
+                    // Señal: tráfico esporádico, favorecer latencia baja
+                    let next = (batch / 2).max(BATCH_MIN);
+                    if next != batch {
+                        mux.batch_size.store(next, Ordering::Relaxed);
+                    }
+                }
+                // Entre 25%-99%: zona neutra, no se toca nada
+                // ──────────────────────────────────────────────────────────
             }
         }
 
