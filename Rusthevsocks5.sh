@@ -168,7 +168,7 @@ const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
 const MUX_WRITE_QUEUE:      usize    = 8192;
-const CTRL_QUEUE:           usize    = 2048;
+const CTRL_QUEUE:           usize    = 512;
 const MAX_BATCH:            usize    = 64;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
@@ -176,7 +176,7 @@ const HEV_RCVBUF:           i32      = 524288;
 const HEV_SNDBUF:           i32      = 524288;
 const CLI_RCVBUF:           i32      = 524288;
 const CLI_SNDBUF:           i32      = 524288;
-const POOL_PREALLOC:        usize    = 4096;
+const POOL_PREALLOC:        usize    = 2048;
 
 const T_OPEN:    u8 = 0x01;
 const T_DATA:    u8 = 0x02;
