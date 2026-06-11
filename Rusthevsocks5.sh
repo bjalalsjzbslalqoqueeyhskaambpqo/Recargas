@@ -136,15 +136,15 @@ TOMLEOF
 # ─── btserver.rs ───────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
 
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -177,9 +177,13 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
 const MUX_WRITE_QUEUE:      usize    = 4096;
 const CTRL_QUEUE:           usize    = 2048;
-const BATCH_MIN:            usize    = 2;
+const BATCH_MIN:            usize    = 8;
 const BATCH_MAX:            usize    = 256;
 const MAX_BATCH:            usize    = BATCH_MAX;   // compatibilidad
+const INITIAL_BATCH:        usize    = 64;          // punto de inicio
+const ADJUST_WINDOW_MS:     u64      = 200;         // ventana de medición
+const THROUGHPUT_THRESHOLD: i64      = 30;          // 3% × 1000
+const PROBE_INTERVAL:       usize    = 10;          // ciclos estables antes de probe
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
 const HEV_RCVBUF:           i32      = 524288;
@@ -352,13 +356,14 @@ impl Stream {
 }
 
 struct Mux {
-    write_tx:   mpsc::Sender<Bytes>,
-    ctrl_tx:    mpsc::Sender<Bytes>,
-    streams:    Arc<DashMap<u32, Arc<Stream>>>,
-    count:      AtomicU32,
-    dead:       AtomicBool,
-    pool:       BufPool,
-    batch_size: AtomicUsize,   // ← NUEVO: batch adaptativo por conexión
+    write_tx:       mpsc::Sender<Bytes>,
+    ctrl_tx:        mpsc::Sender<Bytes>,
+    streams:        Arc<DashMap<u32, Arc<Stream>>>,
+    count:          AtomicU32,
+    dead:           AtomicBool,
+    pool:           BufPool,
+    batch_size:     AtomicUsize,   // batch adaptativo por conexión (inicial = INITIAL_BATCH)
+    frames_sent:    AtomicU64,      // contador de frames enviados (controller lo lee)
 }
 
 impl Mux {
@@ -369,7 +374,8 @@ impl Mux {
             count:      AtomicU32::new(0),
             dead:       AtomicBool::new(false),
             pool,
-            batch_size: AtomicUsize::new(BATCH_MIN),   // arranca conservador
+            batch_size: AtomicUsize::new(INITIAL_BATCH),   // punto de inicio
+            frames_sent: AtomicU64::new(0),                 // contador para controller
         })
     }
 
@@ -449,7 +455,7 @@ async fn write_loop(
     loop {
         buf.clear();
 
-        // Lee el batch_size actual — Relaxed es suficiente, es solo un hint
+        // Lee el batch_size actual — Relaxed es suficiente
         let batch = mux.batch_size.load(Ordering::Relaxed);
 
         tokio::select! {
@@ -462,7 +468,6 @@ async fn write_loop(
                 while let Ok(f) = ctrl_rx.try_recv() {
                     buf.extend_from_slice(&f);
                 }
-                // Los frames de control no cuentan para el ajuste de batch
             }
 
             frame = write_rx.recv() => {
@@ -478,32 +483,13 @@ async fn write_loop(
                     }
                 }
 
-                // ── Ajuste adaptativo ──────────────────────────────────────
-                // Ratio: qué tan lleno está el batch
-                let ratio = (count * 100) / batch;
-
-                if count == batch {
-                    // Cola llena → sube +1 (hasta BATCH_MAX)
-                    let next = (batch + 1).min(BATCH_MAX);
-                    if next != batch {
-                        mux.batch_size.store(next, Ordering::Relaxed);
-                    }
-                } else if ratio < 25 {
-                    // Menos del 25% → bajada adaptativa
-                    if batch > 32 {
-                        // Batch alto: drop directo a 32
-                        mux.batch_size.store(32, Ordering::Relaxed);
-                    } else {
-                        // Batch bajo: ajuste fino -1
-                        let next = (batch - 1).max(BATCH_MIN);
-                        if next != batch {
-                            mux.batch_size.store(next, Ordering::Relaxed);
-                        }
-                    }
-                }
-                // 25%-99%: zona neutra, no se toca nada
-                // ──────────────────────────────────────────────────────────
+                // Registrar frames enviados para el controller
+                mux.frames_sent.fetch_add(count as u64, Ordering::Relaxed);
             }
+        }
+
+        if buf.is_empty() {
+            continue;
         }
 
         match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await {
@@ -720,6 +706,98 @@ async fn wait_room(
     ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADAPTIVE BATCH CONTROLLER
+// Mide throughput real y ajusta batch_size sin intervención.
+// Costo: <1μs cada ADJUST_WINDOW_MS, ~5ns por flush en write_loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn adaptive_controller(mux: Arc<Mux>) {
+    let mut history: VecDeque<u64> = VecDeque::with_capacity(10);
+    let mut stable_cycles: usize = 0;
+    let mut last_direction: i8 = 0;
+
+    loop {
+        time::sleep(Duration::from_millis(ADJUST_WINDOW_MS)).await;
+
+        if mux.dead.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Leer y resetear contador de frames
+        let frames = mux.frames_sent.swap(0, Ordering::Relaxed) as u64;
+        let batch = mux.batch_size.load(Ordering::Relaxed);
+
+        if batch == 0 {
+            continue;
+        }
+
+        // Calcular throughput: frames por segundo (escalado x1000 para evitar f64)
+        let throughput = if ADJUST_WINDOW_MS > 0 {
+            frames * 1000 / ADJUST_WINDOW_MS
+        } else {
+            frames * 1000
+        };
+
+        if history.len() >= 10 {
+            history.pop_front();
+        }
+        history.push_back(throughput);
+
+        if history.len() < 4 {
+            continue;
+        }
+
+        // Comparar últimos 2 ciclos vs promedio de los anteriores
+        let n = history.len();
+        let recent: u64 = (history[n-1] + history[n-2]) / 2;
+        let older: u64 = history[..n-2].iter().sum::<u64>() / (n - 2) as u64;
+
+        if older == 0 {
+            continue;
+        }
+
+        // Delta porcentual × 1000 (evita f64)
+        let delta = ((recent as i64 - older as i64) * 1000) / older as i64;
+
+        let threshold = THROUGHPUT_THRESHOLD; // 3%
+
+        if delta.abs() < threshold {
+            // Zona estable → probe periódico
+            stable_cycles += 1;
+            if stable_cycles >= PROBE_INTERVAL {
+                let dir = if last_direction == 0 { 1i8 } else { last_direction };
+                let step = (batch / 8).max(1);
+                let next = if dir > 0 {
+                    (batch + step).min(BATCH_MAX)
+                } else {
+                    batch.saturating_sub(step).max(BATCH_MIN)
+                };
+                mux.batch_size.store(next, Ordering::Relaxed);
+                last_direction = dir;
+                stable_cycles = 0;
+            }
+        } else if delta > 0 {
+            // Throughput mejorando → continuar en misma dirección
+            stable_cycles = 0;
+            let dir = if last_direction == 0 { 1i8 } else { last_direction };
+            let step = (batch / 8).max(1);
+            let next = (batch + step).min(BATCH_MAX);
+            mux.batch_size.store(next, Ordering::Relaxed);
+            last_direction = dir;
+        } else {
+            // Throughput empeorando → invertir dirección
+            stable_cycles = 0;
+            let dir = -last_direction.signum();
+            let dir = if dir == 0 { -1i8 } else { dir };
+            let step = (batch / 8).max(1);
+            let next = batch.saturating_sub(step).max(BATCH_MIN);
+            mux.batch_size.store(next, Ordering::Relaxed);
+            last_direction = dir;
+        }
+    }
+}
+
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitroom: WaitRoom, ip_count: IpCount) {
     tune_client_fd(tcp.as_raw_fd());
 
@@ -772,6 +850,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitro
             }
 
                     tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
+            tokio::spawn(adaptive_controller(mux.clone()));
             mux_run(mux.clone(), reader).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
         }
