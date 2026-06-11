@@ -144,7 +144,7 @@ use std::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -158,7 +158,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, watch},
+    sync::{mpsc},
     time,
 };
 use tracing::{info, warn};
@@ -751,7 +751,7 @@ async fn adaptive_controller(mux: Arc<Mux>) {
         // Comparar últimos 2 ciclos vs promedio de los anteriores
         let n = history.len();
         let recent: u64 = (history[n-1] + history[n-2]) / 2;
-        let older: u64 = history[..n-2].iter().sum::<u64>() / (n - 2) as u64;
+        let older: u64 = history.iter().take(n - 2).sum::<u64>() / (n - 2) as u64;
 
         if older == 0 {
             continue;
