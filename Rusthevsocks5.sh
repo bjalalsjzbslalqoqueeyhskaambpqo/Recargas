@@ -1,101 +1,9 @@
 #!/bin/bash
 set -e
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info() { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-
-[ "$(id -u)" = "0" ] || die "Ejecutar como root"
-
-if command -v wget >/dev/null 2>&1; then
-    FETCH="wget -q --timeout=30 -O"
-elif command -v curl >/dev/null 2>&1; then
-    FETCH="curl -fsSL --connect-timeout 30 -o"
-else
-    apt-get update -qq --fix-missing 2>/dev/null || true
-    apt-get install -y -qq wget 2>/dev/null || die "No hay wget ni curl"
-    FETCH="wget -q --timeout=30 -O"
-fi
-
-mkdir -p /opt/btserver
-cd /opt/btserver
-
-if [ -f /opt/btserver/token.txt ] && [ -s /opt/btserver/token.txt ]; then
-    PANEL_TOKEN=$(cat /opt/btserver/token.txt)
-    info "Token existente conservado."
-else
-    PANEL_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 64 || true)
-    echo "${PANEL_TOKEN}" > /opt/btserver/token.txt
-    chmod 600 /opt/btserver/token.txt
-    info "Nuevo token generado."
-fi
-
-PANEL_PORT=8090
-SERVER_IP=$(ip -4 addr show scope global | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo "0.0.0.0")
-
-info "Deteniendo servicios..."
-systemctl stop hev-socks5 btserver btpanel 2>/dev/null || true
-sleep 1
-
-info "Descargando hev-socks5-server..."
-$FETCH /tmp/hev-socks5-server.tmp \
-    https://github.com/heiher/hev-socks5-server/releases/latest/download/hev-socks5-server-linux-x86_64 \
-    || die "No se pudo descargar hev-socks5-server"
-mv -f /tmp/hev-socks5-server.tmp /opt/btserver/hev-socks5-server
-chmod +x /opt/btserver/hev-socks5-server
-info "hev-socks5-server OK"
-
-NWORKERS=$(nproc 2>/dev/null || echo 1)
-
-cat > /opt/btserver/hev-socks5-server.yml << YMLEOF
-main:
-  workers: ${NWORKERS}
-  port: 1080
-  listen-address: '127.0.0.1'
-  listen-ipv6-only: false
-  domain-address-type: unspec
-misc:
-  task-stack-size: 8192
-  udp-recv-buffer-size: 524288
-  connect-timeout: 10000
-  tcp-read-write-timeout: 300000
-  udp-read-write-timeout: 60000
-  max-session-count: 8000
-  log-file: stderr
-  log-level: warn
-  limit-nofile: 65536
-YMLEOF
-
-info "Instalando dependencias del sistema..."
-apt-get update -qq --fix-missing 2>/dev/null || true
-apt-get install -y -qq build-essential pkg-config libssl-dev 2>/dev/null \
-    || die "No se pudo instalar build-essential"
-info "build-essential OK"
-
-info "Verificando Rust..."
-if ! command -v cargo >/dev/null 2>&1; then
-    info "Instalando Rust (rustup)..."
-    export RUSTUP_HOME=/usr/local/rustup
-    export CARGO_HOME=/usr/local/cargo
-    $FETCH /tmp/rustup-init.sh https://sh.rustup.rs || die "No se pudo descargar rustup"
-    chmod +x /tmp/rustup-init.sh
-    /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain stable \
-        || die "Error instalando Rust"
-    rm -f /tmp/rustup-init.sh
-    ln -sf /usr/local/cargo/bin/cargo  /usr/local/bin/cargo
-    ln -sf /usr/local/cargo/bin/rustc  /usr/local/bin/rustc
-    ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup
-fi
-export CARGO_HOME=/usr/local/cargo
-export RUSTUP_HOME=/usr/local/rustup
-export PATH=/usr/local/cargo/bin:$PATH
-info "Rust: $(rustc --version)"
 
 PROJ=/opt/btserver/btsrc
-rm -rf "$PROJ"
 mkdir -p "$PROJ/src/bin"
 
-# ─── Cargo.toml ────────────────────────────────────────────────────────────────
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
@@ -133,11 +41,9 @@ strip         = true
 panic         = "abort"
 TOMLEOF
 
-# ─── btserver.rs ───────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
     collections::{HashMap, VecDeque},
-
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
@@ -179,11 +85,11 @@ const MUX_WRITE_QUEUE:      usize    = 4096;
 const CTRL_QUEUE:           usize    = 2048;
 const BATCH_MIN:            usize    = 30;
 const BATCH_MAX:            usize    = 500;
-const MAX_BATCH:            usize    = BATCH_MAX;   // compatibilidad
-const INITIAL_BATCH:        usize    = 40;          // punto de inicio
-const ADJUST_WINDOW_MS:     u64      = 50;         // ventana de medición
+const MAX_BATCH:            usize    = BATCH_MAX;
+const INITIAL_BATCH:        usize    = 40;
+const ADJUST_WINDOW_MS:     u64      = 50;
 const THROUGHPUT_THRESHOLD: i64      = 30;
-const PROBE_INTERVAL:       usize    = 10;          // ciclos estables antes de probe
+const PROBE_INTERVAL:       usize    = 10;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
 const HEV_RCVBUF:           i32      = 524288;
@@ -356,26 +262,26 @@ impl Stream {
 }
 
 struct Mux {
-    write_tx:       mpsc::Sender<Bytes>,
-    ctrl_tx:        mpsc::Sender<Bytes>,
-    streams:        Arc<DashMap<u32, Arc<Stream>>>,
-    count:          AtomicU32,
-    dead:           AtomicBool,
-    pool:           BufPool,
-    batch_size:     AtomicUsize,   // batch adaptativo por conexión (inicial = INITIAL_BATCH)
-    frames_sent:    AtomicU64,      // contador de frames enviados (controller lo lee)
+    write_tx:    mpsc::Sender<Bytes>,
+    ctrl_tx:     mpsc::Sender<Bytes>,
+    streams:     Arc<DashMap<u32, Arc<Stream>>>,
+    count:       AtomicU32,
+    dead:        AtomicBool,
+    pool:        BufPool,
+    batch_size:  AtomicUsize,
+    frames_sent: AtomicU64,
 }
 
 impl Mux {
     fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>, pool: BufPool) -> Arc<Self> {
         Arc::new(Self {
             write_tx, ctrl_tx,
-            streams:    Arc::new(DashMap::with_capacity(128)),
-            count:      AtomicU32::new(0),
-            dead:       AtomicBool::new(false),
+            streams:     Arc::new(DashMap::with_capacity(128)),
+            count:       AtomicU32::new(0),
+            dead:        AtomicBool::new(false),
             pool,
-            batch_size: AtomicUsize::new(INITIAL_BATCH),   // punto de inicio
-            frames_sent: AtomicU64::new(0),                 // contador para controller
+            batch_size:  AtomicUsize::new(INITIAL_BATCH),
+            frames_sent: AtomicU64::new(0),
         })
     }
 
@@ -454,14 +360,10 @@ async fn write_loop(
 
     loop {
         buf.clear();
-
-        // Lee el batch_size actual — Relaxed es suficiente
         let batch = mux.batch_size.load(Ordering::Relaxed);
 
         tokio::select! {
             biased;
-
-            // Control tiene siempre prioridad (PING/PONG/KICK/CLOSE)
             frame = ctrl_rx.recv() => {
                 let Some(f) = frame else { break; };
                 buf.extend_from_slice(&f);
@@ -469,28 +371,21 @@ async fn write_loop(
                     buf.extend_from_slice(&f);
                 }
             }
-
             frame = write_rx.recv() => {
                 let Some(f) = frame else { break; };
                 buf.extend_from_slice(&f);
                 let mut count = 1usize;
-
-                // Drena hasta el batch actual
                 while count < batch {
                     match write_rx.try_recv() {
                         Ok(f)  => { buf.extend_from_slice(&f); count += 1; }
                         Err(_) => break,
                     }
                 }
-
-                // Registrar frames enviados para el controller
                 mux.frames_sent.fetch_add(count as u64, Ordering::Relaxed);
             }
         }
 
-        if buf.is_empty() {
-            continue;
-        }
+        if buf.is_empty() { continue; }
 
         match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await {
             Ok(Ok(())) => {}
@@ -581,8 +476,6 @@ async fn handle_stream(
     mux.send_ctrl_sync(T_CLOSE, sid);
 }
 
-
-
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut hdr  = [0u8; 7];
     let mut rbuf = get_read_buf();
@@ -609,7 +502,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
         match ft {
             T_PING => { mux.send_ctrl_sync(T_PONG, sid); }
             T_PONG => {}
-
             T_OPEN => {
                 let payload = if ln > 0 {
                     Bytes::copy_from_slice(&rbuf[..ln])
@@ -624,7 +516,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 }
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
             }
-
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
@@ -637,7 +528,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                     }
                 }
             }
-
             T_CLOSE => { mux.close_stream_sync(sid); }
             _ => {}
         }
@@ -656,146 +546,6 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
         return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
     }
     None
-}
-
-async fn send_403(writer: &mut OwnedWriteHalf, reason: &str) {
-    let body = format!(
-        "HTTP/1.1 403 Forbidden\r\nX-Disconnect-Reason: {reason}\r\nContent-Length: {}\r\n\r\n{reason}",
-        reason.len()
-    );
-    let _ = writer.write_all(body.as_bytes()).await;
-}
-
-async fn wait_room(
-    mut writer: OwnedWriteHalf,
-    mut reader: OwnedReadHalf,
-    user_id: String,
-    ip: String,
-    waitroom: WaitRoom,
-    ip_count: IpCount,
-) {
-    let activated_msg = b"{\"status\":\"activated\"}\n";
-
-    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
-
-    if let Some(prev_tx) = waitroom.insert(user_id.clone(), promote_tx) {
-        let _ = prev_tx.send(());
-    }
-
-    *ip_count.entry(ip.clone()).or_insert(0) += 1;
-
-    let result = tokio::select! {
-        _ = promote_rx => "promoted",
-        _ = time::sleep(WAIT_TIMEOUT) => "timeout",
-        _ = async {
-            let mut drain = [0u8; 256];
-            loop {
-                match reader.read(&mut drain).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        } => "disconnected",
-    };
-
-    if result == "promoted" {
-        let _ = writer.write_all(activated_msg).await;
-    }
-
-    waitroom.remove(&user_id);
-    ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ADAPTIVE BATCH CONTROLLER
-// Mide throughput real y ajusta batch_size sin intervención.
-// Costo: <1μs cada ADJUST_WINDOW_MS, ~5ns por flush en write_loop
-// ─────────────────────────────────────────────────────────────────────────────
-
-async fn adaptive_controller(mux: Arc<Mux>) {
-    let mut history: VecDeque<u64> = VecDeque::with_capacity(10);
-    let mut stable_cycles: usize = 0;
-    let mut last_direction: i8 = 0;
-
-    loop {
-        time::sleep(Duration::from_millis(ADJUST_WINDOW_MS)).await;
-
-        if mux.dead.load(Ordering::Acquire) {
-            break;
-        }
-
-        // Leer y resetear contador de frames
-        let frames = mux.frames_sent.swap(0, Ordering::Relaxed) as u64;
-        let batch = mux.batch_size.load(Ordering::Relaxed);
-
-        if batch == 0 {
-            continue;
-        }
-
-        // Calcular throughput: frames por segundo (escalado x1000 para evitar f64)
-        let throughput = if ADJUST_WINDOW_MS > 0 {
-            frames * 1000 / ADJUST_WINDOW_MS
-        } else {
-            frames * 1000
-        };
-
-        if history.len() >= 10 {
-            history.pop_front();
-        }
-        history.push_back(throughput);
-
-        if history.len() < 4 {
-            continue;
-        }
-
-        // Comparar últimos 2 ciclos vs promedio de los anteriores
-        let n = history.len();
-        let recent: u64 = (history[n-1] + history[n-2]) / 2;
-        let older: u64 = history.iter().take(n - 2).sum::<u64>() / (n - 2) as u64;
-
-        if older == 0 {
-            continue;
-        }
-
-        // Delta porcentual × 1000 (evita f64)
-        let delta = ((recent as i64 - older as i64) * 1000) / older as i64;
-
-        let threshold = THROUGHPUT_THRESHOLD; // 3%
-
-        if delta.abs() < threshold {
-            // Zona estable → probe periódico
-            stable_cycles += 1;
-            if stable_cycles >= PROBE_INTERVAL {
-                let dir = if last_direction == 0 { 1i8 } else { last_direction };
-                let step = (batch / 8).max(1);
-                let next = if dir > 0 {
-                    (batch + step).min(BATCH_MAX)
-                } else {
-                    batch.saturating_sub(step).max(BATCH_MIN)
-                };
-                mux.batch_size.store(next, Ordering::Relaxed);
-                last_direction = dir;
-                stable_cycles = 0;
-            }
-        } else if delta > 0 {
-            // Throughput mejorando → continuar en misma dirección
-            stable_cycles = 0;
-            let dir = if last_direction == 0 { 1i8 } else { last_direction };
-            let step = (batch / 8).max(1);
-            let next = (batch + step).min(BATCH_MAX);
-            mux.batch_size.store(next, Ordering::Relaxed);
-            last_direction = dir;
-        } else {
-            // Throughput empeorando → invertir dirección
-            stable_cycles = 0;
-            let dir = -last_direction.signum();
-            let dir = if dir == 0 { -1i8 } else { dir };
-            let step = (batch / 8).max(1);
-            let next = batch.saturating_sub(step).max(BATCH_MIN);
-            mux.batch_size.store(next, Ordering::Relaxed);
-            last_direction = dir;
-        }
-    }
 }
 
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitroom: WaitRoom, ip_count: IpCount) {
@@ -849,7 +599,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitro
                 prev_mux.dead.store(true, Ordering::Release);
             }
 
-                    tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
+            tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
             tokio::spawn(adaptive_controller(mux.clone()));
             mux_run(mux.clone(), reader).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
@@ -860,13 +610,116 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitro
             if ip_conns >= WAIT_MAX_PER_IP { return; }
 
             let status = match check_auth(&user_id) {
-                AuthResult::Expired  => "expired",
-                _                    => "waiting",
+                AuthResult::Expired => "expired",
+                _                   => "waiting",
             };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
             wait_room(writer, reader, user_id, peer_ip, waitroom, ip_count).await;
+        }
+    }
+}
+
+async fn wait_room(
+    mut writer: OwnedWriteHalf,
+    mut reader: OwnedReadHalf,
+    user_id: String,
+    ip: String,
+    waitroom: WaitRoom,
+    ip_count: IpCount,
+) {
+    let activated_msg = b"{\"status\":\"activated\"}\n";
+    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
+
+    if let Some(prev_tx) = waitroom.insert(user_id.clone(), promote_tx) {
+        let _ = prev_tx.send(());
+    }
+
+    *ip_count.entry(ip.clone()).or_insert(0) += 1;
+
+    let result = tokio::select! {
+        _ = promote_rx => "promoted",
+        _ = time::sleep(WAIT_TIMEOUT) => "timeout",
+        _ = async {
+            let mut drain = [0u8; 256];
+            loop {
+                match reader.read(&mut drain).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        } => "disconnected",
+    };
+
+    if result == "promoted" {
+        let _ = writer.write_all(activated_msg).await;
+    }
+
+    waitroom.remove(&user_id);
+    ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
+}
+
+async fn adaptive_controller(mux: Arc<Mux>) {
+    let mut history: VecDeque<u64> = VecDeque::with_capacity(10);
+    let mut stable_cycles: usize = 0;
+    let mut last_direction: i8 = 0;
+
+    loop {
+        time::sleep(Duration::from_millis(ADJUST_WINDOW_MS)).await;
+
+        if mux.dead.load(Ordering::Acquire) { break; }
+
+        let frames = mux.frames_sent.swap(0, Ordering::Relaxed) as u64;
+        let batch  = mux.batch_size.load(Ordering::Relaxed);
+
+        if batch == 0 { continue; }
+
+        let throughput = if ADJUST_WINDOW_MS > 0 {
+            frames * 1000 / ADJUST_WINDOW_MS
+        } else {
+            frames * 1000
+        };
+
+        if history.len() >= 10 { history.pop_front(); }
+        history.push_back(throughput);
+
+        if history.len() < 4 { continue; }
+
+        let n = history.len();
+        let recent: u64 = (history[n-1] + history[n-2]) / 2;
+        let older: u64  = history.iter().take(n - 2).sum::<u64>() / (n - 2) as u64;
+
+        if older == 0 { continue; }
+
+        let delta = ((recent as i64 - older as i64) * 1000) / older as i64;
+        let threshold = THROUGHPUT_THRESHOLD;
+
+        if delta.abs() < threshold {
+            stable_cycles += 1;
+            if stable_cycles >= PROBE_INTERVAL {
+                let dir  = if last_direction == 0 { 1i8 } else { last_direction };
+                let step = (batch / 8).max(1);
+                let next = if dir > 0 { (batch + step).min(BATCH_MAX) } else { batch.saturating_sub(step).max(BATCH_MIN) };
+                mux.batch_size.store(next, Ordering::Relaxed);
+                last_direction = dir;
+                stable_cycles  = 0;
+            }
+        } else if delta > 0 {
+            stable_cycles = 0;
+            let dir  = if last_direction == 0 { 1i8 } else { last_direction };
+            let step = (batch / 8).max(1);
+            let next = (batch + step).min(BATCH_MAX);
+            mux.batch_size.store(next, Ordering::Relaxed);
+            last_direction = dir;
+        } else {
+            stable_cycles = 0;
+            let dir  = -last_direction.signum();
+            let dir  = if dir == 0 { -1i8 } else { dir };
+            let step = (batch / 8).max(1);
+            let next = batch.saturating_sub(step).max(BATCH_MIN);
+            mux.batch_size.store(next, Ordering::Relaxed);
+            last_direction = dir;
         }
     }
 }
@@ -924,7 +777,7 @@ async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
         .route("/active",  get(active_handler))
         .route("/promote", get(promote_handler))
         .with_state(state);
-    let ln  = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
+    let ln = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
     info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
 }
@@ -1006,7 +859,6 @@ async fn main() -> Result<()> {
 }
 RSEOF
 
-# ─── panel.rs ──────────────────────────────────────────────────────────────────
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
 use std::{
     collections::HashMap,
@@ -1059,9 +911,7 @@ fn migrate_date_to_ts(s: &str) -> Option<i64> {
 
 fn parse_expires(s: &str) -> i64 {
     let s = s.trim();
-    if let Ok(ts) = s.parse::<i64>() {
-        return ts;
-    }
+    if let Ok(ts) = s.parse::<i64>() { return ts; }
     migrate_date_to_ts(s).unwrap_or(0)
 }
 
@@ -1362,145 +1212,5 @@ async fn main() -> Result<()> {
 }
 RSEOF
 
-info "Tuning TCP/kernel..."
-cat > /etc/sysctl.d/99-btserver.conf << 'SYSCTL'
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.rmem_default=524288
-net.core.wmem_default=524288
-net.ipv4.tcp_rmem=4096 524288 67108864
-net.ipv4.tcp_wmem=4096 524288 67108864
-net.ipv4.tcp_notsent_lowat=4096
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_fin_timeout=10
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=3
-net.core.somaxconn=65535
-net.ipv4.tcp_max_syn_backlog=65535
-net.core.netdev_max_backlog=65535
-fs.file-max=1000000
-net.ipv4.tcp_mem=786432 1048576 67108864
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.ip_local_port_range=1024 65535
-net.ipv4.tcp_max_tw_buckets=2000000
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_ecn=1
-SYSCTL
-modprobe tcp_bbr 2>/dev/null || true
-sysctl -p /etc/sysctl.d/99-btserver.conf -q 2>/dev/null || true
-
-cat > /etc/security/limits.d/btserver.conf << 'LIMITS'
-*    soft nofile 1000000
-*    hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
-LIMITS
-
-info "Compilando (primera vez: 3-5 min)..."
 cd "$PROJ"
-cargo build --release 2>&1 | grep -E "^error|Compiling|Finished" || true
-
-[ -f "$PROJ/target/release/btserver" ] || die "Error compilando btserver"
-[ -f "$PROJ/target/release/panel"    ] || die "Error compilando panel"
-
-cp "$PROJ/target/release/btserver" /opt/btserver/btserver
-cp "$PROJ/target/release/panel"    /opt/btserver/panel
-chmod +x /opt/btserver/btserver /opt/btserver/panel
-info "Compilacion OK"
-
-[ -f /opt/btserver/users.txt ] || touch /opt/btserver/users.txt
-
-cat > /etc/systemd/system/hev-socks5.service << 'SVC'
-[Unit]
-Description=HEV Socks5
-After=network.target
-
-[Service]
-ExecStart=/opt/btserver/hev-socks5-server /opt/btserver/hev-socks5-server.yml
-Restart=always
-RestartSec=2
-LimitNOFILE=1000000
-LimitNPROC=infinity
-TasksMax=infinity
-Nice=-10
-IOSchedulingClass=realtime
-IOSchedulingPriority=0
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-cat > /etc/systemd/system/btserver.service << 'SVC'
-[Unit]
-Description=BlackTunnel Server (Rust v9)
-After=network.target hev-socks5.service
-Requires=hev-socks5.service
-
-[Service]
-ExecStart=/opt/btserver/btserver
-Restart=always
-RestartSec=2
-LimitNOFILE=1000000
-LimitNPROC=infinity
-TasksMax=infinity
-Nice=-10
-IOSchedulingClass=realtime
-IOSchedulingPriority=0
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-cat > /etc/systemd/system/btpanel.service << 'SVC'
-[Unit]
-Description=BlackTunnel Panel (Rust v9)
-After=network.target
-
-[Service]
-ExecStart=/opt/btserver/panel
-Restart=always
-RestartSec=2
-LimitNOFILE=100000
-
-[Install]
-WantedBy=multi-user.target
-SVC
-
-systemctl daemon-reload
-systemctl enable hev-socks5 btserver btpanel
-
-info "Iniciando servicios..."
-systemctl restart hev-socks5; sleep 1
-systemctl restart btserver;   sleep 1
-systemctl restart btpanel;    sleep 1
-
-info "Configurando QoS..."
-IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
-if [ -n "$IFACE" ]; then
-    tc qdisc del dev "$IFACE" root 2>/dev/null || true
-    tc qdisc add dev "$IFACE" root handle 1: prio bands 3 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-    tc qdisc add dev "$IFACE" parent 1:1 handle 10: fq_codel limit 256  target 2ms  interval 50ms
-    tc qdisc add dev "$IFACE" parent 1:2 handle 20: fq_codel limit 512  target 5ms  interval 100ms
-    tc qdisc add dev "$IFACE" parent 1:3 handle 30: fq_codel limit 1024 target 5ms  interval 100ms
-    tc filter add dev "$IFACE" parent 1: protocol ip prio 1 u32 match u16 0x0000 0xfe00 at 2 flowid 1:1
-    tc filter add dev "$IFACE" parent 1: protocol ip prio 2 u32 match u16 0x0000 0xfc00 at 2 flowid 1:2
-    tc filter add dev "$IFACE" parent 1: protocol ip prio 3 u32 match u32 0x00000000 0x00000000 at 0 flowid 1:3
-    info "QoS aplicado en $IFACE"
-fi
-
-echo ""
-echo "================================================"
-echo "  INSTALACION COMPLETA (Rust v9)"
-echo "================================================"
-echo "  PANEL URL:  http://${SERVER_IP}:${PANEL_PORT}"
-echo "  TOKEN:      ${PANEL_TOKEN}"
-echo "================================================"
-systemctl is-active hev-socks5 btserver btpanel 2>/dev/null || true
-ss -s | grep -E "TCP|estab"
+cargo build --release
