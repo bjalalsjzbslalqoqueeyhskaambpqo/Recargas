@@ -64,7 +64,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc},
+    sync::{mpsc, watch},
     time,
 };
 use tracing::{info, warn};
@@ -239,15 +239,18 @@ struct Stream {
     closed:       AtomicBool,
     last_act:     AtomicI64,
     worker_count: AtomicI32,
+    close_signal: watch::Sender<bool>,
 }
 
 impl Stream {
     fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+        let (close_signal, _) = watch::channel(false);
         Arc::new(Self {
             tx,
             closed:       AtomicBool::new(false),
             last_act:     AtomicI64::new(now_secs()),
             worker_count: AtomicI32::new(0),
+            close_signal,
         })
     }
     #[inline(always)] fn touch(&self) { self.last_act.store(now_secs(), Ordering::Relaxed); }
@@ -289,14 +292,19 @@ impl Mux {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
-    #[inline(always)]
-    fn send_data_sync(&self, sid: u32, data: &[u8]) {
-        if self.is_dead() { return; }
+    /// Backpressure-aware send: waits for room in write_tx instead of
+    /// failing immediately on a momentarily full queue. This lets a
+    /// slow client (weak signal) naturally throttle the upstream read
+    /// loop via the await point, instead of the stream being killed.
+    async fn send_data(&self, sid: u32, data: &[u8]) -> bool {
+        if self.is_dead() { return false; }
         let frame = self.pool.data_frame(sid, data);
-        if self.write_tx.try_send(frame).is_err() {
+        if self.write_tx.send(frame).await.is_err() {
             self.close_stream_sync(sid);
             let _ = self.ctrl_tx.try_send(self.pool.ctrl(T_CLOSE, sid));
+            return false;
         }
+        true
     }
 
     #[inline(always)]
@@ -317,6 +325,9 @@ impl Mux {
             if s.try_close() {
                 self.count.fetch_sub(1, Ordering::Relaxed);
             }
+            // Wake any worker blocked in send_data backpressure or a
+            // long hev read, even if it's currently awaiting.
+            let _ = s.close_signal.send(true);
         }
     }
 }
@@ -419,9 +430,8 @@ async fn handle_stream(
         }
     }
 
-    let (close_tx, _) = tokio::sync::watch::channel(false);
-    let mut close_rx_c2h = close_tx.subscribe();
-    let close_tx_h2c = close_tx.clone();
+    let mut close_rx_c2h = stream.close_signal.subscribe();
+    let mut close_rx_h2c = stream.close_signal.subscribe();
 
     let mux2    = mux.clone();
     let stream2 = stream.clone();
@@ -449,23 +459,42 @@ async fn handle_stream(
         stream2.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
+    let mux3    = mux.clone();
+    let stream3 = stream.clone();
+
     let t_h2c = tokio::spawn(async move {
-        stream.worker_count.fetch_add(1, Ordering::Relaxed);
+        stream3.worker_count.fetch_add(1, Ordering::Relaxed);
         let mut buf = get_read_buf();
         buf.resize(MAX_PAYLOAD, 0);
         let idle = Duration::from_secs(STREAM_IDLE_TIMEOUT as u64);
         loop {
-            match time::timeout(idle, hev_r.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    stream.touch();
-                    mux2.send_data_sync(sid, &buf[..n]);
+            tokio::select! {
+                biased;
+                _ = close_rx_h2c.changed() => break,
+                read_res = time::timeout(idle, hev_r.read(&mut buf)) => {
+                    match read_res {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            stream3.touch();
+                            // Backpressure point: if the client socket is slow
+                            // (weak signal), write_tx stays full and this await
+                            // pauses here. That stops draining hev_r, letting
+                            // TCP push back on the upstream (e.g. YouTube) peer.
+                            tokio::select! {
+                                biased;
+                                _ = close_rx_h2c.changed() => break,
+                                ok = mux3.send_data(sid, &buf[..n]) => {
+                                    if !ok { break; }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         put_read_buf(buf);
-        let _ = close_tx_h2c.send(true);
-        stream.worker_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = stream3.close_signal.send(true);
+        stream3.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
