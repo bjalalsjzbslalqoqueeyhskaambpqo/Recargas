@@ -81,15 +81,12 @@ const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
-const MUX_WRITE_QUEUE:      usize    = 4096;
-const CTRL_QUEUE:           usize    = 2048;
-const BATCH_MIN:            usize    = 30;
-const BATCH_MAX:            usize    = 500;
-const MAX_BATCH:            usize    = BATCH_MAX;
-const INITIAL_BATCH:        usize    = 40;
-const ADJUST_WINDOW_MS:     u64      = 50;
-const THROUGHPUT_THRESHOLD: i64      = 30;
-const PROBE_INTERVAL:       usize    = 10;
+const MUX_WRITE_QUEUE:      usize    = 2048;
+const CTRL_QUEUE:           usize    = 1024;
+const BATCH_MIN:            usize    = 20;
+const BATCH_MAX:            usize    = 128;
+const INITIAL_BATCH:        usize    = 30;
+const ADJUST_WINDOW_MS:     u64      = 20;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
 const HEV_RCVBUF:           i32      = 524288;
@@ -661,65 +658,39 @@ async fn wait_room(
 }
 
 async fn adaptive_controller(mux: Arc<Mux>) {
-    let mut history: VecDeque<u64> = VecDeque::with_capacity(10);
-    let mut stable_cycles: usize = 0;
-    let mut last_direction: i8 = 0;
+    let mut smooth: u64 = 0;
 
     loop {
         time::sleep(Duration::from_millis(ADJUST_WINDOW_MS)).await;
 
         if mux.dead.load(Ordering::Acquire) { break; }
 
-        let frames = mux.frames_sent.swap(0, Ordering::Relaxed) as u64;
-        let batch  = mux.batch_size.load(Ordering::Relaxed);
+        let frames = mux.frames_sent.swap(0, Ordering::Relaxed);
 
-        if batch == 0 { continue; }
+        if frames == 0 {
+            smooth = 0;
+            continue;
+        }
 
-        let throughput = if ADJUST_WINDOW_MS > 0 {
-            frames * 1000 / ADJUST_WINDOW_MS
+        smooth = if smooth == 0 {
+            frames
         } else {
-            frames * 1000
+            (smooth * 5 + frames) / 6
         };
 
-        if history.len() >= 10 { history.pop_front(); }
-        history.push_back(throughput);
+        let target = ((smooth as usize) + (smooth as usize / 8)).clamp(BATCH_MIN, BATCH_MAX);
+        let batch  = mux.batch_size.load(Ordering::Relaxed);
 
-        if history.len() < 4 { continue; }
-
-        let n = history.len();
-        let recent: u64 = (history[n-1] + history[n-2]) / 2;
-        let older: u64  = history.iter().take(n - 2).sum::<u64>() / (n - 2) as u64;
-
-        if older == 0 { continue; }
-
-        let delta = ((recent as i64 - older as i64) * 1000) / older as i64;
-        let threshold = THROUGHPUT_THRESHOLD;
-
-        if delta.abs() < threshold {
-            stable_cycles += 1;
-            if stable_cycles >= PROBE_INTERVAL {
-                let dir  = if last_direction == 0 { 1i8 } else { last_direction };
-                let step = (batch / 8).max(1);
-                let next = if dir > 0 { (batch + step).min(BATCH_MAX) } else { batch.saturating_sub(step).max(BATCH_MIN) };
-                mux.batch_size.store(next, Ordering::Relaxed);
-                last_direction = dir;
-                stable_cycles  = 0;
-            }
-        } else if delta > 0 {
-            stable_cycles = 0;
-            let dir  = if last_direction == 0 { 1i8 } else { last_direction };
-            let step = (batch / 8).max(1);
-            let next = (batch + step).min(BATCH_MAX);
-            mux.batch_size.store(next, Ordering::Relaxed);
-            last_direction = dir;
+        let next = if target > batch {
+            target
+        } else if target < batch {
+            batch.saturating_sub(((batch - target) / 4).max(1)).max(target)
         } else {
-            stable_cycles = 0;
-            let dir  = -last_direction.signum();
-            let dir  = if dir == 0 { -1i8 } else { dir };
-            let step = (batch / 8).max(1);
-            let next = batch.saturating_sub(step).max(BATCH_MIN);
+            batch
+        };
+
+        if next != batch {
             mux.batch_size.store(next, Ordering::Relaxed);
-            last_direction = dir;
         }
     }
 }
