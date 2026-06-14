@@ -43,7 +43,7 @@ TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
@@ -64,7 +64,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{mpsc, watch},
+    sync::mpsc,
     time,
 };
 use tracing::{info, warn};
@@ -82,18 +82,17 @@ const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT:  i64      = 600;
 const MUX_WRITE_QUEUE:      usize    = 4096;
-const CTRL_QUEUE:           usize    = 1024;
-const BATCH_MIN:            usize    = 25;
+const CTRL_QUEUE:           usize    = 512;
+const BATCH_MIN:            usize    = 20;
 const BATCH_MAX:            usize    = 128;
-const INITIAL_BATCH:        usize    = 40;
-const ADJUST_WINDOW_MS:     u64      = 80;
+const INITIAL_BATCH:        usize    = 32;
+const ADJUST_WINDOW_MS:     u64      = 20;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
-const HEV_RCVBUF:           i32      = 524288;
-const HEV_SNDBUF:           i32      = 524288;
 const CLI_RCVBUF:           i32      = 524288;
 const CLI_SNDBUF:           i32      = 524288;
 const POOL_PREALLOC:        usize    = 4096;
+const POOL_BUF_CAP:         usize    = MAX_PAYLOAD + 7;
 
 const T_OPEN:    u8 = 0x01;
 const T_DATA:    u8 = 0x02;
@@ -126,9 +125,7 @@ fn now_secs() -> i64 {
 
 fn parse_expires(s: &str) -> Option<i64> {
     let s = s.trim();
-    if let Ok(ts) = s.parse::<i64>() {
-        return Some(ts);
-    }
+    if let Ok(ts) = s.parse::<i64>() { return Some(ts); }
     let mut it = s.splitn(3, '-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
@@ -170,24 +167,33 @@ fn check_auth(id: &str) -> AuthResult {
 struct BufPool(Arc<SegQueue<Vec<u8>>>);
 
 impl BufPool {
-    fn new(prealloc: usize, cap: usize) -> Self {
+    fn new(prealloc: usize) -> Self {
         let q = SegQueue::new();
-        for _ in 0..prealloc { q.push(Vec::with_capacity(cap)); }
+        for _ in 0..prealloc {
+            q.push(Vec::with_capacity(POOL_BUF_CAP));
+        }
         Self(Arc::new(q))
     }
 
     #[inline(always)]
-    fn get(&self, needed: usize) -> Vec<u8> {
+    fn get(&self) -> Vec<u8> {
         if let Some(mut v) = self.0.pop() {
             v.clear();
-            if v.capacity() >= needed { return v; }
+            return v;
         }
-        Vec::with_capacity(needed.max(MAX_PAYLOAD + 7))
+        Vec::with_capacity(POOL_BUF_CAP)
+    }
+
+    #[inline(always)]
+    fn put(&self, v: Vec<u8>) {
+        if v.capacity() <= POOL_BUF_CAP * 2 {
+            self.0.push(v);
+        }
     }
 
     #[inline(always)]
     fn ctrl(&self, t: u8, sid: u32) -> Bytes {
-        let mut v = self.get(7);
+        let mut v = self.get();
         v.push(t);
         v.extend_from_slice(&sid.to_be_bytes());
         v.push(0); v.push(0);
@@ -196,7 +202,7 @@ impl BufPool {
 
     #[inline(always)]
     fn data_frame(&self, sid: u32, payload: &[u8]) -> Bytes {
-        let mut v = self.get(7 + payload.len());
+        let mut v = self.get();
         v.push(T_DATA);
         v.extend_from_slice(&sid.to_be_bytes());
         v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -214,14 +220,15 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
 
 fn tune_client_fd(fd: i32) {
     unsafe {
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,   1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK,  1);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,     CLI_RCVBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,     CLI_SNDBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE,  1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,  120);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,        1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK,       1);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,          CLI_RCVBUF);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,          CLI_SNDBUF);
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE,       1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,       120);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,      30);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,        3);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT,  16384);
     }
 }
 
@@ -229,8 +236,6 @@ fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,    HEV_RCVBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,    HEV_SNDBUF);
     }
 }
 
@@ -239,22 +244,18 @@ struct Stream {
     closed:       AtomicBool,
     last_act:     AtomicI64,
     worker_count: AtomicI32,
-    close_signal: watch::Sender<bool>,
 }
 
 impl Stream {
     fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
-        let (close_signal, _) = watch::channel(false);
         Arc::new(Self {
             tx,
             closed:       AtomicBool::new(false),
             last_act:     AtomicI64::new(now_secs()),
             worker_count: AtomicI32::new(0),
-            close_signal,
         })
     }
     #[inline(always)] fn touch(&self) { self.last_act.store(now_secs(), Ordering::Relaxed); }
-    #[inline(always)] fn idle_secs(&self) -> i64 { now_secs() - self.last_act.load(Ordering::Relaxed) }
     #[inline(always)] fn try_close(&self) -> bool {
         self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
@@ -276,7 +277,7 @@ impl Mux {
     fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>, pool: BufPool) -> Arc<Self> {
         Arc::new(Self {
             write_tx, ctrl_tx,
-            streams:     Arc::new(DashMap::with_capacity(128)),
+            streams:     Arc::new(DashMap::with_capacity(64)),
             count:       AtomicU32::new(0),
             dead:        AtomicBool::new(false),
             pool,
@@ -292,19 +293,14 @@ impl Mux {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
-    /// Backpressure-aware send: waits for room in write_tx instead of
-    /// failing immediately on a momentarily full queue. This lets a
-    /// slow client (weak signal) naturally throttle the upstream read
-    /// loop via the await point, instead of the stream being killed.
-    async fn send_data(&self, sid: u32, data: &[u8]) -> bool {
-        if self.is_dead() { return false; }
+    #[inline(always)]
+    fn send_data_sync(&self, sid: u32, data: &[u8]) {
+        if self.is_dead() { return; }
         let frame = self.pool.data_frame(sid, data);
-        if self.write_tx.send(frame).await.is_err() {
+        if self.write_tx.try_send(frame).is_err() {
             self.close_stream_sync(sid);
             let _ = self.ctrl_tx.try_send(self.pool.ctrl(T_CLOSE, sid));
-            return false;
         }
-        true
     }
 
     #[inline(always)]
@@ -322,12 +318,8 @@ impl Mux {
 
     fn close_stream_sync(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
-            if s.try_close() {
-                self.count.fetch_sub(1, Ordering::Relaxed);
-            }
-            // Wake any worker blocked in send_data backpressure or a
-            // long hev read, even if it's currently awaiting.
-            let _ = s.close_signal.send(true);
+            s.try_close();
+            self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -342,7 +334,11 @@ fn get_read_buf() -> Vec<u8> {
 
 fn put_read_buf(mut b: Vec<u8>) {
     b.clear();
-    if let Some(p) = READ_BUF_POOL.get() { let _ = p.push(b); }
+    if let Some(p) = READ_BUF_POOL.get() {
+        if b.capacity() <= MAX_PAYLOAD * 2 {
+            let _ = p.push(b);
+        }
+    }
 }
 
 type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
@@ -430,8 +426,9 @@ async fn handle_stream(
         }
     }
 
-    let mut close_rx_c2h = stream.close_signal.subscribe();
-    let mut close_rx_h2c = stream.close_signal.subscribe();
+    let (close_tx, _) = tokio::sync::watch::channel(false);
+    let mut close_rx_c2h = close_tx.subscribe();
+    let close_tx_h2c = close_tx.clone();
 
     let mux2    = mux.clone();
     let stream2 = stream.clone();
@@ -459,42 +456,23 @@ async fn handle_stream(
         stream2.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
-    let mux3    = mux.clone();
-    let stream3 = stream.clone();
-
     let t_h2c = tokio::spawn(async move {
-        stream3.worker_count.fetch_add(1, Ordering::Relaxed);
+        stream.worker_count.fetch_add(1, Ordering::Relaxed);
         let mut buf = get_read_buf();
         buf.resize(MAX_PAYLOAD, 0);
         let idle = Duration::from_secs(STREAM_IDLE_TIMEOUT as u64);
         loop {
-            tokio::select! {
-                biased;
-                _ = close_rx_h2c.changed() => break,
-                read_res = time::timeout(idle, hev_r.read(&mut buf)) => {
-                    match read_res {
-                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                        Ok(Ok(n)) => {
-                            stream3.touch();
-                            // Backpressure point: if the client socket is slow
-                            // (weak signal), write_tx stays full and this await
-                            // pauses here. That stops draining hev_r, letting
-                            // TCP push back on the upstream (e.g. YouTube) peer.
-                            tokio::select! {
-                                biased;
-                                _ = close_rx_h2c.changed() => break,
-                                ok = mux3.send_data(sid, &buf[..n]) => {
-                                    if !ok { break; }
-                                }
-                            }
-                        }
-                    }
+            match time::timeout(idle, hev_r.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    stream.touch();
+                    mux2.send_data_sync(sid, &buf[..n]);
                 }
             }
         }
         put_read_buf(buf);
-        let _ = stream3.close_signal.send(true);
-        stream3.worker_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = close_tx_h2c.send(true);
+        stream.worker_count.fetch_sub(1, Ordering::Relaxed);
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
@@ -623,12 +601,14 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, pool: BufPool, waitro
             if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
                 let _ = prev_mux.ctrl_tx.try_send(prev_mux.pool.ctrl(T_KICK, 0));
                 prev_mux.dead.store(true, Ordering::Release);
+                prev_mux.streams.clear();
             }
 
             tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.clone()));
             tokio::spawn(adaptive_controller(mux.clone()));
             mux_run(mux.clone(), reader).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
+            mux.streams.clear();
         }
 
         AuthResult::NotFound | AuthResult::Expired => {
@@ -704,7 +684,7 @@ async fn adaptive_controller(mux: Arc<Mux>) {
         smooth = if smooth == 0 {
             frames
         } else {
-            (smooth * 7 + frames) / 8
+            (smooth * 5 + frames) / 6
         };
 
         let target = ((smooth as usize) + (smooth as usize / 8)).clamp(BATCH_MIN, BATCH_MAX);
@@ -721,6 +701,21 @@ async fn adaptive_controller(mux: Arc<Mux>) {
         if next != batch {
             mux.batch_size.store(next, Ordering::Relaxed);
         }
+    }
+}
+
+async fn memory_sweep(sessions: SessionMap) {
+    loop {
+        time::sleep(Duration::from_secs(300)).await;
+        sessions.retain(|_, mux| {
+            if mux.dead.load(Ordering::Acquire) {
+                mux.streams.clear();
+                false
+            } else {
+                mux.streams.retain(|_, s| !s.is_closed());
+                true
+            }
+        });
     }
 }
 
@@ -835,10 +830,11 @@ async fn main() -> Result<()> {
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
-    let pool = BufPool::new(POOL_PREALLOC, MAX_PAYLOAD + 7);
+    let pool = BufPool::new(POOL_PREALLOC);
 
     tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
     tokio::spawn(midnight_sweep(sessions.clone()));
+    tokio::spawn(memory_sweep(sessions.clone()));
 
     let std_ln   = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
