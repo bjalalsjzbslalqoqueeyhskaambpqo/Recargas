@@ -221,7 +221,6 @@ fn tune_client_fd(fd: i32) {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,       120);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,      30);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,        3);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT,  16384);
     }
 }
 
