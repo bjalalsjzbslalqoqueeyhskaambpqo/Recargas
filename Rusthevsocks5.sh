@@ -675,7 +675,7 @@ async fn adaptive_controller(mux: Arc<Mux>) {
         smooth = if smooth == 0 {
             frames
         } else {
-            (smooth * 5 + frames) / 6
+            (smooth * 7 + frames) / 8
         };
 
         let target = ((smooth as usize) + (smooth as usize / 8)).clamp(BATCH_MIN, BATCH_MAX);
