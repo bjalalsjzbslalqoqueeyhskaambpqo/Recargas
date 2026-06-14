@@ -185,13 +185,6 @@ impl BufPool {
     }
 
     #[inline(always)]
-    fn put(&self, v: Vec<u8>) {
-        if v.capacity() <= POOL_BUF_CAP * 2 {
-            self.0.push(v);
-        }
-    }
-
-    #[inline(always)]
     fn ctrl(&self, t: u8, sid: u32) -> Bytes {
         let mut v = self.get();
         v.push(t);
