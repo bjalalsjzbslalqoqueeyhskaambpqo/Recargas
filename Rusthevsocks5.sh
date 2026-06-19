@@ -291,7 +291,7 @@ async fn write_loop(
             if let Ok(f) = write_rx.try_recv() { buf.extend_from_slice(&f); } else { break; }
         }
 
-        if time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await.is_err() { break; }
+        if !matches!(time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await, Ok(Ok(_))) { break; }
     }
     mux.dead.store(true, Ordering::Release);
 }
@@ -316,7 +316,7 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
     let t_c2h = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
             stream2.touch();
-            if time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await.is_err() { break; }
+            if !matches!(time::timeout(HEV_WRITE_TIMEOUT, hev_w.write_all(&data)).await, Ok(Ok(_))) { break; }
         }
         let _ = hev_w.shutdown().await;
     });
@@ -344,14 +344,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut rbuf = vec![0u8; MAX_PAYLOAD];
 
     loop {
-        if time::timeout(READ_DEADLINE, reader.read_exact(&mut hdr)).await.is_err() { break; }
+        if !matches!(time::timeout(READ_DEADLINE, reader.read_exact(&mut hdr)).await, Ok(Ok(_))) { break; }
         let ft  = hdr[0];
         let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
         let ln  = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
         
         if ln > MAX_PAYLOAD { break; }
         if ln > 0 {
-            if time::timeout(PAYLOAD_DEADLINE, reader.read_exact(&mut rbuf[..ln])).await.is_err() { break; }
+            if !matches!(time::timeout(PAYLOAD_DEADLINE, reader.read_exact(&mut rbuf[..ln])).await, Ok(Ok(_))) { break; }
         }
 
         match ft {
@@ -558,8 +558,13 @@ async fn main() -> Result<()> {
     info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
 
     loop {
-        if let Ok((conn, _)) = listener.accept().await {
-            tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone()));
+        match listener.accept().await {
+            Ok((conn, _)) => {
+                tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone()));
+            }
+            Err(_) => {
+                time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 }
