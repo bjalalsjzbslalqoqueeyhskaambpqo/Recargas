@@ -113,7 +113,17 @@ async fn write_loop(mut w: OwnedWriteHalf, mut wrx: mpsc::Receiver<Bytes>, mut c
     let mut buf = BytesMut::with_capacity(65536);
     loop {
         buf.clear();
-        tokio::select! { biased; Some(f) = crx.recv() => buf.extend_from_slice(&f), Some(f) = wrx.recv() => buf.extend_from_slice(&f), else => break }
+        tokio::select! {
+            biased;
+            res = crx.recv() => match res {
+                Some(f) => buf.extend_from_slice(&f),
+                None => break,
+            },
+            res = wrx.recv() => match res {
+                Some(f) => buf.extend_from_slice(&f),
+                None => break,
+            }
+        }
         while let Ok(f) = crx.try_recv() { buf.extend_from_slice(&f); }
         while buf.len() < 65536 { if let Ok(f) = wrx.try_recv() { buf.extend_from_slice(&f); } else { break; } }
         if time::timeout(CLIENT_WRITE_TIMEOUT, w.write_all(&buf)).await.is_err() { break; }
@@ -211,15 +221,21 @@ async fn kick_api(s: SessionMap, w: WaitRoom) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("btserver=info".parse()?),
+        )
+        .init();
+
     let (ses, wr, ic) = (Arc::new(DashMap::new()), Arc::new(DashMap::new()), Arc::new(DashMap::new()));
     tokio::spawn(kick_api(ses.clone(), wr.clone()));
     tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(86400 - (now_secs() % 86400) as u64)).await; let ids: Vec<String> = s.iter().map(|r| r.key().clone()).collect(); for id in ids { match check_auth(&id).await { AuthResult::Ok{..} => continue, AuthResult::Expired => kick_session(&s, &id, T_EXPIRED), AuthResult::NotFound => kick_session(&s, &id, T_KICK) }; } } }});
-    tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(300)).await; s.retain(|_, m| if m.dead.load(Ordering::Acquire) { m.streams.clear(); false } else { m.streams.retain(|_, st| !st.is_closed()); true }); } }});
+    tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(300)).await; s.retain(|_, m| if m.dead.load(Ordering::Acquire) { m.streams.clear(); false } else { m.streams.retain(|_, s| !s.is_closed()); true }); } }});
     
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?; sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?; sock.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(10)))?; unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); } sock.set_nonblocking(true)?; sock.bind(&LISTEN_ADDR.parse::<SocketAddr>().unwrap().into())?; sock.listen(65535)?;
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?; sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?; sock.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(10)))?; unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); } sock.set_nonblocking(true)?; sock.bind(&addr.into())?;
     let ln = TcpListener::from_std(sock.into())?; info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
-    loop { if let Ok((conn, _)) = ln.accept().await { tokio::spawn(handle_conn(conn, ses.clone(), wr.clone(), ic.clone())); } }
+    loop { if let Ok((conn, _)) = ln.accept().await { b  = sessions.clone(); let p  = pool.clone(); let wr = waitroom.clone(); let ic = ip_count.clone(); tokio::spawn(handle_conn(conn, b, p, wr, ic)); } }
 }
 RSEOF
 
@@ -261,7 +277,7 @@ async fn main() -> Result<()> {
         .route("/client/delete", delete(|State(st): State<AppState>, h: HeaderMap, ConnectInfo(a): ConnectInfo<SocketAddr>, Json(b): Json<IReq>| async move { if let Some(e) = st.ok(&a.ip().to_string(), &h) { return e; } let id = b.id.trim(); if id.is_empty() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"falta id"}))); } let _l = st.mu.lock().await; let mut u = load().await; if u.remove(id).is_none() { return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"no encontrado"}))); } save(&u).await; tokio::spawn(call(format!("{KICK_BASE}{id}&reason=kicked"))); (StatusCode::OK, Json(serde_json::json!({"ok":true}))) }))
         .route("/client/update", put(|State(st): State<AppState>, h: HeaderMap, ConnectInfo(a): ConnectInfo<SocketAddr>, Json(b): Json<UReq>| async move { if let Some(e) = st.ok(&a.ip().to_string(), &h) { return e; } let id = b.id.trim(); if id.is_empty() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"falta id"}))); } let (fid, usr, ko) = { let _l = st.mu.lock().await; let mut u = load().await; let Some(mut usr) = u.get(id).cloned() else { return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"no encontrado"}))); }; if let Some(n) = b.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) { usr.name = n.to_string(); } if let Some(d) = b.days { usr.expires_ts = now_secs() + d.max(0) * 86400; } let (fid, ko) = match b.new_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != id) { Some(nid) => { u.remove(id); (nid.to_string(), true) }, None => (id.to_string(), false) }; u.insert(fid.clone(), usr.clone()); save(&u).await; (fid, usr, ko) }; if ko { tokio::spawn(call(format!("{KICK_BASE}{id}&reason=kicked"))); } if usr.expires_ts <= now_secs() { tokio::spawn(call(format!("{KICK_BASE}{fid}&reason=expired"))); } else { tokio::spawn(call(format!("{PROMOTE_BASE}{fid}"))); } (StatusCode::OK, Json(row(&fid, &usr))) }))
         .with_state(AppState::new().await).into_make_service_with_connect_info::<SocketAddr>();
-    axum::serve(TcpListener::bind(PANEL_ADDR).await?, app).await?; Ok(())
+    info!("panel api on {PANEL_ADDR}"); axum::serve(TcpListener::bind(PANEL_ADDR).await?, app).await?; Ok(())
 }
 RSEOF
 
