@@ -604,12 +604,14 @@ struct AppState {
     token:    Arc<String>,
     users_mu: Arc<Mutex<()>>,
     rate:     Arc<std::sync::Mutex<HashMap<String, Vec<i64>>>>,
+    http:     reqwest::Client, // MEJORA: Cliente HTTP reutilizable
 }
 
 impl AppState {
     async fn new() -> Self {
         let token = fs::read_to_string(TOKEN_PATH).await.unwrap_or_default().trim().to_string();
-        Self { token: Arc::new(token), users_mu: Arc::new(Mutex::new(())), rate: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap_or_default();
+        Self { token: Arc::new(token), users_mu: Arc::new(Mutex::new(())), rate: Arc::new(std::sync::Mutex::new(HashMap::new())), http }
     }
 
     fn rate_ok(&self, ip: &str) -> bool {
@@ -622,6 +624,26 @@ impl AppState {
 
     fn check_token(&self, headers: &HeaderMap) -> bool {
         headers.get("x-token").and_then(|v| v.to_str().ok()).map(|t| t.trim() == self.token.as_str()).unwrap_or(false)
+    }
+
+    // Funciones delegadas al cliente HTTP compartido para máximo rendimiento
+    async fn kick_user(&self, id: String, reason: &'static str) {
+        let _ = self.http.get(format!("{KICK_BASE}{id}&reason={reason}")).send().await;
+    }
+
+    async fn promote_user(&self, id: String) {
+        let _ = self.http.get(format!("{PROMOTE_BASE}{id}")).send().await;
+    }
+
+    async fn fetch_active_ids(&self) -> std::collections::HashSet<String> {
+        if let Ok(resp) = self.http.get("http://127.0.0.1:8091/active").send().await {
+            if let Ok(text) = resp.text().await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return val["active"].as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                }
+            }
+        }
+        Default::default()
     }
 }
 
@@ -652,14 +674,6 @@ fn user_row(id: &str, u: &User) -> serde_json::Value {
     serde_json::json!({ "id": id, "name": u.name, "expires_ts": u.expires_ts, "secs_left": secs_left, "active": secs_left > 0 })
 }
 
-async fn kick_user(id: String, reason: &'static str) {
-    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(format!("{KICK_BASE}{id}&reason={reason}")).send().await; }
-}
-
-async fn promote_user(id: String) {
-    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(format!("{PROMOTE_BASE}{id}")).send().await; }
-}
-
 type ApiResult = (StatusCode, Json<serde_json::Value>);
 fn err_resp(code: StatusCode, msg: &str) -> ApiResult { (code, Json(serde_json::json!({"error": msg}))) }
 
@@ -669,22 +683,9 @@ fn auth_check(st: &AppState, headers: &HeaderMap, addr: &SocketAddr) -> Option<A
     None
 }
 
-async fn fetch_active_ids() -> std::collections::HashSet<String> {
-    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() {
-        if let Ok(resp) = c.get("http://127.0.0.1:8091/active").send().await {
-            if let Ok(text) = resp.text().await {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                    return val["active"].as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-                }
-            }
-        }
-    }
-    Default::default()
-}
-
 async fn handle_clients(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
-    let active = fetch_active_ids().await;
+    let active = st.fetch_active_ids().await;
     let _l = st.users_mu.lock().await;
     let rows: Vec<_> = load_users().await.iter().map(|(id, u)| { let mut r = user_row(id, u); r["connected"] = serde_json::json!(active.contains(id.as_str())); r }).collect();
     (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len()})))
@@ -709,7 +710,11 @@ async fn handle_create(State(st): State<AppState>, headers: HeaderMap, ConnectIn
     if users.contains_key(&id) { return err_resp(StatusCode::CONFLICT, "ya existe"); }
     let expires_ts = expires_from_days(days);
     users.insert(id.clone(), User { name: name.clone(), expires_ts });
-    save_users(&users).await; info!(id, name, days, "usuario creado"); tokio::spawn(promote_user(id.clone()));
+    save_users(&users).await; info!(id, name, days, "usuario creado");
+    
+    let state_clone = st.clone(); let id_clone = id.clone();
+    tokio::spawn(async move { state_clone.promote_user(id_clone).await; });
+    
     (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
 }
 
@@ -723,7 +728,11 @@ async fn handle_delete(State(st): State<AppState>, headers: HeaderMap, ConnectIn
         if !users.contains_key(&id) { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); }
         users.remove(&id); save_users(&users).await;
     }
-    info!(id, "usuario eliminado"); tokio::spawn(kick_user(id, "kicked"));
+    info!(id, "usuario eliminado"); 
+    
+    let state_clone = st.clone(); let id_clone = id.clone();
+    tokio::spawn(async move { state_clone.kick_user(id_clone, "kicked").await; });
+    
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
 }
 
@@ -740,8 +749,17 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
         let (fid, ko) = match body.new_id.as_deref().map(str::trim) { Some(nid) if !nid.is_empty() && nid != id => { users.remove(&id); (nid.to_string(), true) } _ => (id.clone(), false) };
         users.insert(fid.clone(), u.clone()); save_users(&users).await; (fid, u, ko)
     };
-    if kick_old { tokio::spawn(kick_user(id, "kicked")); }
-    if u.expires_ts <= now_secs() { tokio::spawn(kick_user(final_id.clone(), "expired")); } else { tokio::spawn(promote_user(final_id.clone())); }
+    
+    let st_c1 = st.clone(); let id_c1 = id.clone();
+    if kick_old { tokio::spawn(async move { st_c1.kick_user(id_c1, "kicked").await; }); }
+    
+    let st_c2 = st.clone(); let fid_c2 = final_id.clone();
+    if u.expires_ts <= now_secs() { 
+        tokio::spawn(async move { st_c2.kick_user(fid_c2, "expired").await; }); 
+    } else { 
+        tokio::spawn(async move { st_c2.promote_user(fid_c2).await; }); 
+    }
+    
     info!(id = final_id, "usuario actualizado");
     (StatusCode::OK, Json(user_row(&final_id, &u)))
 }
@@ -750,7 +768,7 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(AppState::new().await).into_make_service_with_connect_info::<SocketAddr>();
-    info!("panel api on {PANEL_ADDR}"); axum::serve(TcpListener::bind(PANEL_ADDR).await?, app).await?; Ok(())
+    info!("panel api optimizado on {PANEL_ADDR}"); axum::serve(TcpListener::bind(PANEL_ADDR).await?, app).await?; Ok(())
 }
 RSEOF
 
