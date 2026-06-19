@@ -74,12 +74,12 @@ const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
 const MAX_PAYLOAD:          usize    = 16384;
-const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
+const DIAL_TIMEOUT:         Duration = Duration::from_millis(2000);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
-const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-const READ_DEADLINE:        Duration = Duration::from_secs(300);
-const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(60);
+const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(120);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(14400);
+const READ_DEADLINE:        Duration = Duration::from_secs(14400);
+const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(120);
 
 const T_OPEN:    u8 = 0x01;
 const T_DATA:    u8 = 0x02;
@@ -167,9 +167,9 @@ fn tune_client_fd(fd: i32) {
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &one as *const _ as _, 4);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &one as *const _ as _, 4);
         
-        let idle: i32 = 120;
-        let intvl: i32 = 30;
-        let cnt: i32 = 3;
+        let idle: i32 = 600;
+        let intvl: i32 = 60;
+        let cnt: i32 = 5;
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle as *const _ as _, 4);
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &intvl as *const _ as _, 4);
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &cnt as *const _ as _, 4);
@@ -231,9 +231,9 @@ impl Mux {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
-    #[inline(always)] fn send_data_sync(&self, sid: u32, data: &[u8]) {
+    async fn send_data(&self, sid: u32, data: &[u8]) {
         if self.is_dead() { return; }
-        if self.write_tx.try_send(make_frame(T_DATA, sid, data)).is_err() {
+        if self.write_tx.send(make_frame(T_DATA, sid, data)).await.is_err() {
             self.close_stream_sync(sid);
             let _ = self.ctrl_tx.try_send(make_frame(T_CLOSE, sid, &[]));
         }
@@ -328,7 +328,7 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     stream.touch();
-                    mux2.send_data_sync(sid, &buf[..n]);
+                    mux2.send_data(sid, &buf[..n]).await;
                 }
             }
         }
@@ -358,7 +358,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PING => mux.send_ctrl_sync(T_PONG, sid),
             T_OPEN => {
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let (tx, rx) = mpsc::channel(1024);
+                let (tx, rx) = mpsc::channel(2048);
                 let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) { mux.send_ctrl_sync(T_CLOSE, sid); continue; }
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
@@ -430,8 +430,8 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-            let (write_tx, write_rx) = mpsc::channel(1024);
-            let (ctrl_tx,  ctrl_rx)  = mpsc::channel(256);
+            let (write_tx, write_rx) = mpsc::channel(2048);
+            let (ctrl_tx,  ctrl_rx)  = mpsc::channel(1024);
             let mux = Mux::new(write_tx, ctrl_tx);
 
             if let Some(prev_mux) = sessions.insert(user_id.clone(), mux.clone()) {
@@ -604,7 +604,7 @@ struct AppState {
     token:    Arc<String>,
     users_mu: Arc<Mutex<()>>,
     rate:     Arc<std::sync::Mutex<HashMap<String, Vec<i64>>>>,
-    http:     reqwest::Client, // MEJORA: Cliente HTTP reutilizable
+    http:     reqwest::Client,
 }
 
 impl AppState {
@@ -626,7 +626,6 @@ impl AppState {
         headers.get("x-token").and_then(|v| v.to_str().ok()).map(|t| t.trim() == self.token.as_str()).unwrap_or(false)
     }
 
-    // Funciones delegadas al cliente HTTP compartido para máximo rendimiento
     async fn kick_user(&self, id: String, reason: &'static str) {
         let _ = self.http.get(format!("{KICK_BASE}{id}&reason={reason}")).send().await;
     }
