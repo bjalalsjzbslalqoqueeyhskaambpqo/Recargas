@@ -221,28 +221,22 @@ async fn kick_api(s: SessionMap, w: WaitRoom) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("btserver=info".parse()?),
-        )
-        .init();
-
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
     let (ses, wr, ic) = (Arc::new(DashMap::new()), Arc::new(DashMap::new()), Arc::new(DashMap::new()));
     tokio::spawn(kick_api(ses.clone(), wr.clone()));
     tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(86400 - (now_secs() % 86400) as u64)).await; let ids: Vec<String> = s.iter().map(|r| r.key().clone()).collect(); for id in ids { match check_auth(&id).await { AuthResult::Ok{..} => continue, AuthResult::Expired => kick_session(&s, &id, T_EXPIRED), AuthResult::NotFound => kick_session(&s, &id, T_KICK) }; } } }});
-    tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(300)).await; s.retain(|_, m| if m.dead.load(Ordering::Acquire) { m.streams.clear(); false } else { m.streams.retain(|_, s| !s.is_closed()); true }); } }});
+    tokio::spawn({let s=ses.clone(); async move { loop { time::sleep(Duration::from_secs(300)).await; s.retain(|_, m| if m.dead.load(Ordering::Acquire) { m.streams.clear(); false } else { m.streams.retain(|_, st| !st.is_closed()); true }); } }});
     
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?; sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?; sock.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(10)))?; unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); } sock.set_nonblocking(true)?; sock.bind(&addr.into())?;
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?; sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?; sock.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)).with_interval(Duration::from_secs(10)))?; unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); } sock.set_nonblocking(true)?; sock.bind(&LISTEN_ADDR.parse::<SocketAddr>().unwrap().into())?;
     let ln = TcpListener::from_std(sock.into())?; info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
-    loop { if let Ok((conn, _)) = ln.accept().await { b  = sessions.clone(); let p  = pool.clone(); let wr = waitroom.clone(); let ic = ip_count.clone(); tokio::spawn(handle_conn(conn, b, p, wr, ic)); } }
+    loop { if let Ok((conn, _)) = ln.accept().await { tokio::spawn(handle_conn(conn, ses.clone(), wr.clone(), ic.clone())); } }
 }
 RSEOF
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use anyhow::Result; use axum::{extract::{ConnectInfo, Query, State}, http::{HeaderMap, StatusCode}, routing::{delete, get, post, put}, Json, Router};
-use serde::{Deserialize, Serialize}; use tokio::{fs, net::TcpListener, sync::Mutex};
+use serde::{Deserialize, Serialize}; use tokio::{fs, net::TcpListener, sync::Mutex}; use tracing::info;
 
 const PANEL_ADDR: &str = "0.0.0.0:8090"; const USERS_PATH: &str = "/opt/btserver/users.txt"; const TOKEN_PATH: &str = "/opt/btserver/token.txt"; const KICK_BASE: &str = "http://127.0.0.1:8091/kick?id="; const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
 #[inline(always)] fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
