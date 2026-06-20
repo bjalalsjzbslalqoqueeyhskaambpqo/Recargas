@@ -75,17 +75,17 @@ const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 
 // Limites optimizados para entorno de bajos recursos (1vCPU / 1GB RAM)
-const MAX_STREAMS:          usize    = 2000;
-const QUEUE_SIZE:           usize    = 64;
+const MAX_STREAMS:          usize    = 4000;
+const QUEUE_SIZE:           usize    = 500;
 const MAX_PAYLOAD:          usize    = 16384;
 const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
-const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(3600);
+const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(30);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(86400);
 const MUX_WRITE_QUEUE:      usize    = 512;
 const CTRL_QUEUE:           usize    = 128;
-const BATCH_MIN:            usize    = 20;
+const BATCH_MIN:            usize    = 40;
 const BATCH_MAX:            usize    = 100;
 const INITIAL_BATCH:        usize    = 64;
 const ADJUST_WINDOW_MS:     u64      = 100;
