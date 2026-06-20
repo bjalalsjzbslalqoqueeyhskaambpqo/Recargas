@@ -78,7 +78,7 @@ const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(600);
+const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(900);
 const MUX_WRITE_QUEUE:      usize    = 2048;
 const CTRL_QUEUE:           usize    = 128;
 const BATCH_MIN:            usize    = 20;
@@ -198,6 +198,8 @@ fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
 }
 
@@ -241,9 +243,10 @@ impl Mux {
     }
 
     #[inline(always)] fn kill(&self) {
-        self.dead.store(true, Ordering::Release);
-        let _ = self.kill_tx.send(true);
-        self.streams.clear();
+        if self.dead.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let _ = self.kill_tx.send(true);
+            self.streams.clear();
+        }
     }
 
     #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
