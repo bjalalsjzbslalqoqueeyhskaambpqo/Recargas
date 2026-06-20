@@ -435,7 +435,7 @@ func handleLobbyConn(conn net.Conn, lib *Library, hub *LobbyHub) {
 	
 	log.Printf("[lobby] conectado: %s", deviceID)
 	
-	// ESTO ERA LO QUE FALTABA Y EL CLIENTE SE QUEDABA ESPERANDO
+	// Estado inicial para que el cliente Android se desbloquee
 	sendLine(client, map[string]interface{}{"type": "state", "status": "ready"})
 	sendLine(client, map[string]interface{}{"type": "content_list", "items": lib.ListForClient()})
 	
@@ -867,7 +867,12 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/admin/add-manual", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ Name, URL, Category string; Duration int }
+		var req struct {
+			Name     string `json:"name"`
+			URL      string `json:"url"`
+			Category string `json:"category"`
+			Duration int    `json:"duration"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.URL == "" { http.Error(w, "parametros invalidos", 400); return }
 		id := uuid.NewString()
 		item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, URL: req.URL, Status: "ready", Mode: "manual"}
@@ -877,7 +882,11 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	}))
 
 	mux.HandleFunc("/admin/add-library", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ Name, SourceURL, Category string }
+		var req struct {
+			Name      string `json:"name"`
+			SourceURL string `json:"source_url"`
+			Category  string `json:"category"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.SourceURL == "" { http.Error(w, "parametros invalidos", 400); return }
 		id := uuid.NewString()
 		item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, Status: "processing", Mode: "library", QualityDirs: make(map[string]string), QualityReady: make(map[string]bool)}
@@ -887,7 +896,11 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	}))
 
 	mux.HandleFunc("/admin/add-ondemand", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ Name, SourceURL, Category string }
+		var req struct {
+			Name      string `json:"name"`
+			SourceURL string `json:"source_url"`
+			Category  string `json:"category"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.SourceURL == "" { http.Error(w, "parametros invalidos", 400); return }
 		id := uuid.NewString()
 		item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "ondemand"}
@@ -896,7 +909,11 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	}))
 
 	mux.HandleFunc("/admin/add-live", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ Name, SourceURL, Category string }
+		var req struct {
+			Name      string `json:"name"`
+			SourceURL string `json:"source_url"`
+			Category  string `json:"category"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.SourceURL == "" { http.Error(w, "parametros invalidos", 400); return }
 		id := uuid.NewString()
 		item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "live", IsLive: true}
@@ -1065,15 +1082,4 @@ if [ "$ACTIVE" = "active" ]; then
 else
   echo "  AVISO: servicio no activo. journalctl -u streamserver -n 50"
 fi
-echo "=================================================="
-echo "API Admin protegida:"
-echo "  URL:   http://<IP_SERVIDOR>:${ADMIN_PORT}"
-echo "  Token: ${ADMIN_TOKEN}"
-echo
-echo "Comandos CLI (ya autenticados autom.):"
-echo "  streamserver add-ondemand <nombre> <url> [categoria]"
-echo "  streamserver add-library <nombre> <url> [categoria]"
-echo "  streamserver add-live <nombre> <url> [categoria]"
-echo "  streamserver delete <id>"
-echo "  streamserver list"
 echo "=================================================="
