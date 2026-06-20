@@ -13,7 +13,7 @@ LOBBY_PORT="8384"
 ADMIN_PORT="8385"
 
 echo "=================================================="
-echo "  Stream Server - Actualizador a V4 (Robusto)"
+echo "  Stream Server - Actualizador Final V5"
 echo "=================================================="
 
 echo "[1/6] Preparando entorno..."
@@ -379,24 +379,23 @@ func startHTTPServer(lib *Library, lm *LiveManager, odm *OnDemandManager) {
 	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}; log.Fatal(srv.ListenAndServe())
 }
 
-// === API Admin Diagnostico Avanzado ===
+// === API Admin ===
 func withAuth(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
 		if r.Method == "OPTIONS" { w.WriteHeader(http.StatusOK); return }
-		if r.Header.Get("X-Admin-Token") != token { http.Error(w, `{"error":"Acceso Denegado: Token Incorrecto"}`, http.StatusUnauthorized); return }
+		if r.Header.Get("X-Admin-Token") != token { http.Error(w, `{"error":"Token Incorrecto"}`, http.StatusUnauthorized); return }
 		next(w, r)
 	}
 }
 
-// Parsea el JSON y muestra por que fallo exactamente si ocurre un error
 func parseBodyVerbose(w http.ResponseWriter, r *http.Request, dest interface{}) error {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil { http.Error(w, fmt.Sprintf("Error leyendo body: %v", err), 400); return err }
-	if len(bodyBytes) == 0 { http.Error(w, "El servidor recibió un Body Vacio (Posible bloqueo de NGINX/Cloudflare)", 400); return fmt.Errorf("body vacio") }
-	if err := json.Unmarshal(bodyBytes, dest); err != nil { http.Error(w, fmt.Sprintf("JSON malformado. Recibi esto: '%s' Error: %v", string(bodyBytes), err), 400); return err }
+	if len(bodyBytes) == 0 { http.Error(w, "Body Vacio", 400); return fmt.Errorf("body vacio") }
+	if err := json.Unmarshal(bodyBytes, dest); err != nil { http.Error(w, fmt.Sprintf("JSON malformado: %v", err), 400); return err }
 	return nil
 }
 
@@ -404,36 +403,36 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/admin/add-manual", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name, URL, Category string; Duration int }
+		var req struct { Name string `json:"name"`; URL string `json:"url"`; Category string `json:"category"`; Duration int `json:"duration"` }
 		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.URL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Recibi Name='%s' URL='%s'", req.Name, req.URL), 400); return }
+		if req.Name == "" || req.URL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.URL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, URL: req.URL, Status: "ready", Mode: "manual"}
 		if req.Duration > 0 { item.DurationSeconds = &req.Duration }; lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/add-library", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name, SourceURL, Category string }
+		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
 		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Recibi Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, Status: "processing", Mode: "library", QualityDirs: make(map[string]string), QualityReady: make(map[string]bool)}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); go processLibraryItem(lib, hub, item)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "processing"})
 	}))
 
 	mux.HandleFunc("/admin/add-ondemand", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name, SourceURL, Category string }
+		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
 		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Recibi Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "ondemand"}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/add-live", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name, SourceURL, Category string }
+		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
 		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Recibi Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "live", IsLive: true}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
@@ -528,4 +527,4 @@ systemctl restart "${SERVICE_NAME}"
 ln -sf "${INSTALL_DIR}/streamserver" /usr/local/bin/streamserver
 
 echo "[6/6] Finalizado."
-echo "API Admin Segura en el puerto: ${ADMIN_PORT}"
+echo "¡Error de parametros arreglado!"
