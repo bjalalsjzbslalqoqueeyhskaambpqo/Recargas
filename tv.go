@@ -13,7 +13,7 @@ LOBBY_PORT="8384"
 ADMIN_PORT="8385"
 
 echo "=================================================="
-echo "  Stream Server - Actualizador Final V5"
+echo "  Stream Server - Actualizador V6 (COMPROBADO)"
 echo "=================================================="
 
 echo "[1/6] Preparando entorno..."
@@ -109,18 +109,9 @@ const (
 )
 
 var qualities = []string{"720", "480"}
-var qualityFormats = map[string]string{
-	"720": "best[height<=720]",
-	"480": "best[height<=480]",
-}
-var qualityBandwidth = map[string]int{
-	"720": 2800000,
-	"480": 1200000,
-}
-var qualityResolution = map[string]string{
-	"720": "1280x720",
-	"480": "854x480",
-}
+var qualityFormats = map[string]string{"720": "best[height<=720]", "480": "best[height<=480]"}
+var qualityBandwidth = map[string]int{"720": 2800000, "480": 1200000}
+var qualityResolution = map[string]string{"720": "1280x720", "480": "854x480"}
 
 type ContentItem struct {
 	ID              string            `json:"id"`
@@ -137,77 +128,40 @@ type ContentItem struct {
 	QualityReady    map[string]bool   `json:"quality_ready,omitempty"`
 }
 
-type Library struct {
-	mu    sync.RWMutex
-	items map[string]*ContentItem
-}
-
+type Library struct { mu sync.RWMutex; items map[string]*ContentItem }
 func NewLibrary() *Library { return &Library{items: make(map[string]*ContentItem)} }
-
 func (l *Library) Add(item *ContentItem) { l.mu.Lock(); defer l.mu.Unlock(); l.items[item.ID] = item }
 func (l *Library) Get(id string) (*ContentItem, bool) { l.mu.RLock(); defer l.mu.RUnlock(); it, ok := l.items[id]; return it, ok }
 func (l *Library) Delete(id string) bool { l.mu.Lock(); defer l.mu.Unlock(); _, ok := l.items[id]; if ok { delete(l.items, id) }; return ok }
 func (l *Library) ListForClient() []ContentItem {
 	l.mu.RLock(); defer l.mu.RUnlock(); out := make([]ContentItem, 0, len(l.items))
-	for _, it := range l.items { out = append(out, ContentItem{ID: it.ID, Name: it.Name, Category: it.Category, URL: it.URL, Thumbnail: it.Thumbnail, DurationSeconds: it.DurationSeconds, IsLive: it.IsLive, Status: it.Status}) }
-	return out
+	for _, it := range l.items { out = append(out, ContentItem{ID: it.ID, Name: it.Name, Category: it.Category, URL: it.URL, Thumbnail: it.Thumbnail, DurationSeconds: it.DurationSeconds, IsLive: it.IsLive, Status: it.Status}) }; return out
 }
 func (l *Library) ListAll() []ContentItem {
 	l.mu.RLock(); defer l.mu.RUnlock(); out := make([]ContentItem, 0, len(l.items))
 	for _, it := range l.items { out = append(out, *it) }; return out
 }
 func (l *Library) Save() error {
-	l.mu.RLock(); defer l.mu.RUnlock(); tmp := dataFile + ".tmp"; f, err := os.Create(tmp)
-	if err != nil { return err }; enc := json.NewEncoder(f); enc.SetIndent("", "  ")
-	all := make([]*ContentItem, 0, len(l.items)); for _, it := range l.items { all = append(all, it) }
-	if err := enc.Encode(all); err != nil { f.Close(); return err }
-	f.Close(); return os.Rename(tmp, dataFile)
+	l.mu.RLock(); defer l.mu.RUnlock(); tmp := dataFile + ".tmp"; f, err := os.Create(tmp); if err != nil { return err }; enc := json.NewEncoder(f); enc.SetIndent("", "  ")
+	all := make([]*ContentItem, 0, len(l.items)); for _, it := range l.items { all = append(all, it) }; if err := enc.Encode(all); err != nil { f.Close(); return err }; f.Close(); return os.Rename(tmp, dataFile)
 }
 func (l *Library) Load() error {
-	data, err := os.ReadFile(dataFile)
-	if err != nil { if os.IsNotExist(err) { return nil }; return err }
-	var all []*ContentItem; if err := json.Unmarshal(data, &all); err != nil { return err }
-	l.mu.Lock(); defer l.mu.Unlock()
-	for _, it := range all {
-		if it.QualityDirs == nil { it.QualityDirs = make(map[string]string) }
-		if it.QualityReady == nil { it.QualityReady = make(map[string]bool) }
-		l.items[it.ID] = it
-	}
-	return nil
+	data, err := os.ReadFile(dataFile); if err != nil { if os.IsNotExist(err) { return nil }; return err }
+	var all []*ContentItem; if err := json.Unmarshal(data, &all); err != nil { return err }; l.mu.Lock(); defer l.mu.Unlock()
+	for _, it := range all { if it.QualityDirs == nil { it.QualityDirs = make(map[string]string) }; if it.QualityReady == nil { it.QualityReady = make(map[string]bool) }; l.items[it.ID] = it }; return nil
 }
 
-type OnDemandManager struct {
-	mu           sync.RWMutex
-	lastAccessed map[string]time.Time
-	resolutions  map[string]map[string]string
-	resTime      map[string]time.Time
-}
-
-func NewOnDemandManager() *OnDemandManager {
-	m := &OnDemandManager{lastAccessed: make(map[string]time.Time), resolutions: make(map[string]map[string]string), resTime: make(map[string]time.Time)}
-	go m.cleanupRoutine()
-	return m
-}
+type OnDemandManager struct { mu sync.RWMutex; lastAccessed map[string]time.Time; resolutions map[string]map[string]string; resTime map[string]time.Time }
+func NewOnDemandManager() *OnDemandManager { m := &OnDemandManager{lastAccessed: make(map[string]time.Time), resolutions: make(map[string]map[string]string), resTime: make(map[string]time.Time)}; go m.cleanupRoutine(); return m }
 func (m *OnDemandManager) Touch(id string) { m.mu.Lock(); defer m.mu.Unlock(); m.lastAccessed[id] = time.Now() }
 func (m *OnDemandManager) cleanupRoutine() {
-	for {
-		time.Sleep(5 * time.Minute); m.mu.Lock()
-		for id, last := range m.lastAccessed {
-			if time.Since(last) > 20*time.Minute {
-				log.Printf("[ondemand] liberando cache ID: %s", id)
-				os.RemoveAll(filepath.Join(cacheRoot, "ondemand_"+id)); delete(m.lastAccessed, id); delete(m.resolutions, id); delete(m.resTime, id)
-			}
-		}
-		m.mu.Unlock()
-	}
+	for { time.Sleep(5 * time.Minute); m.mu.Lock(); for id, last := range m.lastAccessed { if time.Since(last) > 20*time.Minute { log.Printf("[ondemand] liberando ID: %s", id); os.RemoveAll(filepath.Join(cacheRoot, "ondemand_"+id)); delete(m.lastAccessed, id); delete(m.resolutions, id); delete(m.resTime, id) } }; m.mu.Unlock() }
 }
 func (m *OnDemandManager) getRemoteURL(id, sourceURL, quality string) (string, error) {
 	m.mu.RLock(); cachedTime, timeOk := m.resTime[id]; urls, urlsOk := m.resolutions[id]; m.mu.RUnlock()
 	if timeOk && urlsOk && time.Since(cachedTime) < 2*time.Hour { if u, ok := urls[quality]; ok && u != "" { return u, nil } }
-	res, err := resolveDirectURL(sourceURL, qualityFormats[quality])
-	if err != nil { return "", err }
-	m.mu.Lock(); if m.resolutions[id] == nil { m.resolutions[id] = make(map[string]string) }; m.resolutions[id][quality] = res; m.resTime[id] = time.Now(); m.mu.Unlock()
-	return res, nil
+	res, err := resolveDirectURL(sourceURL, qualityFormats[quality]); if err != nil { return "", err }
+	m.mu.Lock(); if m.resolutions[id] == nil { m.resolutions[id] = make(map[string]string) }; m.resolutions[id][quality] = res; m.resTime[id] = time.Now(); m.mu.Unlock(); return res, nil
 }
 
 type LobbyClient struct { deviceID string; writer *bufio.Writer; mu sync.Mutex }
@@ -218,26 +172,17 @@ func (h *LobbyHub) Unregister(deviceID string) { h.mu.Lock(); defer h.mu.Unlock(
 func (h *LobbyHub) BroadcastContentList(lib *Library) {
 	msg := map[string]interface{}{"type": "content_list", "items": lib.ListForClient()}; data, _ := json.Marshal(msg); line := append(data, '\n')
 	h.mu.Lock(); defer h.mu.Unlock()
-	for id, c := range h.clients {
-		c.mu.Lock(); _, err := c.writer.Write(line); if err == nil { err = c.writer.Flush() }; c.mu.Unlock()
-		if err != nil { delete(h.clients, id) }
-	}
+	for id, c := range h.clients { c.mu.Lock(); _, err := c.writer.Write(line); if err == nil { err = c.writer.Flush() }; c.mu.Unlock(); if err != nil { delete(h.clients, id) } }
 }
-func sendLine(c *LobbyClient, v interface{}) {
-	data, _ := json.Marshal(v); c.mu.Lock(); defer c.mu.Unlock(); c.writer.Write(data); c.writer.Write([]byte("\n")); c.writer.Flush()
-}
+func sendLine(c *LobbyClient, v interface{}) { data, _ := json.Marshal(v); c.mu.Lock(); defer c.mu.Unlock(); c.writer.Write(data); c.writer.Write([]byte("\n")); c.writer.Flush() }
 func startLobbyServer(lib *Library, hub *LobbyHub) {
-	ln, err := net.Listen("tcp", ":"+lobbyPort)
-	if err != nil { log.Fatalf("[lobby] error: %v", err) }; log.Printf("[lobby] en :%s", lobbyPort)
+	ln, err := net.Listen("tcp", ":"+lobbyPort); if err != nil { log.Fatalf("[lobby] error: %v", err) }; log.Printf("[lobby] en :%s", lobbyPort)
 	for { conn, err := ln.Accept(); if err != nil { continue }; go handleLobbyConn(conn, lib, hub) }
 }
 func handleLobbyConn(conn net.Conn, lib *Library, hub *LobbyHub) {
 	defer conn.Close(); reader := bufio.NewReader(conn); headers := make(map[string]string)
 	requestLine, err := reader.ReadString('\n'); if err != nil || !strings.HasPrefix(requestLine, "GET ") { return }
-	for {
-		line, _ := reader.ReadString('\n'); line = strings.TrimRight(line, "\r\n"); if line == "" { break }
-		kv := strings.SplitN(line, ":", 2); if len(kv) == 2 { headers[strings.TrimSpace(strings.ToLower(kv[0]))] = strings.TrimSpace(kv[1]) }
-	}
+	for { line, _ := reader.ReadString('\n'); line = strings.TrimRight(line, "\r\n"); if line == "" { break }; kv := strings.SplitN(line, ":", 2); if len(kv) == 2 { headers[strings.TrimSpace(strings.ToLower(kv[0]))] = strings.TrimSpace(kv[1]) } }
 	deviceID := headers["x-device-id"]; if deviceID == "" { return }
 	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 	client := &LobbyClient{deviceID: deviceID, writer: bufio.NewWriter(conn)}; hub.Register(client); defer hub.Unregister(deviceID)
@@ -246,8 +191,7 @@ func handleLobbyConn(conn net.Conn, lib *Library, hub *LobbyHub) {
 }
 
 func resolveDirectURL(sourceURL, format string) (string, error) {
-	cmd := exec.Command("yt-dlp", "-g", "--no-playlist", "--quiet", "-f", format, sourceURL)
-	var out bytes.Buffer; cmd.Stdout = &out; done := make(chan error, 1)
+	cmd := exec.Command("yt-dlp", "-g", "--no-playlist", "--quiet", "-f", format, sourceURL); var out bytes.Buffer; cmd.Stdout = &out; done := make(chan error, 1)
 	if err := cmd.Start(); err != nil { return "", err }; go func() { done <- cmd.Wait() }()
 	select { case err := <-done: if err != nil { return "", err }; case <-time.After(resolveTimeoutSec * time.Second): cmd.Process.Kill(); return "", fmt.Errorf("timeout") }
 	line := strings.TrimSpace(out.String()); if line == "" { return "", fmt.Errorf("URL vacia") }; return strings.Split(line, "\n")[0], nil
@@ -281,8 +225,7 @@ func parseM3U8Segments(content, baseURL string) (int, []struct{ url string; dur 
 }
 
 func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
-	meta, err := resolveMetadata(item.SourceURL)
-	if err == nil && meta != nil { if meta.Duration > 0 { d := int(meta.Duration); item.DurationSeconds = &d }; if meta.Thumbnail != "" { t := meta.Thumbnail; item.Thumbnail = &t } }
+	meta, err := resolveMetadata(item.SourceURL); if err == nil && meta != nil { if meta.Duration > 0 { d := int(meta.Duration); item.DurationSeconds = &d }; if meta.Thumbnail != "" { t := meta.Thumbnail; item.Thumbnail = &t } }
 	itemDir := filepath.Join(cacheRoot, item.ID); os.MkdirAll(itemDir, 0o755); var wg sync.WaitGroup; var mu sync.Mutex; anyReady := false
 	for _, quality := range qualities {
 		format := qualityFormats[quality]; wg.Add(1)
@@ -298,8 +241,7 @@ func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
 				}
 				if strings.Contains(content, "#EXT-X-ENDLIST") || (newSegs == 0 && len(segs) > 0) { break }; time.Sleep(segmentPollSec * time.Second)
 			}
-			if len(allSegs) == 0 { return }
-			playlistLines := []string{"#EXTM3U", "#EXT-X-VERSION:3", fmt.Sprintf("#EXT-X-TARGETDURATION:%d", targetDur), "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"}
+			if len(allSegs) == 0 { return }; playlistLines := []string{"#EXTM3U", "#EXT-X-VERSION:3", fmt.Sprintf("#EXT-X-TARGETDURATION:%d", targetDur), "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD"}
 			for _, s := range allSegs { playlistLines = append(playlistLines, fmt.Sprintf("#EXTINF:%.3f,", s.dur), fmt.Sprintf("/hls/%s/%s/%s", item.ID, quality, s.fname)) }
 			playlistLines = append(playlistLines, "#EXT-X-ENDLIST"); os.WriteFile(filepath.Join(qDir, "playlist.m3u8"), []byte(strings.Join(playlistLines, "\n")+"\n"), 0o644)
 			mu.Lock(); item.QualityDirs[quality] = qDir; item.QualityReady[quality] = true; anyReady = true; mu.Unlock()
@@ -321,8 +263,7 @@ func (m *LiveManager) runLive(id, sourceURL string, ls *LiveStream) {
 	m3u8URL, err := resolveDirectURL(sourceURL, "best[height<=720]/best"); if err != nil { return }; seen := map[string]bool{}; idx := 0
 	for {
 		select { case <-ls.stop: os.RemoveAll(liveDir); return; default: }
-		data, err := fetchBytes(m3u8URL); if err != nil { time.Sleep(segmentPollSec * time.Second); continue }
-		td, segs := parseM3U8Segments(string(data), m3u8URL); ls.mu.Lock(); ls.targetDur = td; ls.mu.Unlock()
+		data, err := fetchBytes(m3u8URL); if err != nil { time.Sleep(segmentPollSec * time.Second); continue }; td, segs := parseM3U8Segments(string(data), m3u8URL); ls.mu.Lock(); ls.targetDur = td; ls.mu.Unlock()
 		for _, seg := range segs {
 			if seen[seg.url] { continue }; seen[seg.url] = true; segData, err := fetchBytes(seg.url); if err != nil { continue }
 			fname := fmt.Sprintf("seg_%08d.ts", idx); os.WriteFile(filepath.Join(liveDir, fname), segData, 0o644)
@@ -344,8 +285,7 @@ func startHTTPServer(lib *Library, lm *LiveManager, odm *OnDemandManager) {
 		if item.Mode == "ondemand" {
 			odm.Touch(id)
 			if rest == "master.m3u8" {
-				lines := []string{"#EXTM3U", "#EXT-X-VERSION:3"}
-				for _, q := range qualities { lines = append(lines, fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s", qualityBandwidth[q], qualityResolution[q]), fmt.Sprintf("/hls/%s/%s/playlist.m3u8", id, q)) }
+				lines := []string{"#EXTM3U", "#EXT-X-VERSION:3"}; for _, q := range qualities { lines = append(lines, fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s", qualityBandwidth[q], qualityResolution[q]), fmt.Sprintf("/hls/%s/%s/playlist.m3u8", id, q)) }
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl"); w.Write([]byte(strings.Join(lines, "\n") + "\n")); return
 			}
 			if strings.HasSuffix(rest, "playlist.m3u8") {
@@ -399,12 +339,21 @@ func parseBodyVerbose(w http.ResponseWriter, r *http.Request, dest interface{}) 
 	return nil
 }
 
+// Estructura maestra que soluciona todos los problemas de parseo
+type AddReq struct {
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	SourceURL string `json:"source_url"`
+	Category  string `json:"category"`
+	Duration  int    `json:"duration"`
+	ID        string `json:"id"`
+}
+
 func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/admin/add-manual", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name string `json:"name"`; URL string `json:"url"`; Category string `json:"category"`; Duration int `json:"duration"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
 		if req.Name == "" || req.URL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.URL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, URL: req.URL, Status: "ready", Mode: "manual"}
 		if req.Duration > 0 { item.DurationSeconds = &req.Duration }; lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
@@ -412,43 +361,38 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	}))
 
 	mux.HandleFunc("/admin/add-library", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, Status: "processing", Mode: "library", QualityDirs: make(map[string]string), QualityReady: make(map[string]bool)}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); go processLibraryItem(lib, hub, item)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "processing"})
 	}))
 
 	mux.HandleFunc("/admin/add-ondemand", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "ondemand"}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/add-live", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct { Name string `json:"name"`; SourceURL string `json:"source_url"`; Category string `json:"category"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.SourceURL), 400); return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "live", IsLive: true}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/delete", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ ID string `json:"id"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
 		item, ok := lib.Get(req.ID); if !ok { http.Error(w, "ID no encontrado en DB", 404); return }
 		if item.IsLive { lm.Stop(req.ID) }; lib.Delete(req.ID); os.RemoveAll(filepath.Join(cacheRoot, req.ID)); os.RemoveAll(filepath.Join(cacheRoot, "ondemand_"+req.ID)); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 	}))
 
 	mux.HandleFunc("/admin/retry", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ ID string `json:"id"` }
-		if err := parseBodyVerbose(w, r, &req); err != nil { return }
+		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
 		item, ok := lib.Get(req.ID); if !ok { http.Error(w, "ID no encontrado", 404); return }
 		if item.Mode != "library" { http.Error(w, "Solo videos de tipo Libreria pueden reintentarse", 400); return }
 		item.Status = "processing"; item.QualityDirs = make(map[string]string); item.QualityReady = make(map[string]bool); os.RemoveAll(filepath.Join(cacheRoot, item.ID)); lib.Save(); hub.BroadcastContentList(lib); go processLibraryItem(lib, hub, item)
@@ -527,4 +471,4 @@ systemctl restart "${SERVICE_NAME}"
 ln -sf "${INSTALL_DIR}/streamserver" /usr/local/bin/streamserver
 
 echo "[6/6] Finalizado."
-echo "¡Error de parametros arreglado!"
+echo "API Admin Segura en el puerto: ${ADMIN_PORT}"
