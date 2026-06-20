@@ -372,10 +372,16 @@ func fetchBytes(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func parseM3U8Segments(content, baseURL string) (int, []struct{ url string; dur float64 }) {
+func parseM3U8Segments(content, baseURL string) (int, []struct {
+	url string
+	dur float64
+}) {
 	lines := strings.Split(content, "\n")
 	targetDuration := 6
-	var segs []struct{ url string; dur float64 }
+	var segs []struct {
+		url string
+		dur float64
+	}
 	var pendingDur float64
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -406,7 +412,10 @@ func parseM3U8Segments(content, baseURL string) (int, []struct{ url string; dur 
 			if dur == 0 {
 				dur = 6.0
 			}
-			segs = append(segs, struct{ url string; dur float64 }{segURL, dur})
+			segs = append(segs, struct {
+				url string
+				dur float64
+			}{segURL, dur})
 			pendingDur = 0
 		}
 	}
@@ -459,10 +468,13 @@ func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
 				return
 			}
 
-			log.Printf("[library][%s] descargando segmentos %s...", item.ID, quality)
 			seen := map[string]bool{}
 			idx := 0
-			var allSegs []struct{ fname string; dur float64 }
+			type segEntry struct {
+				fname string
+				dur   float64
+			}
+			var allSegs []segEntry
 			targetDur := 6
 
 			for {
@@ -492,7 +504,7 @@ func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
 						log.Printf("[library][%s] write seg error: %v", item.ID, err)
 						continue
 					}
-					allSegs = append(allSegs, struct{ fname string; dur float64 }{fname, seg.dur})
+					allSegs = append(allSegs, segEntry{fname, seg.dur})
 					idx++
 					newSegs++
 				}
@@ -502,14 +514,14 @@ func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
 					break
 				}
 				if newSegs == 0 && len(segs) > 0 {
-					log.Printf("[library][%s] calidad %s sin segmentos nuevos, fin", item.ID, quality)
+					log.Printf("[library][%s] calidad %s sin nuevos segmentos, fin", item.ID, quality)
 					break
 				}
 				time.Sleep(segmentPollSec * time.Second)
 			}
 
 			if len(allSegs) == 0 {
-				log.Printf("[library][%s] calidad %s sin segmentos descargados", item.ID, quality)
+				log.Printf("[library][%s] calidad %s sin segmentos", item.ID, quality)
 				return
 			}
 
@@ -523,10 +535,9 @@ func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
 			for _, s := range allSegs {
 				playlistLines = append(playlistLines,
 					fmt.Sprintf("#EXTINF:%.3f,", s.dur),
-					s.fname+".ts" ,
+					fmt.Sprintf("/hls/%s/%s/%s", item.ID, quality, s.fname),
 				)
 			}
-
 			playlistLines = append(playlistLines, "#EXT-X-ENDLIST")
 			playlistContent := strings.Join(playlistLines, "\n") + "\n"
 			playlistPath := filepath.Join(qDir, "playlist.m3u8")
@@ -615,7 +626,7 @@ func (m *LiveManager) runLive(id, sourceURL string, ls *LiveStream) {
 		log.Printf("[live][%s] resolve error: %v", id, err)
 		return
 	}
-	log.Printf("[live][%s] URL resuelta, grabando segmentos...", id)
+	log.Printf("[live][%s] grabando segmentos...", id)
 
 	seen := map[string]bool{}
 	idx := 0
@@ -704,6 +715,7 @@ func startHTTPServer(lib *Library, lm *LiveManager) {
 
 		if item.IsLive {
 			ls := lm.GetOrCreate(id, item.SourceURL)
+
 			if rest == "master.m3u8" {
 				ls.mu.RLock()
 				ready := ls.ready
@@ -713,12 +725,13 @@ func startHTTPServer(lib *Library, lm *LiveManager) {
 					return
 				}
 				body := "#EXTM3U\n#EXT-X-VERSION:3\n"
-				body += fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n")
+				body += "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n"
 				body += fmt.Sprintf("/hls/%s/live.m3u8\n", id)
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 				w.Write([]byte(body))
 				return
 			}
+
 			if rest == "live.m3u8" {
 				ls.mu.RLock()
 				segs := make([]LiveSegment, len(ls.segments))
@@ -748,6 +761,7 @@ func startHTTPServer(lib *Library, lm *LiveManager) {
 				w.Write([]byte(body))
 				return
 			}
+
 			if strings.HasPrefix(rest, "seg/") {
 				fname := strings.TrimPrefix(rest, "seg/")
 				if strings.Contains(fname, "..") || strings.Contains(fname, "/") {
@@ -765,6 +779,7 @@ func startHTTPServer(lib *Library, lm *LiveManager) {
 				w.Write(data)
 				return
 			}
+
 			http.NotFound(w, r)
 			return
 		}
@@ -821,6 +836,7 @@ func startHTTPServer(lib *Library, lm *LiveManager) {
 				return
 			}
 		}
+
 		http.NotFound(w, r)
 	})
 
@@ -884,12 +900,12 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager) {
 		}
 		id := uuid.NewString()
 		item := &ContentItem{
-			ID:          id,
-			Name:        req.Name,
-			SourceURL:   req.SourceURL,
-			Status:      "processing",
-			Mode:        "library",
-			QualityDirs: make(map[string]string),
+			ID:           id,
+			Name:         req.Name,
+			SourceURL:    req.SourceURL,
+			Status:       "processing",
+			Mode:         "library",
+			QualityDirs:  make(map[string]string),
 			QualityReady: make(map[string]bool),
 		}
 		lib.Add(item)
