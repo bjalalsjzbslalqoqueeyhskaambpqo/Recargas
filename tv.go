@@ -68,7 +68,6 @@ echo "[5/7] Generando Token de Administracion..."
 mkdir -p "${INSTALL_DIR}"
 TOKEN_FILE="${INSTALL_DIR}/admin_token.txt"
 if [ ! -f "$TOKEN_FILE" ]; then
-  # Generar un token aleatorio seguro de 32 caracteres (hex)
   head -c 16 /dev/urandom | xxd -p > "$TOKEN_FILE"
 fi
 ADMIN_TOKEN="$(cat "$TOKEN_FILE")"
@@ -302,7 +301,6 @@ func (m *OnDemandManager) getRemoteURL(id, sourceURL, quality string) (string, e
 	urls, urlsOk := m.resolutions[id]
 	m.mu.RUnlock()
 
-	// Reutilizar URL resuelta si tiene menos de 2 horas
 	if timeOk && urlsOk && time.Since(cachedTime) < 2*time.Hour {
 		if u, ok := urls[quality]; ok && u != "" {
 			return u, nil
@@ -327,30 +325,142 @@ type LobbyClient struct {
 	writer   *bufio.Writer
 	mu       sync.Mutex
 }
+
 type LobbyHub struct {
 	mu      sync.Mutex
 	clients map[string]*LobbyClient
 }
-func NewLobbyHub() *LobbyHub { return &LobbyHub{clients: make(map[string]*LobbyClient)} }
+
+func NewLobbyHub() *LobbyHub {
+	return &LobbyHub{clients: make(map[string]*LobbyClient)}
+}
+
 func (h *LobbyHub) Register(c *LobbyClient) {
-	h.mu.Lock(); defer h.mu.Unlock(); h.clients[c.deviceID] = c
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[c.deviceID] = c
 }
+
 func (h *LobbyHub) Unregister(deviceID string) {
-	h.mu.Lock(); defer h.mu.Unlock(); delete(h.clients, deviceID)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.clients, deviceID)
 }
+
 func (h *LobbyHub) BroadcastContentList(lib *Library) {
-	msg := map[string]interface{}{"type": "content_list", "items": lib.ListForClient()}
+	msg := map[string]interface{}{
+		"type":  "content_list",
+		"items": lib.ListForClient(),
+	}
 	data, _ := json.Marshal(msg)
 	line := append(data, '\n')
-	h.mu.Lock(); defer h.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for id, c := range h.clients {
 		c.mu.Lock()
 		_, err := c.writer.Write(line)
-		if err == nil { err = c.writer.Flush() }
+		if err == nil {
+			err = c.writer.Flush()
+		}
 		c.mu.Unlock()
-		if err != nil { delete(h.clients, id) }
+		if err != nil {
+			log.Printf("[lobby] error escribiendo a %s: %v", id, err)
+			delete(h.clients, id)
+		}
 	}
 }
+
+func sendLine(c *LobbyClient, v interface{}) {
+	data, _ := json.Marshal(v)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writer.Write(data)
+	c.writer.Write([]byte("\n"))
+	c.writer.Flush()
+}
+
+func startLobbyServer(lib *Library, hub *LobbyHub) {
+	ln, err := net.Listen("tcp", ":"+lobbyPort)
+	if err != nil {
+		log.Fatalf("[lobby] no se pudo escuchar en :%s: %v", lobbyPort, err)
+	}
+	log.Printf("[lobby] escuchando en :%s", lobbyPort)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("[lobby] accept error: %v", err)
+			continue
+		}
+		go handleLobbyConn(conn, lib, hub)
+	}
+}
+
+func handleLobbyConn(conn net.Conn, lib *Library, hub *LobbyHub) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	headers := make(map[string]string)
+	requestLine, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	if !strings.HasPrefix(requestLine, "GET ") {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		kv := strings.SplitN(line, ":", 2)
+		if len(kv) == 2 {
+			headers[strings.TrimSpace(strings.ToLower(kv[0]))] = strings.TrimSpace(kv[1])
+		}
+	}
+	deviceID := headers["x-device-id"]
+	if deviceID == "" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\nmissing X-Device-Id\r\n"))
+		return
+	}
+	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+	
+	writer := bufio.NewWriter(conn)
+	client := &LobbyClient{deviceID: deviceID, writer: writer}
+	hub.Register(client)
+	defer hub.Unregister(deviceID)
+	
+	log.Printf("[lobby] conectado: %s", deviceID)
+	
+	// ESTO ERA LO QUE FALTABA Y EL CLIENTE SE QUEDABA ESPERANDO
+	sendLine(client, map[string]interface{}{"type": "state", "status": "ready"})
+	sendLine(client, map[string]interface{}{"type": "content_list", "items": lib.ListForClient()})
+	
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("[lobby] %s desconectado: %v", deviceID, err)
+			return
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			continue
+		}
+		switch msg["type"] {
+		case "hello":
+		case "play":
+			log.Printf("[lobby] %s play: %v", deviceID, msg["content_id"])
+		}
+	}
+}
+
 
 // === Utils ===
 func resolveDirectURL(sourceURL, format string) (string, error) {
@@ -644,7 +754,6 @@ func startHTTPServer(lib *Library, lm *LiveManager, odm *OnDemandManager) {
 				os.MkdirAll(odDir, 0o755)
 				fpath := filepath.Join(odDir, hashStr+".ts")
 
-				// Ver caché
 				data, err := os.ReadFile(fpath)
 				if err == nil {
 					w.Header().Set("Content-Type", "video/MP2T")
@@ -652,7 +761,6 @@ func startHTTPServer(lib *Library, lm *LiveManager, odm *OnDemandManager) {
 					w.Write(data)
 					return
 				}
-				// Descargar segmento
 				data, err = fetchBytes(targetURL)
 				if err != nil { http.Error(w, "fetch fail", 502); return }
 				os.WriteFile(fpath, data, 0o644)
@@ -782,7 +890,6 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 		var req struct{ Name, SourceURL, Category string }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.SourceURL == "" { http.Error(w, "parametros invalidos", 400); return }
 		id := uuid.NewString()
-		// Se guarda con estado ready pero no se descarga nada hasta que se pide.
 		item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "ondemand"}
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
@@ -832,44 +939,6 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 	srv := &http.Server{Addr: "0.0.0.0:" + adminPort, Handler: mux}
 	log.Printf("[admin] escuchando API segura en 0.0.0.0:%s", adminPort)
 	log.Fatal(srv.ListenAndServe())
-}
-
-func startLobbyServer(lib *Library, hub *LobbyHub) {
-	ln, err := net.Listen("tcp", ":"+lobbyPort)
-	if err != nil { log.Fatalf("[lobby] error: %v", err) }
-	for {
-		conn, err := ln.Accept()
-		if err != nil { continue }
-		go handleLobbyConn(conn, lib, hub)
-	}
-}
-
-func handleLobbyConn(conn net.Conn, lib *Library, hub *LobbyHub) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	headers := make(map[string]string)
-	requestLine, err := reader.ReadString('\n')
-	if err != nil || !strings.HasPrefix(requestLine, "GET ") { return }
-	for {
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" { break }
-		kv := strings.SplitN(line, ":", 2)
-		if len(kv) == 2 { headers[strings.TrimSpace(strings.ToLower(kv[0]))] = strings.TrimSpace(kv[1]) }
-	}
-	deviceID := headers["x-device-id"]
-	if deviceID == "" { return }
-	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-	client := &LobbyClient{deviceID: deviceID, writer: bufio.NewWriter(conn)}
-	hub.Register(client); defer hub.Unregister(deviceID)
-	data, _ := json.Marshal(map[string]interface{}{"type": "content_list", "items": lib.ListForClient()})
-	client.mu.Lock(); client.writer.Write(append(data, '\n')); client.writer.Flush(); client.mu.Unlock()
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil { return }
-		var msg map[string]interface{}
-		json.Unmarshal([]byte(line), &msg)
-	}
 }
 
 func adminCLI(args []string) {
