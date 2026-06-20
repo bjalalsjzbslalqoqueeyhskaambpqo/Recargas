@@ -13,60 +13,18 @@ LOBBY_PORT="8384"
 ADMIN_PORT="8385"
 
 echo "=================================================="
-echo "  Stream Server - Actualizador V6 (COMPROBADO)"
+echo "  Stream Server - Actualizador V7 (Thumbnails)"
 echo "=================================================="
 
-echo "[1/6] Preparando entorno..."
-apt-get update -qq
-apt-get install -y -qq curl wget tar python3 python3-pip ffmpeg jq >/dev/null
-
-echo "[2/6] Verificando yt-dlp y Go..."
-PIP_HELP="$(python3 -m pip install --help || true)"
-if echo "$PIP_HELP" | grep -q -- "--break-system-packages"; then
-  python3 -m pip install --upgrade yt-dlp --break-system-packages -q
-else
-  python3 -m pip install --upgrade yt-dlp -q
-fi
-
-if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "${GO_VERSION}"; then
-  ARCH="$(uname -m)"
-  case "$ARCH" in
-    x86_64) GOARCH="amd64" ;;
-    aarch64) GOARCH="arm64" ;;
-    *) echo "ERROR: arquitectura no soportada: $ARCH"; exit 1 ;;
-  esac
-  cd /tmp
-  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" -O go.tar.gz
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf go.tar.gz
-  rm -f go.tar.gz
-  ln -sf /usr/local/go/bin/go /usr/local/bin/go
-  ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
-fi
-export PATH="/usr/local/go/bin:${PATH}"
-
-echo "[3/6] Obteniendo Token..."
-mkdir -p "${INSTALL_DIR}"
-TOKEN_FILE="${INSTALL_DIR}/admin_token.txt"
-if [ ! -f "$TOKEN_FILE" ]; then
-  head -c 16 /dev/urandom | xxd -p > "$TOKEN_FILE"
-fi
-ADMIN_TOKEN="$(cat "$TOKEN_FILE")"
-
-echo "[4/6] Deteniendo servicios y actualizando codigo..."
+echo "[1/4] Deteniendo servicios..."
 systemctl stop streamserver 2>/dev/null || true
-sleep 1
 fuser -k ${HTTP_PORT}/tcp 2>/dev/null || true
 fuser -k ${LOBBY_PORT}/tcp 2>/dev/null || true
 fuser -k ${ADMIN_PORT}/tcp 2>/dev/null || true
+sleep 1
 
 mkdir -p "${SRC_DIR}" "${CACHE_ROOT}"
-
-cat > "${SRC_DIR}/go.mod" <<'EOF'
-module streamserver
-
-go 1.22
-EOF
+ADMIN_TOKEN="$(cat ${INSTALL_DIR}/admin_token.txt)"
 
 cat > "${SRC_DIR}/main.go" <<'GOEOF'
 package main
@@ -225,7 +183,7 @@ func parseM3U8Segments(content, baseURL string) (int, []struct{ url string; dur 
 }
 
 func processLibraryItem(lib *Library, hub *LobbyHub, item *ContentItem) {
-	meta, err := resolveMetadata(item.SourceURL); if err == nil && meta != nil { if meta.Duration > 0 { d := int(meta.Duration); item.DurationSeconds = &d }; if meta.Thumbnail != "" { t := meta.Thumbnail; item.Thumbnail = &t } }
+	meta, err := resolveMetadata(item.SourceURL); if err == nil && meta != nil { if meta.Duration > 0 { d := int(meta.Duration); item.DurationSeconds = &d }; if meta.Thumbnail != "" { t := meta.Thumbnail; if item.Thumbnail == nil { item.Thumbnail = &t } } }
 	itemDir := filepath.Join(cacheRoot, item.ID); os.MkdirAll(itemDir, 0o755); var wg sync.WaitGroup; var mu sync.Mutex; anyReady := false
 	for _, quality := range qualities {
 		format := qualityFormats[quality]; wg.Add(1)
@@ -319,12 +277,9 @@ func startHTTPServer(lib *Library, lm *LiveManager, odm *OnDemandManager) {
 	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}; log.Fatal(srv.ListenAndServe())
 }
 
-// === API Admin ===
 func withAuth(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+		w.Header().Set("Access-Control-Allow-Origin", "*"); w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS"); w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
 		if r.Method == "OPTIONS" { w.WriteHeader(http.StatusOK); return }
 		if r.Header.Get("X-Admin-Token") != token { http.Error(w, `{"error":"Token Incorrecto"}`, http.StatusUnauthorized); return }
 		next(w, r)
@@ -339,7 +294,7 @@ func parseBodyVerbose(w http.ResponseWriter, r *http.Request, dest interface{}) 
 	return nil
 }
 
-// Estructura maestra que soluciona todos los problemas de parseo
+// Estructura actualizada con Thumbnail y IsLive
 type AddReq struct {
 	Name      string `json:"name"`
 	URL       string `json:"url"`
@@ -347,6 +302,8 @@ type AddReq struct {
 	Category  string `json:"category"`
 	Duration  int    `json:"duration"`
 	ID        string `json:"id"`
+	Thumbnail string `json:"thumbnail"`
+	IsLive    bool   `json:"is_live"`
 }
 
 func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string) {
@@ -354,40 +311,41 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 
 	mux.HandleFunc("/admin/add-manual", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
 		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.URL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' URL='%s'", req.Name, req.URL), 400); return }
-		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, URL: req.URL, Status: "ready", Mode: "manual"}
-		if req.Duration > 0 { item.DurationSeconds = &req.Duration }; lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
-		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
+		if req.Name == "" || req.URL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre"), 400); return }
+		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, URL: req.URL, Status: "ready", Mode: "manual", IsLive: req.IsLive}
+		if req.Duration > 0 { item.DurationSeconds = &req.Duration }; if req.Thumbnail != "" { item.Thumbnail = &req.Thumbnail }
+		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/add-library", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
 		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre"), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, Status: "processing", Mode: "library", QualityDirs: make(map[string]string), QualityReady: make(map[string]bool)}
+		if req.Thumbnail != "" { item.Thumbnail = &req.Thumbnail }
 		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); go processLibraryItem(lib, hub, item)
 		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "processing"})
 	}))
 
 	mux.HandleFunc("/admin/add-ondemand", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
 		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre"), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "ondemand"}
-		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
-		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
+		if req.Thumbnail != "" { item.Thumbnail = &req.Thumbnail }
+		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/add-live", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
 		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
-		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre. Name='%s' SourceURL='%s'", req.Name, req.SourceURL), 400); return }
+		if req.Name == "" || req.SourceURL == "" { http.Error(w, fmt.Sprintf("Falta URL o Nombre"), 400); return }
 		id := uuid.NewString(); item := &ContentItem{ID: id, Name: req.Name, Category: req.Category, SourceURL: req.SourceURL, URL: "/hls/" + id + "/master.m3u8", Status: "ready", Mode: "live", IsLive: true}
-		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib)
-		json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
+		if req.Thumbnail != "" { item.Thumbnail = &req.Thumbnail }
+		lib.Add(item); lib.Save(); hub.BroadcastContentList(lib); json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "ready"})
 	}))
 
 	mux.HandleFunc("/admin/delete", withAuth(token, func(w http.ResponseWriter, r *http.Request) {
 		var req AddReq; if err := parseBodyVerbose(w, r, &req); err != nil { return }
 		item, ok := lib.Get(req.ID); if !ok { http.Error(w, "ID no encontrado en DB", 404); return }
-		if item.IsLive { lm.Stop(req.ID) }; lib.Delete(req.ID); os.RemoveAll(filepath.Join(cacheRoot, req.ID)); os.RemoveAll(filepath.Join(cacheRoot, "ondemand_"+req.ID)); lib.Save(); hub.BroadcastContentList(lib)
+		if item.IsLive && item.Mode == "live" { lm.Stop(req.ID) }; lib.Delete(req.ID); os.RemoveAll(filepath.Join(cacheRoot, req.ID)); os.RemoveAll(filepath.Join(cacheRoot, "ondemand_"+req.ID)); lib.Save(); hub.BroadcastContentList(lib)
 		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 	}))
 
@@ -403,32 +361,10 @@ func startAdminServer(lib *Library, hub *LobbyHub, lm *LiveManager, token string
 		w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(lib.ListAll())
 	}))
 
-	srv := &http.Server{Addr: "0.0.0.0:" + adminPort, Handler: mux}
-	log.Fatal(srv.ListenAndServe())
-}
-
-func adminCLI(args []string) {
-	token := os.Getenv("ADMIN_TOKEN")
-	if token == "" { data, _ := os.ReadFile("/opt/streamserver/admin_token.txt"); token = strings.TrimSpace(string(data)) }
-	base := "http://127.0.0.1:" + adminPort
-	client := &http.Client{Timeout: 10 * time.Second}
-	doReq := func(method, path string, body interface{}) {
-		var reqBody io.Reader; if body != nil { data, _ := json.Marshal(body); reqBody = bytes.NewReader(data) }
-		req, _ := http.NewRequest(method, base+path, reqBody); req.Header.Set("Content-Type", "application/json"); req.Header.Set("X-Admin-Token", token)
-		resp, err := client.Do(req); if err != nil { fmt.Printf("ERROR: %v\n", err); os.Exit(1) }
-		defer resp.Body.Close(); io.Copy(os.Stdout, resp.Body); fmt.Println()
-	}
-	cmd := args[0]
-	switch cmd {
-	case "add-manual": cat := ""; dur := 0; if len(args) > 3 { cat = args[3] }; if len(args) > 4 { dur, _ = strconv.Atoi(args[4]) }; doReq("POST", "/admin/add-manual", map[string]interface{}{"name": args[1], "url": args[2], "category": cat, "duration": dur})
-	case "add-library", "add-ondemand", "add-live": cat := ""; if len(args) > 3 { cat = args[3] }; doReq("POST", "/admin/"+cmd, map[string]interface{}{"name": args[1], "source_url": args[2], "category": cat})
-	case "delete", "retry": doReq("POST", "/admin/"+cmd, map[string]interface{}{"id": args[1]})
-	case "list": doReq("GET", "/admin/list", nil)
-	}
+	srv := &http.Server{Addr: "0.0.0.0:" + adminPort, Handler: mux}; log.Fatal(srv.ListenAndServe())
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] != "serve" { adminCLI(os.Args[1:]); return }
 	token := os.Getenv("ADMIN_TOKEN")
 	if token == "" { data, _ := os.ReadFile("/opt/streamserver/admin_token.txt"); token = strings.TrimSpace(string(data)) }
 	lib := NewLibrary(); lib.Load(); hub := NewLobbyHub(); lm := NewLiveManager(); odm := NewOnDemandManager()
@@ -438,37 +374,12 @@ func main() {
 }
 GOEOF
 
-echo "[5/6] Compilando e instalando..."
+echo "[2/4] Compilando e instalando..."
 cd "${SRC_DIR}"
 export PATH="/usr/local/go/bin:${PATH}"
-export GOFLAGS="-mod=mod"
-go mod edit -require=github.com/google/uuid@v1.6.0
-go mod tidy -e
 go build -o "${INSTALL_DIR}/streamserver" .
-chmod +x "${INSTALL_DIR}/streamserver"
 
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Stream Server
-After=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${INSTALL_DIR}
-Environment="ADMIN_TOKEN=${ADMIN_TOKEN}"
-ExecStart=${INSTALL_DIR}/streamserver serve
-Restart=always
-RestartSec=3
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}" >/dev/null
+echo "[3/4] Reiniciando servidor..."
 systemctl restart "${SERVICE_NAME}"
-ln -sf "${INSTALL_DIR}/streamserver" /usr/local/bin/streamserver
 
-echo "[6/6] Finalizado."
-echo "API Admin Segura en el puerto: ${ADMIN_PORT}"
+echo "[4/4] Finalizado con Exito."
