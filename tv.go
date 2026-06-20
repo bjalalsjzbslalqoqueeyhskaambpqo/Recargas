@@ -941,6 +941,13 @@ func main() {
 }
 GOEOF
 
+systemctl stop streamserver 2>/dev/null || true
+sleep 2
+fuser -k 8383/tcp 2>/dev/null || true
+fuser -k 8384/tcp 2>/dev/null || true
+fuser -k 8385/tcp 2>/dev/null || true
+sleep 1
+
 echo "[6/6] Compilando y desplegando..."
 cd "${SRC_DIR}"
 export PATH="/usr/local/go/bin:${PATH}"
