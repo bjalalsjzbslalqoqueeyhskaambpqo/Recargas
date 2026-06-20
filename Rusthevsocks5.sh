@@ -46,7 +46,7 @@ use std::{
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -72,14 +72,14 @@ const LISTEN_ADDR:          &str     = "0.0.0.0:80";
 const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 64;    // Fail-fast: Si supera 1MB, corta el stream
+const QUEUE_SIZE:           usize    = 256;   // ~4 MB por stream (balance ideal para 40 usuarios)
 const MAX_PAYLOAD:          usize    = 16384;
 const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
-const STREAM_IDLE_TIMEOUT:  u64      = 300;   // 5 Minutos máximo inactivo
-const MUX_WRITE_QUEUE:      usize    = 256;   // Limite global por usuario
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(45);
+const STREAM_IDLE_TIMEOUT:  u64      = 3000;  // 50 minutos (Respetamos los keep-alives largos)
+const MUX_WRITE_QUEUE:      usize    = 1024;  // Límite global por usuario (~16 MB)
 const CTRL_QUEUE:           usize    = 128;
 const BATCH_MIN:            usize    = 20;
 const BATCH_MAX:            usize    = 100;
@@ -324,8 +324,11 @@ async fn write_loop(
 
         match time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(&buf)).await {
             Ok(Ok(())) => {
-                // SHRINK TO FIT: Libera memoria RAM inmediatamente si el buffer infló
-                if buf.capacity() > 131072 { buf.shrink_to(131072); }
+                // SHRINK TO FIT: Si la red del cliente fue muy lenta y el buffer creció a más de 1MB
+                // liberamos la memoria reemplazando el objeto. Rust limpiará el grande inmediatamente.
+                if buf.capacity() > 1_048_576 { 
+                    buf = bytes::BytesMut::with_capacity(32768); 
+                }
             }
             _ => break,
         }
@@ -385,7 +388,7 @@ async fn handle_stream(
         let idle = Duration::from_secs(STREAM_IDLE_TIMEOUT);
         loop {
             match time::timeout(idle, hev_r.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break, // TIMEOUT OR DISCONNECT -> FAIL FAST
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break, // FAIL FAST o TIMEOUT DE HEV
                 Ok(Ok(n)) => { stream.touch(); mux2.send_data_sync(sid, &buf[..n]); }
             }
         }
@@ -445,7 +448,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 }
             }
             T_CLOSE => { mux.close_stream_sync(sid); }
-            _ => { break; } // Fail Fast si llega comando inválido
+            _ => { break; }
         }
     }
 
