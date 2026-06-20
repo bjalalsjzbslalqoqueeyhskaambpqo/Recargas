@@ -1,3 +1,5 @@
+--- START OF FILE Rusthevsocks5 (1).sh ---
+
 #!/bin/bash
 set -e
 
@@ -71,15 +73,17 @@ const HEV_ADDR:             &str     = "127.0.0.1:1080";
 const LISTEN_ADDR:          &str     = "0.0.0.0:80";
 const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
-const MAX_STREAMS:          usize    = 7000;
-const QUEUE_SIZE:           usize    = 128;
+
+// Limites optimizados para entorno de bajos recursos (1vCPU / 1GB RAM)
+const MAX_STREAMS:          usize    = 2000;
+const QUEUE_SIZE:           usize    = 64;
 const MAX_PAYLOAD:          usize    = 16384;
 const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
 const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(3600);
-const MUX_WRITE_QUEUE:      usize    = 2048;
+const MUX_WRITE_QUEUE:      usize    = 512;
 const CTRL_QUEUE:           usize    = 128;
 const BATCH_MIN:            usize    = 20;
 const BATCH_MAX:            usize    = 100;
@@ -87,8 +91,6 @@ const INITIAL_BATCH:        usize    = 64;
 const ADJUST_WINDOW_MS:     u64      = 100;
 const READ_DEADLINE:        Duration = Duration::from_secs(300);
 const PAYLOAD_DEADLINE:     Duration = Duration::from_secs(30);
-const CLI_RCVBUF:           i32      = 524288;
-const CLI_SNDBUF:           i32      = 524288;
 
 const T_OPEN:    u8 = 0x01;
 const T_DATA:    u8 = 0x02;
@@ -185,12 +187,11 @@ fn tune_client_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_RCVBUF,    CLI_RCVBUF);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_SNDBUF,    CLI_SNDBUF);
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 120);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
+        // Eliminados RCVBUF y SNDBUF harcodeados. Linux aplicará auto-tuning nativamente para ahorrar RAM.
     }
 }
 
@@ -255,12 +256,15 @@ impl Mux {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
-    #[inline(always)] fn send_data_sync(&self, sid: u32, data: &[u8]) {
-        if self.is_dead() { return; }
-        if self.write_tx.try_send(build_data_frame(sid, data)).is_err() {
+    // BACKPRESSURE REAL: Si el enlace está ahogado, suspende la emisión asíncrona sin tirar la sesión.
+    #[inline(always)] async fn send_data_async(&self, sid: u32, data: &[u8]) -> bool {
+        if self.is_dead() { return false; }
+        if self.write_tx.send(build_data_frame(sid, data)).await.is_err() {
             self.close_stream_sync(sid);
             let _ = self.ctrl_tx.try_send(build_ctrl_frame(T_CLOSE, sid));
+            return false;
         }
+        true
     }
 
     #[inline(always)] fn send_ctrl_sync(&self, t: u8, sid: u32) {
@@ -400,7 +404,10 @@ async fn handle_stream(
                 res = time::timeout(STREAM_IDLE_TIMEOUT, hev_r.read(&mut buf)) => {
                     match res {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                        Ok(Ok(n)) => { mux2.send_data_sync(sid, &buf[..n]); }
+                        Ok(Ok(n)) => { 
+                            // Propagación de Backpressure asíncrono para proteger memoria y fidelidad TCP
+                            if !mux2.send_data_async(sid, &buf[..n]).await { break; }
+                        }
                     }
                 }
             }
@@ -862,3 +869,4 @@ RSEOF
 
 cd "$PROJ"
 cargo build --release
+--- END OF FILE Rusthevsocks5 (1).sh ---
