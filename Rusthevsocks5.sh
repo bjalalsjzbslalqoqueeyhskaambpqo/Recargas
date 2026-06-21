@@ -74,18 +74,17 @@ const LISTEN_ADDR:          &str     = "0.0.0.0:80";
 const KICK_ADDR:            &str     = "127.0.0.1:8091";
 const USERS_FILE:           &str     = "/opt/btserver/users.txt";
 
-// Limites optimizados para entorno de bajos recursos (1vCPU / 1GB RAM)
-const MAX_STREAMS:          usize    = 4000;
-const QUEUE_SIZE:           usize    = 500;
+const MAX_STREAMS:          usize    = 3000;
+const QUEUE_SIZE:           usize    = 256;
 const MAX_PAYLOAD:          usize    = 16384;
-const DIAL_TIMEOUT:         Duration = Duration::from_millis(800);
-const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT:         Duration = Duration::from_millis(3000);
+const HEV_CONN_TIMEOUT:     Duration = Duration::from_secs(10);
 const HEV_WRITE_TIMEOUT:    Duration = Duration::from_secs(30);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_IDLE_TIMEOUT:  Duration = Duration::from_secs(86400);
-const MUX_WRITE_QUEUE:      usize    = 512;
-const CTRL_QUEUE:           usize    = 128;
-const BATCH_MIN:            usize    = 40;
+const MUX_WRITE_QUEUE:      usize    = 1024;
+const CTRL_QUEUE:           usize    = 512;
+const BATCH_MIN:            usize    = 20;
 const BATCH_MAX:            usize    = 100;
 const INITIAL_BATCH:        usize    = 64;
 const ADJUST_WINDOW_MS:     u64      = 100;
@@ -191,7 +190,6 @@ fn tune_client_fd(fd: i32) {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 120);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
-        // Eliminados RCVBUF y SNDBUF harcodeados. Linux aplicará auto-tuning nativamente para ahorrar RAM.
     }
 }
 
@@ -256,20 +254,19 @@ impl Mux {
         self.streams.get(&sid).map(|r| r.clone())
     }
 
-    // BACKPRESSURE REAL: Si el enlace está ahogado, suspende la emisión asíncrona sin tirar la sesión.
     #[inline(always)] async fn send_data_async(&self, sid: u32, data: &[u8]) -> bool {
         if self.is_dead() { return false; }
         if self.write_tx.send(build_data_frame(sid, data)).await.is_err() {
             self.close_stream_sync(sid);
-            let _ = self.ctrl_tx.try_send(build_ctrl_frame(T_CLOSE, sid));
+            self.send_ctrl_async(T_CLOSE, sid).await;
             return false;
         }
         true
     }
 
-    #[inline(always)] fn send_ctrl_sync(&self, t: u8, sid: u32) {
+    #[inline(always)] async fn send_ctrl_async(&self, t: u8, sid: u32) {
         if self.is_dead() { return; }
-        let _ = self.ctrl_tx.try_send(build_ctrl_frame(t, sid));
+        let _ = self.ctrl_tx.send(build_ctrl_frame(t, sid)).await;
     }
 
     fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
@@ -359,14 +356,14 @@ async fn handle_stream(
 
     let hev = match time::timeout(DIAL_TIMEOUT, TcpStream::connect(HEV_ADDR)).await {
         Ok(Ok(c)) => c,
-        _ => { mux.close_stream_sync(sid); mux.send_ctrl_sync(T_CLOSE, sid); return; }
+        _ => { mux.close_stream_sync(sid); mux.send_ctrl_async(T_CLOSE, sid).await; return; }
     };
     tune_hev_fd(hev.as_raw_fd());
     let (mut hev_r, mut hev_w) = hev.into_split();
 
     if !first.is_empty() {
         if time::timeout(HEV_CONN_TIMEOUT, hev_w.write_all(&first)).await.is_err() {
-            mux.close_stream_sync(sid); mux.send_ctrl_sync(T_CLOSE, sid); return;
+            mux.close_stream_sync(sid); mux.send_ctrl_async(T_CLOSE, sid).await; return;
         }
     }
 
@@ -405,7 +402,6 @@ async fn handle_stream(
                     match res {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(n)) => { 
-                            // Propagación de Backpressure asíncrono para proteger memoria y fidelidad TCP
                             if !mux2.send_data_async(sid, &buf[..n]).await { break; }
                         }
                     }
@@ -417,7 +413,7 @@ async fn handle_stream(
 
     let _ = tokio::join!(t_c2h, t_h2c);
     mux.close_stream_sync(sid);
-    mux.send_ctrl_sync(T_CLOSE, sid);
+    mux.send_ctrl_async(T_CLOSE, sid).await;
 }
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
@@ -456,14 +452,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
         }
 
         match ft {
-            T_PING => { mux.send_ctrl_sync(T_PONG, sid); }
+            T_PING => { mux.send_ctrl_async(T_PONG, sid).await; }
             T_PONG => {}
             T_OPEN => {
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
                 let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
-                    mux.send_ctrl_sync(T_CLOSE, sid);
+                    mux.send_ctrl_async(T_CLOSE, sid).await;
                     continue;
                 }
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
@@ -472,9 +468,9 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.try_send(payload).is_err() {
+                        if s.tx.send(payload).await.is_err() {
                             mux.close_stream_sync(sid);
-                            mux.send_ctrl_sync(T_CLOSE, sid);
+                            mux.send_ctrl_async(T_CLOSE, sid).await;
                         }
                     }
                 }
