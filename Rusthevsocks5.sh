@@ -128,7 +128,7 @@ fn parse_expires(s: &str) -> Option<i64> {
 
 enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 
-fn check_auth(id: &str) -> AuthResult {
+fn check_auth_blocking(id: &str) -> AuthResult {
     let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return AuthResult::NotFound; };
     for line in content.lines() {
         let line = line.trim();
@@ -144,6 +144,12 @@ fn check_auth(id: &str) -> AuthResult {
         return AuthResult::Ok { name: name.to_string(), secs_left: exp_ts - now };
     }
     AuthResult::NotFound
+}
+
+async fn check_auth(id: String) -> AuthResult {
+    tokio::task::spawn_blocking(move || check_auth_blocking(&id))
+        .await
+        .unwrap_or(AuthResult::NotFound)
 }
 
 #[inline(always)]
@@ -490,7 +496,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
 
     let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
-    match check_auth(&user_id) {
+    match check_auth(user_id.clone()).await {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
@@ -515,7 +521,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
         AuthResult::NotFound | AuthResult::Expired => {
             let ip_conns = ip_count.get(&peer_ip).map(|v| *v).unwrap_or(0);
             if ip_conns >= WAIT_MAX_PER_IP { return; }
-            let status = match check_auth(&user_id) { AuthResult::Expired => "expired", _ => "waiting" };
+            let status = match check_auth(user_id.clone()).await { AuthResult::Expired => "expired", _ => "waiting" };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
             wait_room(writer, reader, user_id, peer_ip, waitroom, ip_count).await;
@@ -574,7 +580,7 @@ async fn midnight_sweep(sessions: SessionMap) {
         let ids: Vec<String> = sessions.iter().map(|r| r.key().clone()).collect();
         let mut kicked = 0usize;
         for id in ids {
-            let reason = match check_auth(&id) { AuthResult::Ok { .. } => continue, AuthResult::Expired => T_EXPIRED, AuthResult::NotFound => T_KICK };
+            let reason = match check_auth(id.clone()).await { AuthResult::Ok { .. } => continue, AuthResult::Expired => T_EXPIRED, AuthResult::NotFound => T_KICK };
             kick_session_sync(&sessions, &id, reason);
             kicked += 1;
         }
@@ -614,17 +620,18 @@ async fn main() -> Result<()> {
 RSEOF
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
-use std::{collections::HashMap, net::SocketAddr, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use anyhow::Result;
 use axum::{extract::{ConnectInfo, Query, State}, http::{HeaderMap, StatusCode}, routing::{delete, get, post, put}, Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
 use tracing::info;
 
 const PANEL_ADDR: &str = "0.0.0.0:8090";
 const USERS_PATH: &str = "/opt/btserver/users.txt";
 const TOKEN_PATH: &str = "/opt/btserver/token.txt";
 const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
+const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
 
 #[inline(always)] fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 fn expires_from_days(days: i64) -> i64 { now_secs() + days * 86400 }
@@ -641,11 +648,11 @@ fn migrate_date_to_ts(s: &str) -> Option<i64> {
 
 fn parse_expires(s: &str) -> i64 { let s = s.trim(); if let Ok(ts) = s.parse::<i64>() { return ts; } migrate_date_to_ts(s).unwrap_or(0) }
 
-#[derive(Clone)] struct AppState { token: Arc<String>, users_mu: Arc<Mutex<()>>, rate: Arc<Mutex<HashMap<String, Vec<i64>>>> }
+#[derive(Clone)] struct AppState { token: Arc<String>, users_mu: Arc<Mutex<()>>, rate: Arc<std::sync::Mutex<HashMap<String, Vec<i64>>>> }
 impl AppState {
     fn new() -> Self {
         let token = std::fs::read_to_string(TOKEN_PATH).map(|s| s.trim().to_string()).unwrap_or_default();
-        Self { token: Arc::new(token), users_mu: Arc::new(Mutex::new(())), rate: Arc::new(Mutex::new(HashMap::new())) }
+        Self { token: Arc::new(token), users_mu: Arc::new(Mutex::new(())), rate: Arc::new(std::sync::Mutex::new(HashMap::new())) }
     }
     fn rate_ok(&self, ip: &str) -> bool {
         let now = now_secs(); let mut map = self.rate.lock().unwrap();
@@ -662,7 +669,7 @@ impl AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)] struct User { name: String, expires_ts: i64 }
 
-fn load_users() -> HashMap<String, User> {
+fn load_users_blocking() -> HashMap<String, User> {
     let Ok(c) = std::fs::read_to_string(USERS_PATH) else { return HashMap::new(); };
     let mut map = HashMap::new();
     for line in c.lines() {
@@ -677,10 +684,18 @@ fn load_users() -> HashMap<String, User> {
     map
 }
 
-fn save_users(users: &HashMap<String, User>) {
+fn save_users_blocking(users: &HashMap<String, User>) {
     let tmp = format!("{USERS_PATH}.tmp"); let mut out = String::new();
     for (id, u) in users { out.push_str(&format!("{id}:{}:{}\n", u.name, u.expires_ts)); }
     if std::fs::write(&tmp, &out).is_ok() { let _ = std::fs::rename(&tmp, USERS_PATH); }
+}
+
+async fn load_users() -> HashMap<String, User> {
+    tokio::task::spawn_blocking(load_users_blocking).await.unwrap_or_default()
+}
+
+async fn save_users(users: HashMap<String, User>) {
+    let _ = tokio::task::spawn_blocking(move || save_users_blocking(&users)).await;
 }
 
 fn user_row(id: &str, u: &User) -> serde_json::Value {
@@ -688,7 +703,6 @@ fn user_row(id: &str, u: &User) -> serde_json::Value {
     serde_json::json!({ "id": id, "name": u.name, "expires_ts": u.expires_ts, "secs_left": secs_left, "active": secs_left > 0 })
 }
 
-const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
 async fn kick_user(id: String, reason: &'static str) {
     let url = format!("{KICK_BASE}{id}&reason={reason}");
     if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(&url).send().await; }
@@ -724,8 +738,8 @@ async fn fetch_active_ids() -> std::collections::HashSet<String> {
 async fn handle_clients(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let active = fetch_active_ids().await;
-    let _l = st.users_mu.lock().unwrap();
-    let users = load_users();
+    let _l = st.users_mu.lock().await;
+    let users = load_users().await;
     let rows: Vec<_> = users.iter().map(|(id, u)| {
         let mut row = user_row(id, u); row["connected"] = serde_json::json!(active.contains(id.as_str())); row
     }).collect();
@@ -735,8 +749,8 @@ async fn handle_clients(State(st): State<AppState>, headers: HeaderMap, ConnectI
 async fn handle_client(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Query(p): Query<HashMap<String, String>>) -> ApiResult {
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = match p.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) { Some(id) => id, None => return err_resp(StatusCode::BAD_REQUEST, "falta id") };
-    let _l = st.users_mu.lock().unwrap();
-    match load_users().get(&id).cloned() { Some(u) => (StatusCode::OK, Json(user_row(&id, &u))), None => err_resp(StatusCode::NOT_FOUND, "no encontrado") }
+    let _l = st.users_mu.lock().await;
+    match load_users().await.get(&id).cloned() { Some(u) => (StatusCode::OK, Json(user_row(&id, &u))), None => err_resp(StatusCode::NOT_FOUND, "no encontrado") }
 }
 
 #[derive(Deserialize)] struct CreateBody { id: String, name: Option<String>, days: Option<i64> }
@@ -745,12 +759,13 @@ async fn handle_create(State(st): State<AppState>, headers: HeaderMap, ConnectIn
     let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
     let name = body.name.as_deref().unwrap_or("").trim().to_string(); let name = if name.is_empty() { "sin-nombre".to_string() } else { name };
     let days = body.days.unwrap_or(30).max(0);
-    let _l = st.users_mu.lock().unwrap();
-    let mut users = load_users();
+    let _l = st.users_mu.lock().await;
+    let mut users = load_users().await;
     if users.contains_key(&id) { return err_resp(StatusCode::CONFLICT, "ya existe"); }
     let expires_ts = expires_from_days(days);
     users.insert(id.clone(), User { name: name.clone(), expires_ts });
-    save_users(&users);
+    save_users(users).await;
+    drop(_l);
     tokio::spawn(promote_user(id.clone()));
     (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
 }
@@ -760,11 +775,11 @@ async fn handle_delete(State(st): State<AppState>, headers: HeaderMap, ConnectIn
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
     {
-        let _l = st.users_mu.lock().unwrap();
-        let mut users = load_users();
+        let _l = st.users_mu.lock().await;
+        let mut users = load_users().await;
         if !users.contains_key(&id) { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); }
         users.remove(&id);
-        save_users(&users);
+        save_users(users).await;
     }
     tokio::spawn(kick_user(id, "kicked"));
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
@@ -775,8 +790,8 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
     if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
     let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
     let (final_id, u, kick_old) = {
-        let _l = st.users_mu.lock().unwrap();
-        let mut users = load_users();
+        let _l = st.users_mu.lock().await;
+        let mut users = load_users().await;
         let Some(mut u) = users.get(&id).cloned() else { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); };
         if let Some(n) = body.name.as_deref() { let n = n.trim(); if !n.is_empty() { u.name = n.to_string(); } }
         if let Some(d) = body.days { u.expires_ts = expires_from_days(d.max(0)); }
@@ -785,7 +800,7 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
             _ => (id.clone(), false),
         };
         users.insert(final_id.clone(), u.clone());
-        save_users(&users);
+        save_users(users).await;
         (final_id, u, kick_old)
     };
     if kick_old { tokio::spawn(kick_user(id, "kicked")); }
