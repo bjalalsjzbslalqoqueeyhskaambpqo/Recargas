@@ -234,6 +234,10 @@ impl Mux {
 
     #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
 
+    #[inline(always)] fn has_stream_sync(&self, sid: u32) -> bool {
+        self.streams.contains_key(&sid)
+    }
+
     #[inline(always)] fn get_stream_sync(&self, sid: u32) -> Option<Arc<Stream>> {
         self.streams.get(&sid).map(|r| r.clone())
     }
@@ -413,6 +417,9 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PING => { mux.send_ctrl_async(T_PONG, sid).await; }
             T_PONG => {}
             T_OPEN => {
+                if mux.has_stream_sync(sid) {
+                    continue;
+                }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
                 let s = Stream::new(tx);
