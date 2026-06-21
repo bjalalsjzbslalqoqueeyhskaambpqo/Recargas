@@ -179,7 +179,6 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
 fn tune_client_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 120);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
@@ -190,7 +189,6 @@ fn tune_client_fd(fd: i32) {
 fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
@@ -302,6 +300,10 @@ async fn write_loop(
 
     loop {
         buf.clear();
+        if buf.capacity() > 262144 {
+            buf = bytes::BytesMut::with_capacity(32768);
+        }
+
         tokio::select! {
             biased;
             _ = kill_rx.changed() => break,
@@ -573,18 +575,25 @@ async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
     axum::serve(ln, app).await.expect("kick serve");
 }
 
-async fn midnight_sweep(sessions: SessionMap) {
+async fn session_monitor(sessions: SessionMap) {
     loop {
-        let secs = 86400 - (now_secs() % 86400);
-        time::sleep(Duration::from_secs(secs as u64)).await;
+        time::sleep(Duration::from_secs(60)).await;
         let ids: Vec<String> = sessions.iter().map(|r| r.key().clone()).collect();
         let mut kicked = 0usize;
         for id in ids {
-            let reason = match check_auth(id.clone()).await { AuthResult::Ok { .. } => continue, AuthResult::Expired => T_EXPIRED, AuthResult::NotFound => T_KICK };
-            kick_session_sync(&sessions, &id, reason);
-            kicked += 1;
+            match check_auth(id.clone()).await {
+                AuthResult::Ok { .. } => continue,
+                AuthResult::Expired => {
+                    kick_session_sync(&sessions, &id, T_EXPIRED);
+                    kicked += 1;
+                }
+                AuthResult::NotFound => {
+                    kick_session_sync(&sessions, &id, T_KICK);
+                    kicked += 1;
+                }
+            }
         }
-        if kicked > 0 { info!("midnight sweep: kicked {kicked}"); }
+        if kicked > 0 { info!("session monitor: kicked {kicked} expired/deleted users"); }
     }
 }
 
@@ -606,7 +615,7 @@ async fn main() -> Result<()> {
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
     tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
-    tokio::spawn(midnight_sweep(sessions.clone()));
+    tokio::spawn(session_monitor(sessions.clone()));
     let std_ln = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
     info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
