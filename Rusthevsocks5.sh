@@ -10,7 +10,7 @@ cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
 version = "9.0.0"
-edition = "2026"
+edition = "2021"
 
 [[bin]]
 name = "btserver"
