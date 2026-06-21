@@ -74,7 +74,7 @@ const LISTEN_ADDR:   &str = "0.0.0.0:80";
 const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
-const MAX_STREAMS:     usize = 10000;
+const MAX_STREAMS:     usize = 40000;
 const QUEUE_SIZE:      usize = 32;
 const MAX_PAYLOAD:     usize = 16384;
 const MUX_WRITE_QUEUE: usize = 256;
