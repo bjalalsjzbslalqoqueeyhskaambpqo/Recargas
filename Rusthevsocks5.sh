@@ -345,7 +345,7 @@ async fn handle_stream(
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
-    let Ok(hev) = time::timeout(Duration::from_millis(3000), TcpStream::connect(HEV_ADDR)).await else {
+    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(3000), TcpStream::connect(HEV_ADDR)).await else {
         mux.close_stream_sync(sid);
         mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
@@ -646,7 +646,6 @@ use anyhow::Result;
 use axum::{extract::{ConnectInfo, Query, State}, http::{HeaderMap, StatusCode}, routing::{delete, get, post, put}, Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
-use tracing::info;
 
 const PANEL_ADDR: &str = "0.0.0.0:8090";
 const USERS_PATH: &str = "/opt/btserver/users.txt";
