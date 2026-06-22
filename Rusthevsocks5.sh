@@ -74,10 +74,10 @@ const LISTEN_ADDR:   &str = "0.0.0.0:80";
 const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
-const MAX_STREAMS:     usize = 40000;
-const QUEUE_SIZE:      usize = 32;
+const MAX_STREAMS:     usize = 10000;
+const QUEUE_SIZE:      usize = 256;
 const MAX_PAYLOAD:     usize = 16384;
-const MUX_WRITE_QUEUE: usize = 256;
+const MUX_WRITE_QUEUE: usize = 512;
 const CTRL_QUEUE:      usize = 128;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
@@ -89,6 +89,16 @@ const T_PING:    u8 = 0x04;
 const T_PONG:    u8 = 0x05;
 const T_KICK:    u8 = 0x06;
 const T_EXPIRED: u8 = 0x07;
+
+fn maximize_fd_limit() {
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            rl.rlim_cur = rl.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+}
 
 fn valid_id(id: &str) -> bool {
     if let Some(rest) = id.strip_prefix("S-") {
@@ -335,11 +345,12 @@ async fn handle_stream(
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
-    let Ok(hev) = TcpStream::connect(HEV_ADDR).await else {
+    let Ok(hev) = time::timeout(Duration::from_millis(3000), TcpStream::connect(HEV_ADDR)).await else {
         mux.close_stream_sync(sid);
         mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
     };
+    
     tune_hev_fd(hev.as_raw_fd());
     let (mut hev_r, mut hev_w) = hev.into_split();
 
@@ -441,7 +452,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.send(payload).await.is_err() {
+                        if s.tx.try_send(payload).is_err() {
                             mux.close_stream_sync(sid);
                             mux.send_ctrl_async(T_CLOSE, sid).await;
                         }
@@ -610,6 +621,7 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    maximize_fd_limit();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
