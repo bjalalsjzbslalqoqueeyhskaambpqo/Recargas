@@ -75,7 +75,7 @@ const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
 const MAX_STREAMS:     usize = 10000;
-const QUEUE_SIZE:      usize = 256;
+const QUEUE_SIZE:      usize = 2048;
 const MAX_PAYLOAD:     usize = 16384;
 const MUX_WRITE_QUEUE: usize = 512;
 const CTRL_QUEUE:      usize = 128;
@@ -292,7 +292,6 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
         let _ = mux.ctrl_tx.try_send(build_ctrl_frame(reason, 0));
         mux.kill();
-        info!(id, reason, "session kicked");
         true
     } else {
         false
@@ -345,7 +344,7 @@ async fn handle_stream(
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
-    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(3000), TcpStream::connect(HEV_ADDR)).await else {
+    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
         mux.close_stream_sync(sid);
         mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
@@ -582,7 +581,6 @@ async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
     let state = InternalState { sessions, waitroom };
     let app = Router::new().route("/kick", get(kick_handler)).route("/active", get(active_handler)).route("/promote", get(promote_handler)).with_state(state);
     let ln = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
-    info!("kick api on {KICK_ADDR}");
     axum::serve(ln, app).await.expect("kick serve");
 }
 
@@ -590,21 +588,13 @@ async fn session_monitor(sessions: SessionMap) {
     loop {
         time::sleep(Duration::from_secs(60)).await;
         let ids: Vec<String> = sessions.iter().map(|r| r.key().clone()).collect();
-        let mut kicked = 0usize;
         for id in ids {
             match check_auth(id.clone()).await {
                 AuthResult::Ok { .. } => continue,
-                AuthResult::Expired => {
-                    kick_session_sync(&sessions, &id, T_EXPIRED);
-                    kicked += 1;
-                }
-                AuthResult::NotFound => {
-                    kick_session_sync(&sessions, &id, T_KICK);
-                    kicked += 1;
-                }
+                AuthResult::Expired => { kick_session_sync(&sessions, &id, T_EXPIRED); }
+                AuthResult::NotFound => { kick_session_sync(&sessions, &id, T_KICK); }
             }
         }
-        if kicked > 0 { info!("session monitor: kicked {kicked} expired/deleted users"); }
     }
 }
 
@@ -630,11 +620,10 @@ async fn main() -> Result<()> {
     tokio::spawn(session_monitor(sessions.clone()));
     let std_ln = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
     loop {
         match listener.accept().await {
             Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
-            Err(e) => warn!("accept: {e}"),
+            Err(_) => {}
         }
     }
 }
