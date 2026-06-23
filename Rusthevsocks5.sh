@@ -1,5 +1,3 @@
---- START OF FILE Rusthevsocks5 (1).sh ---
-
 #!/bin/bash
 set -e
 
@@ -74,11 +72,20 @@ const LISTEN_ADDR:   &str = "0.0.0.0:80";
 const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
-const MAX_STREAMS:     usize = 8000;
-const QUEUE_SIZE:      usize = 256;
-const MAX_PAYLOAD:     usize = 16384;
-const MUX_WRITE_QUEUE: usize = 1024;
-const CTRL_QUEUE:      usize = 128;
+const MAX_STREAMS:     usize = 10000;
+
+// FILOSOFÍA DE ALTO RENDIMIENTO Y AISLAMIENTO:
+// Mantenemos MAX_PAYLOAD en 16384 para no romper la recepción de clientes antiguos.
+const MAX_PAYLOAD:     usize = 16384; 
+// Pero forzamos envíos pequeños (4KB) hacia el cliente para intercalar datos y bajar el ping.
+const HEV_READ_CHUNK:  usize = 4096;  
+
+// COLAS ESTRECHAS: Limitamos drásticamente el uso de RAM.
+// Si un usuario descarga mucho, el canal se llena rápido y el Kernel frena el tráfico nativamente.
+const QUEUE_SIZE:      usize = 8;     // (Antes 2048) Máximo 8 frames en RAM por stream
+const MUX_WRITE_QUEUE: usize = 64;    // (Antes 512)
+const CTRL_QUEUE:      usize = 32;
+
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
 
@@ -186,9 +193,18 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
     libc::setsockopt(fd, level, opt, &val as *const i32 as *const libc::c_void, 4);
 }
 
+const TCP_QUICKACK: i32 = 12;
+
+// Ajustes del Kernel para evitar el Bufferbloat en el MUX
 fn tune_client_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        
+        let buf_size: i32 = 65536; // 64 KB Max (Delega al SO la congestión)
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &buf_size as *const _ as _, 4);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &buf_size as *const _ as _, 4);
+
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 120);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 30);
@@ -196,35 +212,33 @@ fn tune_client_fd(fd: i32) {
     }
 }
 
+// Ajustes del Kernel para el motor Hev local
 fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,  1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        
+        let buf_size: i32 = 65536; // 64 KB Max
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &buf_size as *const _ as _, 4);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &buf_size as *const _ as _, 4);
+
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
 }
 
 struct Stream {
-    tx:        mpsc::Sender<Bytes>,
-    cancel_tx: watch::Sender<bool>,
-    closed:    AtomicBool,
+    tx:     mpsc::Sender<Bytes>,
+    closed: AtomicBool,
 }
 
 impl Stream {
-    fn new(tx: mpsc::Sender<Bytes>) -> (Arc<Self>, watch::Receiver<bool>) {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        (Arc::new(Self { tx, cancel_tx, closed: AtomicBool::new(false) }), cancel_rx)
+    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+        Arc::new(Self { tx, closed: AtomicBool::new(false) })
     }
-
     #[inline(always)] fn try_close(&self) -> bool {
-        if self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            let _ = self.cancel_tx.send(true); 
-            true
-        } else {
-            false
-        }
+        self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
-    
     #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
 }
 
@@ -289,7 +303,7 @@ impl Mux {
 
     fn close_stream_sync(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
-            s.try_close(); 
+            s.try_close();
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -301,7 +315,6 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
         let _ = mux.ctrl_tx.try_send(build_ctrl_frame(reason, 0));
         mux.kill();
-        info!(id, reason, "session kicked");
         true
     } else {
         false
@@ -319,7 +332,7 @@ async fn write_loop(
 
     loop {
         buf.clear();
-        if buf.capacity() > 262144 {
+        if buf.capacity() > 65536 {
             buf = bytes::BytesMut::with_capacity(32768);
         }
 
@@ -345,21 +358,18 @@ async fn write_loop(
 }
 
 async fn handle_stream(
-    mux:       Arc<Mux>,
-    sid:       u32,
-    stream:    Arc<Stream>,
-    mut rx:    mpsc::Receiver<Bytes>,
-    mut cancel_rx: watch::Receiver<bool>,
-    first:     Bytes,
+    mux:    Arc<Mux>,
+    sid:    u32,
+    stream: Arc<Stream>,
+    mut rx: mpsc::Receiver<Bytes>,
+    first:  Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
-    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
-        if !stream.is_closed() {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_async(T_CLOSE, sid).await;
-        }
+    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(5000), TcpStream::connect(HEV_ADDR)).await else {
+        mux.close_stream_sync(sid);
+        mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
     };
     
@@ -368,10 +378,8 @@ async fn handle_stream(
 
     if !first.is_empty() {
         if hev_w.write_all(&first).await.is_err() {
-            if !stream.is_closed() {
-                mux.close_stream_sync(sid);
-                mux.send_ctrl_async(T_CLOSE, sid).await;
-            }
+            mux.close_stream_sync(sid);
+            mux.send_ctrl_async(T_CLOSE, sid).await;
             return;
         }
     }
@@ -382,17 +390,22 @@ async fn handle_stream(
 
     let mux2 = mux.clone();
 
-    let mut cancel_rx1 = cancel_rx.clone();
+    // Cliente (Mux) -> Servidor Hev (Local)
     let t_c2h = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
                 _ = kill_rx1.changed() => break,
-                _ = cancel_rx1.changed() => break, 
                 _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
-                        Some(data) => { if hev_w.write_all(&data).await.is_err() { break; } }
+                        Some(data) => { 
+                            // REGLA DE GUILLOTINA: Si Hev local se traba, le damos max 500ms. 
+                            // Si falla, extirpamos la conexión al instante y liberamos RAM.
+                            if tokio::time::timeout(Duration::from_millis(500), hev_w.write_all(&data)).await.is_err() {
+                                break; 
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -401,18 +414,22 @@ async fn handle_stream(
         let _ = hev_w.shutdown().await;
     });
 
-    let mut cancel_rx2 = cancel_rx.clone();
+    // Servidor Hev (Local) -> Cliente (Mux)
     let t_h2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_PAYLOAD];
+        // Obligamos a mandar en trozos pequeños para no congelar otras conexiones.
+        let mut buf = vec![0u8; HEV_READ_CHUNK]; 
         loop {
             tokio::select! {
                 biased;
                 _ = kill_rx2.changed() => break,
-                _ = cancel_rx2.changed() => break, 
                 res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => { if !mux2.send_data_async(sid, &buf[..n]).await { break; } }
+                        Ok(n) => { 
+                            // BACKPRESSURE NATIVO: Si el Mux está lleno por descargas, 
+                            // send_data_async pausará automáticamente la lectura.
+                            if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
+                        }
                     }
                 }
             }
@@ -421,11 +438,8 @@ async fn handle_stream(
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
-    
-    if !stream.is_closed() {
-        mux.close_stream_sync(sid);
-        mux.send_ctrl_async(T_CLOSE, sid).await;
-    }
+    mux.close_stream_sync(sid);
+    mux.send_ctrl_async(T_CLOSE, sid).await;
 }
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
@@ -443,6 +457,8 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
         let ft  = hdr[0];
         let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
         let ln  = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
+        
+        // Soportamos hasta 16KB para no romper la compatibilidad con los viejos clientes Android.
         if ln > MAX_PAYLOAD { break; }
 
         if ln > 0 {
@@ -458,21 +474,22 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PONG => {}
             T_OPEN => {
                 if mux.has_stream_sync(sid) {
-                    mux.close_stream_sync(sid);
+                    continue;
                 }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let (tx, rx) = mpsc::channel(QUEUE_SIZE);
-                let (s, cancel_rx) = Stream::new(tx);
+                let (tx, rx) = mpsc::channel(QUEUE_SIZE); // Cola minúscula para forzar backpressure al SO
+                let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
                     mux.send_ctrl_async(T_CLOSE, sid).await;
                     continue;
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, cancel_rx, payload));
+                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
             }
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
+                        // Si el canal local está lleno (porque bajamos QUEUE_SIZE), descartamos el stream.
                         if s.tx.try_send(payload).is_err() {
                             mux.close_stream_sync(sid);
                             mux.send_ctrl_async(T_CLOSE, sid).await;
@@ -841,7 +858,6 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    maximize_fd_limit();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let state = AppState::new();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -853,4 +869,3 @@ RSEOF
 
 cd "$PROJ"
 cargo build --release
---- END OF FILE Rusthevsocks5 (1).sh ---
