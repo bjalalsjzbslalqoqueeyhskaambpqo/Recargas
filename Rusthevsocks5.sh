@@ -67,7 +67,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 const HEV_ADDR:      &str = "127.0.0.1:1080";
 const LISTEN_ADDR:   &str = "0.0.0.0:80";
@@ -75,7 +75,7 @@ const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
 const MAX_STREAMS:     usize = 8000;
-const QUEUE_SIZE:      usize = 2048;
+const QUEUE_SIZE:      usize = 256;
 const MAX_PAYLOAD:     usize = 16384;
 const MUX_WRITE_QUEUE: usize = 1024;
 const CTRL_QUEUE:      usize = 128;
@@ -345,12 +345,12 @@ async fn write_loop(
 }
 
 async fn handle_stream(
-    mux:       Arc<Mux>,
-    sid:       u32,
-    stream:    Arc<Stream>,
-    mut rx:    mpsc::Receiver<Bytes>,
-    cancel_rx: watch::Receiver<bool>,
-    first:     Bytes,
+    mux:           Arc<Mux>,
+    sid:           u32,
+    stream:        Arc<Stream>,
+    mut rx:        mpsc::Receiver<Bytes>,
+    mut cancel_rx: watch::Receiver<bool>,
+    first:         Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
