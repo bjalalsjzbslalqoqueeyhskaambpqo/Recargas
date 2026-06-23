@@ -67,7 +67,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 const HEV_ADDR:      &str = "127.0.0.1:1080";
 const LISTEN_ADDR:   &str = "0.0.0.0:80";
@@ -349,7 +349,7 @@ async fn handle_stream(
     sid:       u32,
     stream:    Arc<Stream>,
     mut rx:    mpsc::Receiver<Bytes>,
-    cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<bool>,
     first:     Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
@@ -642,7 +642,6 @@ async fn main() -> Result<()> {
     tokio::spawn(session_monitor(sessions.clone()));
     let std_ln = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
     loop {
         match listener.accept().await {
             Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
