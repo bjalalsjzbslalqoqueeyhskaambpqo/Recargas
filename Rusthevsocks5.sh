@@ -67,7 +67,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 const HEV_ADDR:      &str = "127.0.0.1:1080";
 const LISTEN_ADDR:   &str = "0.0.0.0:80";
@@ -345,12 +345,12 @@ async fn write_loop(
 }
 
 async fn handle_stream(
-    mux:           Arc<Mux>,
-    sid:           u32,
-    stream:        Arc<Stream>,
-    mut rx:        mpsc::Receiver<Bytes>,
-    mut cancel_rx: watch::Receiver<bool>,
-    first:         Bytes,
+    mux:       Arc<Mux>,
+    sid:       u32,
+    stream:    Arc<Stream>,
+    mut rx:    mpsc::Receiver<Bytes>,
+    cancel_rx: watch::Receiver<bool>,
+    first:     Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
@@ -634,12 +634,21 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 #[tokio::main]
 async fn main() -> Result<()> {
     maximize_fd_limit();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
-    let state = AppState::new();
-    let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
-    let ln = TcpListener::bind(PANEL_ADDR).await?;
-    axum::serve(ln, app).await?;
-    Ok(())
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
+    let sessions: SessionMap = Arc::new(DashMap::new());
+    let waitroom: WaitRoom   = Arc::new(DashMap::new());
+    let ip_count: IpCount    = Arc::new(DashMap::new());
+    tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
+    tokio::spawn(session_monitor(sessions.clone()));
+    let std_ln = build_listener().expect("listener");
+    let listener = TcpListener::from_std(std_ln).expect("tokio listener");
+    info!("btserver v9 on {LISTEN_ADDR} → hev {HEV_ADDR}");
+    loop {
+        match listener.accept().await {
+            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
+            Err(_) => {}
+        }
+    }
 }
 RSEOF
 
@@ -833,6 +842,7 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    maximize_fd_limit();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let state = AppState::new();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
