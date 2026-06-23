@@ -67,7 +67,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 const HEV_ADDR:      &str = "127.0.0.1:1080";
 const LISTEN_ADDR:   &str = "0.0.0.0:80";
@@ -211,7 +211,6 @@ struct Stream {
 }
 
 impl Stream {
-    // Retorna el Stream y su receptor de Cancelación (Para matar Tareas Fantasma)
     fn new(tx: mpsc::Sender<Bytes>) -> (Arc<Self>, watch::Receiver<bool>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         (Arc::new(Self { tx, cancel_tx, closed: AtomicBool::new(false) }), cancel_rx)
@@ -219,7 +218,7 @@ impl Stream {
 
     #[inline(always)] fn try_close(&self) -> bool {
         if self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            let _ = self.cancel_tx.send(true); // Dispara el Asesinato Instantáneo de Tareas
+            let _ = self.cancel_tx.send(true); 
             true
         } else {
             false
@@ -290,7 +289,7 @@ impl Mux {
 
     fn close_stream_sync(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
-            s.try_close(); // Esto mata cualquier tarea vieja que estuviera usándolo
+            s.try_close(); 
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -346,12 +345,12 @@ async fn write_loop(
 }
 
 async fn handle_stream(
-    mux:           Arc<Mux>,
-    sid:           u32,
-    stream:        Arc<Stream>,
-    mut rx:        mpsc::Receiver<Bytes>,
-    mut cancel_rx: watch::Receiver<bool>,
-    first:         Bytes,
+    mux:       Arc<Mux>,
+    sid:       u32,
+    stream:    Arc<Stream>,
+    mut rx:    mpsc::Receiver<Bytes>,
+    cancel_rx: watch::Receiver<bool>,
+    first:     Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
@@ -389,7 +388,7 @@ async fn handle_stream(
             tokio::select! {
                 biased;
                 _ = kill_rx1.changed() => break,
-                _ = cancel_rx1.changed() => break, // Asesinato preventivo si se recicla el FD
+                _ = cancel_rx1.changed() => break, 
                 _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
@@ -409,7 +408,7 @@ async fn handle_stream(
             tokio::select! {
                 biased;
                 _ = kill_rx2.changed() => break,
-                _ = cancel_rx2.changed() => break, // Asesinato preventivo si se recicla el FD
+                _ = cancel_rx2.changed() => break, 
                 res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
@@ -423,9 +422,6 @@ async fn handle_stream(
 
     let _ = tokio::join!(t_c2h, t_h2c);
     
-    // Solo enviamos un T_CLOSE al cliente si la conexión se murió por causas naturales.
-    // Si la conexión murió porque el cliente nos mandó un T_CLOSE (stream.is_closed() == true), 
-    // no hacemos eco para evitar ruido innecesario en la red.
     if !stream.is_closed() {
         mux.close_stream_sync(sid);
         mux.send_ctrl_async(T_CLOSE, sid).await;
@@ -462,8 +458,6 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PONG => {}
             T_OPEN => {
                 if mux.has_stream_sync(sid) {
-                    // Si recibimos T_OPEN de un SID que ya existe, matamos al viejo brutalmente
-                    // para limpiar el camino de la nueva conexión, impidiendo corrupción.
                     mux.close_stream_sync(sid);
                 }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
@@ -641,19 +635,11 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 async fn main() -> Result<()> {
     maximize_fd_limit();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
-    let sessions: SessionMap = Arc::new(DashMap::new());
-    let waitroom: WaitRoom   = Arc::new(DashMap::new());
-    let ip_count: IpCount    = Arc::new(DashMap::new());
-    tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
-    tokio::spawn(session_monitor(sessions.clone()));
-    let std_ln = build_listener().expect("listener");
-    let listener = TcpListener::from_std(std_ln).expect("tokio listener");
-    loop {
-        match listener.accept().await {
-            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
-            Err(_) => {}
-        }
-    }
+    let state = AppState::new();
+    let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
+    let ln = TcpListener::bind(PANEL_ADDR).await?;
+    axum::serve(ln, app).await?;
+    Ok(())
 }
 RSEOF
 
