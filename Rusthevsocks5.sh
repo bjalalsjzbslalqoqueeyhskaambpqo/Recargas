@@ -74,10 +74,10 @@ const LISTEN_ADDR:   &str = "0.0.0.0:80";
 const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
-const MAX_STREAMS:     usize = 10000;
+const MAX_STREAMS:     usize = 8000;
 const QUEUE_SIZE:      usize = 2048;
 const MAX_PAYLOAD:     usize = 16384;
-const MUX_WRITE_QUEUE: usize = 512;
+const MUX_WRITE_QUEUE: usize = 1024;
 const CTRL_QUEUE:      usize = 128;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
@@ -205,17 +205,27 @@ fn tune_hev_fd(fd: i32) {
 }
 
 struct Stream {
-    tx:     mpsc::Sender<Bytes>,
-    closed: AtomicBool,
+    tx:        mpsc::Sender<Bytes>,
+    cancel_tx: watch::Sender<bool>,
+    closed:    AtomicBool,
 }
 
 impl Stream {
-    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
-        Arc::new(Self { tx, closed: AtomicBool::new(false) })
+    // Retorna el Stream y su receptor de Cancelación (Para matar Tareas Fantasma)
+    fn new(tx: mpsc::Sender<Bytes>) -> (Arc<Self>, watch::Receiver<bool>) {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        (Arc::new(Self { tx, cancel_tx, closed: AtomicBool::new(false) }), cancel_rx)
     }
+
     #[inline(always)] fn try_close(&self) -> bool {
-        self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        if self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let _ = self.cancel_tx.send(true); // Dispara el Asesinato Instantáneo de Tareas
+            true
+        } else {
+            false
+        }
     }
+    
     #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
 }
 
@@ -280,7 +290,7 @@ impl Mux {
 
     fn close_stream_sync(&self, sid: u32) {
         if let Some((_, s)) = self.streams.remove(&sid) {
-            s.try_close();
+            s.try_close(); // Esto mata cualquier tarea vieja que estuviera usándolo
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -292,6 +302,7 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
         let _ = mux.ctrl_tx.try_send(build_ctrl_frame(reason, 0));
         mux.kill();
+        info!(id, reason, "session kicked");
         true
     } else {
         false
@@ -335,18 +346,21 @@ async fn write_loop(
 }
 
 async fn handle_stream(
-    mux:    Arc<Mux>,
-    sid:    u32,
-    stream: Arc<Stream>,
-    mut rx: mpsc::Receiver<Bytes>,
-    first:  Bytes,
+    mux:           Arc<Mux>,
+    sid:           u32,
+    stream:        Arc<Stream>,
+    mut rx:        mpsc::Receiver<Bytes>,
+    mut cancel_rx: watch::Receiver<bool>,
+    first:         Bytes,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
     let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
-        mux.close_stream_sync(sid);
-        mux.send_ctrl_async(T_CLOSE, sid).await;
+        if !stream.is_closed() {
+            mux.close_stream_sync(sid);
+            mux.send_ctrl_async(T_CLOSE, sid).await;
+        }
         return;
     };
     
@@ -355,8 +369,10 @@ async fn handle_stream(
 
     if !first.is_empty() {
         if hev_w.write_all(&first).await.is_err() {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_async(T_CLOSE, sid).await;
+            if !stream.is_closed() {
+                mux.close_stream_sync(sid);
+                mux.send_ctrl_async(T_CLOSE, sid).await;
+            }
             return;
         }
     }
@@ -367,11 +383,13 @@ async fn handle_stream(
 
     let mux2 = mux.clone();
 
+    let mut cancel_rx1 = cancel_rx.clone();
     let t_c2h = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
                 _ = kill_rx1.changed() => break,
+                _ = cancel_rx1.changed() => break, // Asesinato preventivo si se recicla el FD
                 _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
@@ -384,12 +402,14 @@ async fn handle_stream(
         let _ = hev_w.shutdown().await;
     });
 
+    let mut cancel_rx2 = cancel_rx.clone();
     let t_h2c = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
             tokio::select! {
                 biased;
                 _ = kill_rx2.changed() => break,
+                _ = cancel_rx2.changed() => break, // Asesinato preventivo si se recicla el FD
                 res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
@@ -402,8 +422,14 @@ async fn handle_stream(
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
-    mux.close_stream_sync(sid);
-    mux.send_ctrl_async(T_CLOSE, sid).await;
+    
+    // Solo enviamos un T_CLOSE al cliente si la conexión se murió por causas naturales.
+    // Si la conexión murió porque el cliente nos mandó un T_CLOSE (stream.is_closed() == true), 
+    // no hacemos eco para evitar ruido innecesario en la red.
+    if !stream.is_closed() {
+        mux.close_stream_sync(sid);
+        mux.send_ctrl_async(T_CLOSE, sid).await;
+    }
 }
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
@@ -436,16 +462,18 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PONG => {}
             T_OPEN => {
                 if mux.has_stream_sync(sid) {
-                    continue;
+                    // Si recibimos T_OPEN de un SID que ya existe, matamos al viejo brutalmente
+                    // para limpiar el camino de la nueva conexión, impidiendo corrupción.
+                    mux.close_stream_sync(sid);
                 }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
                 let (tx, rx) = mpsc::channel(QUEUE_SIZE);
-                let s = Stream::new(tx);
+                let (s, cancel_rx) = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
                     mux.send_ctrl_async(T_CLOSE, sid).await;
                     continue;
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload));
+                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, cancel_rx, payload));
             }
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
@@ -612,7 +640,7 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 #[tokio::main]
 async fn main() -> Result<()> {
     maximize_fd_limit();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
@@ -819,6 +847,7 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    maximize_fd_limit();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let state = AppState::new();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
