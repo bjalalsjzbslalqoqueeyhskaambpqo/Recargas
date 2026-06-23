@@ -65,7 +65,6 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::{info, warn};
 
 const HEV_ADDR:      &str = "127.0.0.1:1080";
 const LISTEN_ADDR:   &str = "0.0.0.0:80";
@@ -197,10 +196,8 @@ fn tune_client_fd(fd: i32, mode: TunnelMode) {
         } else {
             setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 0);
         }
-        
         let timeout: i32 = 15000;
         libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
-
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
@@ -216,7 +213,6 @@ fn tune_hev_fd(fd: i32, mode: TunnelMode) {
         } else {
             setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 0);
         }
-        
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
@@ -360,6 +356,7 @@ async fn handle_stream(
     first:  Bytes,
     mode:   TunnelMode,
 ) {
+    let _ = stream.is_closed();
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
@@ -368,7 +365,7 @@ async fn handle_stream(
         mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
     };
-    
+
     tune_hev_fd(hev.as_raw_fd(), mode);
     let (mut hev_r, mut hev_w) = hev.into_split();
 
@@ -394,11 +391,7 @@ async fn handle_stream(
                 _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
-                        Some(data) => { 
-                            if hev_w.write_all(&data).await.is_err() { 
-                                break; 
-                            }
-                        }
+                        Some(data) => { if hev_w.write_all(&data).await.is_err() { break; } }
                         None => break,
                     }
                 }
@@ -417,9 +410,7 @@ async fn handle_stream(
                 res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => { 
-                            if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
-                        }
+                        Ok(n) => { if !mux2.send_data_async(sid, &buf[..n]).await { break; } }
                     }
                 }
             }
@@ -447,7 +438,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
         let ft  = hdr[0];
         let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
         let ln  = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
-        
+
         if ln > MAX_PAYLOAD { break; }
 
         if ln > 0 {
@@ -462,9 +453,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
             T_PING => { mux.send_ctrl_async(T_PONG, sid).await; }
             T_PONG => {}
             T_OPEN => {
-                if mux.has_stream_sync(sid) {
-                    continue;
-                }
+                if mux.has_stream_sync(sid) { continue; }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
                 let queue_size = if mode == TunnelMode::Gaming { 32 } else { 512 };
                 let (tx, rx) = mpsc::channel(queue_size);
@@ -505,6 +494,7 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
 
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, ip_count: IpCount) {
     let peer_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let raw_fd = tcp.as_raw_fd();
     let mut buf = vec![0u8; 8192];
     let mut n   = 0usize;
     let deadline = time::Instant::now() + Duration::from_secs(10);
@@ -524,14 +514,14 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
 
     let raw = &buf[..n];
     let action_str = extract_header(raw, b"action:");
-    
+
     let mode = match action_str {
         Some("tunnel-gaming") => TunnelMode::Gaming,
         Some("tunnel") | Some("tunnel-tcp") => TunnelMode::Normal,
         _ => return,
     };
 
-    tune_client_fd(tcp.as_raw_fd(), mode);
+    tune_client_fd(raw_fd, mode);
 
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
@@ -551,7 +541,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let (write_tx, write_rx) = mpsc::channel::<Bytes>(mux_write_queue);
             let ctrl_queue = if mode == TunnelMode::Gaming { 32 } else { 128 };
             let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(ctrl_queue);
-            
+
             let mux = Mux::new(write_tx, ctrl_tx);
             let kill_rx = mux.kill_tx.subscribe();
 
@@ -639,10 +629,8 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?;
-    
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(15)).with_interval(Duration::from_secs(5));
     sock.set_tcp_keepalive(&ka)?;
-    
     unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); }
     sock.set_nonblocking(true)?; sock.bind(&addr.into())?; sock.listen(65535)?;
     Ok(sock.into())
