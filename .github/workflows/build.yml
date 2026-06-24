@@ -2,7 +2,7 @@ name: Build btserver binaries
 
 on:
   push:
-    branches: [ main ]
+    branches: [ stable ]
   workflow_dispatch:
 
 permissions:
