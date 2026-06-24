@@ -191,9 +191,6 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
 fn tune_client_fd(fd: i32, mode: TunnelMode) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        if mode == TunnelMode::Gaming {
-            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
-        }
         
         let timeout: i32 = 15000;
         libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
@@ -202,14 +199,30 @@ fn tune_client_fd(fd: i32, mode: TunnelMode) {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
+
+        if mode == TunnelMode::Gaming {
+            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        } else {
+            let bbr = b"bbr\0";
+            libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, bbr.as_ptr() as *const _, 3);
+
+            let huge_buf: i32 = 262144;
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &huge_buf as *const _ as _, 4);
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &huge_buf as *const _ as _, 4);
+        }
     }
 }
 
 fn tune_hev_fd(fd: i32, mode: TunnelMode) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+        
         if mode == TunnelMode::Gaming {
             setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        } else {
+            let huge_buf: i32 = 262144;
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &huge_buf as *const _ as _, 4);
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &huge_buf as *const _ as _, 4);
         }
         
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
@@ -322,7 +335,7 @@ async fn write_loop(
 
     loop {
         buf.clear();
-        if buf.capacity() > 131072 {
+        if buf.capacity() > 262144 {
             buf = bytes::BytesMut::with_capacity(32768);
         }
 
@@ -350,7 +363,6 @@ async fn write_loop(
 async fn handle_stream(
     mux:    Arc<Mux>,
     sid:    u32,
-    _stream: Arc<Stream>,
     mut rx: mpsc::Receiver<Bytes>,
     first:  Bytes,
     mode:   TunnelMode,
@@ -461,14 +473,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
                     continue;
                 }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let queue_size = if mode == TunnelMode::Gaming { 32 } else { 512 };
+                let queue_size = if mode == TunnelMode::Gaming { 32 } else { 256 };
                 let (tx, rx) = mpsc::channel(queue_size);
                 let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
                     mux.send_ctrl_async(T_CLOSE, sid).await;
                     continue;
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload, mode));
+                tokio::spawn(handle_stream(mux.clone(), sid, rx, payload, mode));
             }
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
@@ -544,7 +556,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-            let mux_write_queue = if mode == TunnelMode::Gaming { 64 } else { 512 };
+            let mux_write_queue = if mode == TunnelMode::Gaming { 64 } else { 256 };
             let (write_tx, write_rx) = mpsc::channel::<Bytes>(mux_write_queue);
             let ctrl_queue = if mode == TunnelMode::Gaming { 32 } else { 128 };
             let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(ctrl_queue);
@@ -635,7 +647,7 @@ async fn session_monitor(sessions: SessionMap) {
 fn build_listener() -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?; // <--- TCP_NODELAY = 1 universal
+    sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?;
     
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(15)).with_interval(Duration::from_secs(5));
     sock.set_tcp_keepalive(&ka)?;
@@ -648,7 +660,6 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 #[tokio::main]
 async fn main() -> Result<()> {
     maximize_fd_limit();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
@@ -855,7 +866,6 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let state = AppState::new();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
     let ln = TcpListener::bind(PANEL_ADDR).await?;
