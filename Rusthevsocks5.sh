@@ -96,6 +96,11 @@ enum TunnelMode {
     Gaming,
 }
 
+fn log(msg: &str) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    eprintln!("[{now}] {msg}");
+}
+
 fn maximize_fd_limit() {
     unsafe {
         let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -192,7 +197,7 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
 fn tune_client_fd(fd: i32, mode: TunnelMode) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        
+
         let timeout: i32 = 15000;
         libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
 
@@ -363,7 +368,7 @@ async fn handle_stream(
         mux.send_ctrl_async(T_CLOSE, sid).await;
         return;
     };
-    
+
     tune_hev_fd(hev.as_raw_fd());
     let (mut hev_r, mut hev_w) = hev.into_split();
 
@@ -389,7 +394,7 @@ async fn handle_stream(
                 _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
-                        Some(data) => { 
+                        Some(data) => {
                             if hev_w.write_all(&data).await.is_err() { break; }
                         }
                         None => break,
@@ -409,8 +414,8 @@ async fn handle_stream(
                 res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => { 
-                            if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
+                        Ok(n) => {
+                            if !mux2.send_data_async(sid, &buf[..n]).await { break; }
                         }
                     }
                 }
@@ -439,7 +444,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
         let ft  = hdr[0];
         let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
         let ln  = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
-        
+
         if ln > MAX_PAYLOAD { break; }
 
         if ln > 0 {
@@ -494,17 +499,24 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
 
 async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, ip_count: IpCount) {
     let peer_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    log(&format!("conn accepted from {peer_ip}"));
     let mut buf = vec![0u8; 8192];
     let mut n   = 0usize;
     let deadline = time::Instant::now() + Duration::from_secs(10);
-    
+
     let raw_fd = tcp.as_raw_fd();
     let (mut reader, mut writer) = tcp.into_split();
 
     loop {
-        if time::Instant::now() > deadline || n >= buf.len() { return; }
+        if time::Instant::now() > deadline || n >= buf.len() {
+            log(&format!("conn {peer_ip} header read timeout/overflow"));
+            return;
+        }
         match reader.read(&mut buf[n..]).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                log(&format!("conn {peer_ip} closed while reading header"));
+                return;
+            }
             Ok(nr) => {
                 n += nr;
                 let raw = &buf[..n];
@@ -515,39 +527,57 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
 
     let raw = &buf[..n];
     let action_str = extract_header(raw, b"action:");
-    
+    log(&format!("conn {peer_ip} action={action_str:?}"));
+
     let mode = match action_str {
         Some("tunnel-gaming") => TunnelMode::Gaming,
         Some("tunnel") | Some("tunnel-tcp") => TunnelMode::Normal,
-        _ => return,
+        _ => {
+            log(&format!("conn {peer_ip} unknown action, dropping"));
+            return;
+        }
     };
 
     tune_client_fd(raw_fd, mode);
 
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
-        None => return,
+        None => {
+            log(&format!("conn {peer_ip} missing x-internal-id, dropping"));
+            return;
+        }
     };
 
-    if !valid_id(&user_id) { return; }
+    if !valid_id(&user_id) {
+        log(&format!("conn {peer_ip} invalid id={user_id}, dropping"));
+        return;
+    }
+
+    log(&format!("conn {peer_ip} id={user_id} mode={} parsed ok, checking auth", if mode == TunnelMode::Gaming { "gaming" } else { "normal" }));
 
     let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
     match check_auth(user_id.clone()).await {
         AuthResult::Ok { name, secs_left } => {
+            log(&format!("conn {peer_ip} id={user_id} auth ok name={name} secs_left={secs_left}"));
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
-            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+            if writer.write_all(resp.as_bytes()).await.is_err() {
+                log(&format!("conn {peer_ip} id={user_id} failed to write 101 response"));
+                return;
+            }
 
             let (ext_kill_tx, mut ext_kill_rx) = watch::channel(0u8);
             if let Some((_, prev_tx)) = sessions.remove(&user_id) {
                 let _ = prev_tx.send(T_KICK);
+                log(&format!("conn {peer_ip} id={user_id} kicked previous session"));
             }
             sessions.insert(user_id.clone(), ext_kill_tx);
 
             if mode == TunnelMode::Gaming {
+                log(&format!("conn {peer_ip} id={user_id} entering gaming mux loop"));
                 let (write_tx, write_rx) = mpsc::channel::<Bytes>(MUX_WRITE_QUEUE);
                 let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
-                
+
                 let mux = Mux::new(write_tx, ctrl_tx);
                 let mux_kill_tx = mux.kill_tx.clone();
                 let mux_ctrl_tx = mux.ctrl_tx.clone();
@@ -564,37 +594,60 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
 
                 tokio::spawn(write_loop(writer, write_rx, ctrl_rx, mux.kill_tx.subscribe(), mux.clone()));
                 mux_run(mux.clone(), reader).await;
-
+                log(&format!("conn {peer_ip} id={user_id} gaming mux loop ended"));
             } else {
-                let Ok(server) = TcpStream::connect(DROPBEAR_ADDR).await else {
-                    sessions.remove(&user_id);
-                    return;
+                log(&format!("conn {peer_ip} id={user_id} normal mode, connecting to dropbear at {DROPBEAR_ADDR}"));
+                let connect_result = TcpStream::connect(DROPBEAR_ADDR).await;
+                let server = match connect_result {
+                    Ok(s) => {
+                        log(&format!("conn {peer_ip} id={user_id} connected to dropbear ok"));
+                        s
+                    }
+                    Err(e) => {
+                        log(&format!("conn {peer_ip} id={user_id} FAILED connecting to dropbear: {e}"));
+                        sessions.remove(&user_id);
+                        return;
+                    }
                 };
-                
+
                 let (mut server_r, mut server_w) = server.into_split();
-                
+
                 let mut krx1 = ext_kill_rx.clone();
+                let peer_ip_1 = peer_ip.clone();
+                let user_id_1 = user_id.clone();
                 let t1 = tokio::spawn(async move {
                     tokio::select! {
-                        _ = krx1.changed() => {},
-                        _ = tokio::io::copy(&mut reader, &mut server_w) => {}
+                        _ = krx1.changed() => {
+                            log(&format!("conn {peer_ip_1} id={user_id_1} c2s copy ended by kill signal"));
+                        },
+                        res = tokio::io::copy(&mut reader, &mut server_w) => {
+                            log(&format!("conn {peer_ip_1} id={user_id_1} c2s copy ended res={res:?}"));
+                        }
                     }
                 });
-                
+
                 let mut krx2 = ext_kill_rx.clone();
+                let peer_ip_2 = peer_ip.clone();
+                let user_id_2 = user_id.clone();
                 let t2 = tokio::spawn(async move {
                     tokio::select! {
-                        _ = krx2.changed() => {},
-                        _ = tokio::io::copy(&mut server_r, &mut writer) => {}
+                        _ = krx2.changed() => {
+                            log(&format!("conn {peer_ip_2} id={user_id_2} s2c copy ended by kill signal"));
+                        },
+                        res = tokio::io::copy(&mut server_r, &mut writer) => {
+                            log(&format!("conn {peer_ip_2} id={user_id_2} s2c copy ended res={res:?}"));
+                        }
                     }
                 });
-                
+
                 let _ = tokio::join!(t1, t2);
+                log(&format!("conn {peer_ip} id={user_id} normal mode session ended"));
             }
-            
+
             sessions.remove(&user_id);
         }
         AuthResult::NotFound | AuthResult::Expired => {
+            log(&format!("conn {peer_ip} id={user_id} auth not found or expired"));
             let ip_conns = ip_count.get(&peer_ip).map(|v| *v).unwrap_or(0);
             if ip_conns >= WAIT_MAX_PER_IP { return; }
             let status = match check_auth(user_id.clone()).await { AuthResult::Expired => "expired", _ => "waiting" };
@@ -666,10 +719,10 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
     let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?;
-    
+
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(15)).with_interval(Duration::from_secs(5));
     sock.set_tcp_keepalive(&ka)?;
-    
+
     unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); }
     sock.set_nonblocking(true)?; sock.bind(&addr.into())?; sock.listen(65535)?;
     Ok(sock.into())
@@ -678,6 +731,7 @@ fn build_listener() -> std::io::Result<std::net::TcpListener> {
 #[tokio::main]
 async fn main() -> Result<()> {
     maximize_fd_limit();
+    log("btserver starting up");
     let sessions: SessionMap = Arc::new(DashMap::new());
     let waitroom: WaitRoom   = Arc::new(DashMap::new());
     let ip_count: IpCount    = Arc::new(DashMap::new());
@@ -685,10 +739,11 @@ async fn main() -> Result<()> {
     tokio::spawn(session_monitor(sessions.clone()));
     let std_ln = build_listener().expect("listener");
     let listener = TcpListener::from_std(std_ln).expect("tokio listener");
+    log(&format!("listening on {LISTEN_ADDR}"));
     loop {
         match listener.accept().await {
             Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
-            Err(_) => {}
+            Err(e) => { log(&format!("accept error: {e}")); }
         }
     }
 }
