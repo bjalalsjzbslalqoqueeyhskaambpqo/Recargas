@@ -1,651 +1,925 @@
-#include <jni.h>
-#include <android/multinetwork.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/timerfd.h>
-#include <sys/socket.h>
-#include <sys/resource.h>
-#include <sys/uio.h>
-#include <time.h>
-#include <unistd.h>
-#include <poll.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <netdb.h>
-
-#ifndef TCP_QUICKACK
-#define TCP_QUICKACK 12
-#endif
-
-#ifndef TCP_USER_TIMEOUT
-#define TCP_USER_TIMEOUT 18
-#endif
-
-#define OP_PING        0x10
-#define OP_PONG        0x11
-#define OP_STRM_OPEN   0x12
-#define OP_STRM_DATA   0x13
-#define OP_STRM_CLOSE  0x14
-#define OP_SYNC_STATE  0x15
-#define OP_SYNC_RST    0x16
-#define OP_KICK        0x18
-#define OP_EXPIRED     0x19
-
-#define FRAME_HDR         8
-#define MAX_PAYLOAD       32768
-#define KEEPALIVE_SEC     5
-#define HANDSHAKE_TIMEOUT 4000
-#define EPOLL_BATCH_SIZE  256
-#define MAX_STREAM_BUF    1048576
-
-#define PROXY_HOST_V6  "emailmarketing.personal.com.ar"
-#define TUNNEL_HOST_V6 "2.brawlpass.com.ar"
-#define PROXY_HOST_V4  "recarga.personal.com.ar"
-#define TUNNEL_HOST_V4 "dif2pyjxd7k7p.cloudfront.net"
-#define PROXY_PORT     80
-#define CONNECT_MS     2000
-
-static const char *PROXY_IPS_V6[] = { "2606:4700::6812:16b7", "2606:4700::6812:17b7" };
-
-static struct {
-    atomic_int run; atomic_int sid_seq; char iid[160];
-    pthread_mutex_t mu; JavaVM *jvm; jobject svc; net_handle_t net; pthread_t thr;
-    jclass cb_c, pr_c; jmethodID cb_m, pr_m;
-    int tfd, efd, wfd;
-    atomic_int gaming_mode;
-} g = { .mu = PTHREAD_MUTEX_INITIALIZER, .tfd = -1, .efd = -1, .wfd = -1 };
-
-typedef struct st_node {
-    struct st_node *next;
-    uint32_t sid; int cfd;
-    int pending; int paused;
-    uint8_t *buf; size_t off, len, cap;
-} st_node;
-
-#define ST_SIZE 4096
-#define ST_MASK (ST_SIZE - 1)
-static st_node *g_st[ST_SIZE];
-
-static struct {
-    uint8_t *buf; size_t off, len, cap; int blocked;
-    int r_st; size_t r_hlen, r_plen; uint16_t r_exp;
-    uint8_t r_hdr[FRAME_HDR], r_pay[MAX_PAYLOAD];
-    int missed_pings; uint32_t rtt_us;
-} tun;
-
-static __thread JNIEnv *t_env = NULL;
-static __thread int t_att = 0;
-
-static JNIEnv *jni_get(void) {
-    if (t_env) return t_env;
-    JavaVM *vm; pthread_mutex_lock(&g.mu); vm = g.jvm; pthread_mutex_unlock(&g.mu);
-    if (!vm) return NULL;
-    if ((*vm)->GetEnv(vm, (void **)&t_env, JNI_VERSION_1_6) == JNI_OK) { t_att = 0; return t_env; }
-    if ((*vm)->AttachCurrentThread(vm, &t_env, NULL) == JNI_OK) { t_att = 1; return t_env; }
-    return NULL;
-}
-
-static void jni_release(void) {
-    if (!t_att || !t_env) return;
-    JavaVM *vm; pthread_mutex_lock(&g.mu); vm = g.jvm; pthread_mutex_unlock(&g.mu);
-    if (vm) (*vm)->DetachCurrentThread(vm);
-    t_env = NULL; t_att = 0;
-}
-
-static void push_event(const char *ev) {
-    jclass cls; jmethodID mid;
-    pthread_mutex_lock(&g.mu); cls = g.cb_c; mid = g.cb_m; pthread_mutex_unlock(&g.mu);
-    if (!cls || !mid) return;
-    JNIEnv *e = jni_get(); if (!e) return;
-    jstring js = (*e)->NewStringUTF(e, ev);
-    if (js) { (*e)->CallStaticVoidMethod(e, cls, mid, js); (*e)->DeleteLocalRef(e, js); }
-    if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e);
-}
-
-static void push_tunnel_latency(int fd) {
-#ifdef TCP_INFO
-    struct tcp_info info;
-    socklen_t len = sizeof(info);
-    if (fd < 0 || getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) != 0) return;
-    unsigned int rtt_us = info.tcpi_rtt;
-    if (!rtt_us) return;
-    tun.rtt_us = rtt_us;
-    char ev[32];
-    snprintf(ev, sizeof(ev), "ping:%u", (rtt_us + 500U) / 1000U);
-    push_event(ev);
-#else
-    (void)fd;
-#endif
-}
-
-static int buf_append(uint8_t **b, size_t *off, size_t *len, size_t *cap, const uint8_t *d, size_t dl) {
-    if (!dl) return 0;
-    if (*off + *len + dl > *cap) {
-        if (*len && *off) memmove(*b, *b + *off, *len);
-        *off = 0;
-        if (*len + dl > *cap) {
-            size_t nc = (*len + dl) * 2 + 8192;
-            uint8_t *nb = realloc(*b, nc);
-            if (!nb) return -1;
-            *b = nb; *cap = nc;
-        }
-    }
-    memcpy(*b + *off + *len, d, dl); *len += dl;
-    return 0;
-}
-
-static void buf_consume(uint8_t **b, size_t *off, size_t *len, size_t *cap, size_t amt) {
-    if (amt >= *len) {
-        *off = 0; *len = 0;
-        if (*cap > 65536) { free(*b); *b = NULL; *cap = 0; }
-    } else {
-        *off += amt; *len -= amt;
-    }
-}
-
-static void st_init(void) {
-    memset(g_st, 0, sizeof(g_st)); free(tun.buf); memset(&tun, 0, sizeof(tun));
-    tun.missed_pings = 0; tun.rtt_us = 0;
-}
-
-static st_node *st_get(uint32_t sid) {
-    for (st_node *n = g_st[sid & ST_MASK]; n; n = n->next) if (n->sid == sid) return n;
-    return NULL;
-}
-
-static st_node *st_put(uint32_t sid, int cfd) {
-    st_node *n = calloc(1, sizeof(*n)); if (!n) return NULL;
-    n->sid = sid; n->cfd = cfd; n->pending = 1; n->paused = 0;
-    int sl = sid & ST_MASK; n->next = g_st[sl]; g_st[sl] = n;
-    return n;
-}
-
-static void epoll_set(int epfd, int op, int fd, uint32_t ev, uint64_t data) {
-    struct epoll_event e = {ev, {.u64 = data}}; epoll_ctl(epfd, op, fd, &e);
-}
-
-static void st_pause(int epfd, st_node *n) {
-    if (n->paused) return;
-    n->paused = 1;
-    uint32_t evs = EPOLLRDHUP | EPOLLOUT;
-    epoll_set(epfd, EPOLL_CTL_MOD, n->cfd, evs, (uint64_t)n->sid<<32 | n->cfd);
-}
-
-static void st_resume(int epfd, st_node *n) {
-    if (!n->paused) return;
-    n->paused = 0;
-    uint32_t evs = EPOLLRDHUP | EPOLLIN;
-    epoll_set(epfd, EPOLL_CTL_MOD, n->cfd, evs, (uint64_t)n->sid<<32 | n->cfd);
-}
-
-static void tun_update_epoll(int epfd, int tfd) {
-    uint32_t evs = EPOLLIN | EPOLLRDHUP; if (tun.len > 0) evs |= EPOLLOUT;
-    epoll_set(epfd, EPOLL_CTL_MOD, tfd, evs, tfd);
-}
-
-static void toggle_bp(int epfd, int blocked) {
-    for (int i = 0; i < ST_SIZE; i++)
-        for (st_node *n = g_st[i]; n; n = n->next) {
-            if (n->paused) continue;
-            uint32_t evs = EPOLLRDHUP;
-            if (!blocked) evs |= EPOLLIN;
-            if (n->len > 0) evs |= EPOLLOUT;
-            epoll_set(epfd, EPOLL_CTL_MOD, n->cfd, evs, (uint64_t)n->sid<<32 | n->cfd);
-        }
-}
-
-static int tun_send_v(int epfd, int tfd, uint8_t op, uint8_t flags, uint32_t sid, const uint8_t *data, uint16_t dlen) {
-    uint8_t hdr[FRAME_HDR] = { op, flags, sid>>24, sid>>16, sid>>8, sid, dlen>>8, dlen };
-    if (!tun.len && !tun.blocked) {
-        struct iovec iov[2] = { {hdr, FRAME_HDR}, {(void*)data, dlen} };
-        ssize_t n;
-        do { n = writev(tfd, iov, dlen ? 2 : 1); } while (n < 0 && errno == EINTR);
-        size_t tot = FRAME_HDR + dlen, sent = (n > 0) ? n : 0;
-        if (n == (ssize_t)tot) return 0;
-        if (sent < FRAME_HDR) {
-            if (buf_append(&tun.buf, &tun.off, &tun.len, &tun.cap, hdr + sent, FRAME_HDR - sent) < 0) return -1;
-            if (dlen && buf_append(&tun.buf, &tun.off, &tun.len, &tun.cap, data, dlen) < 0) return -1;
-        } else {
-            if (buf_append(&tun.buf, &tun.off, &tun.len, &tun.cap, data + (sent - FRAME_HDR), tot - sent) < 0) return -1;
-        }
-        tun.blocked = 1; toggle_bp(epfd, 1); tun_update_epoll(epfd, tfd);
-        return 0;
-    }
-    if (buf_append(&tun.buf, &tun.off, &tun.len, &tun.cap, hdr, FRAME_HDR) < 0) return -1;
-    if (dlen && buf_append(&tun.buf, &tun.off, &tun.len, &tun.cap, data, dlen) < 0) return -1;
-    return 0;
-}
-
-static void tun_flush(int epfd, int tfd) {
-    if (!tun.len) return;
-    ssize_t n;
-    do { n = send(tfd, tun.buf + tun.off, tun.len, MSG_NOSIGNAL | MSG_DONTWAIT); } while (n < 0 && errno == EINTR);
-    if (n > 0) {
-        buf_consume(&tun.buf, &tun.off, &tun.len, &tun.cap, n);
-        if (!tun.len) {
-            if (tun.blocked) { tun.blocked = 0; toggle_bp(epfd, 0); }
-            tun_update_epoll(epfd, tfd);
-        }
-    }
-}
-
-static void st_close(int epfd, int tfd, uint32_t sid, st_node *st, int notify) {
-    if (!st) st = st_get(sid); if (!st) return;
-    epoll_ctl(epfd, EPOLL_CTL_DEL, st->cfd, NULL);
-    shutdown(st->cfd, SHUT_RDWR); close(st->cfd);
-    if (notify) tun_send_v(epfd, tfd, OP_STRM_CLOSE, 0, sid, NULL, 0);
-    st_node **pp = &g_st[sid & ST_MASK];
-    while (*pp) { if ((*pp)->sid == sid) { st_node *n = *pp; *pp = n->next; free(n->buf); free(n); return; } pp = &(*pp)->next; }
-}
-
-static int st_flush(int epfd, int tfd, st_node *st) {
-    if (!st->len) return 0;
-    ssize_t n;
-    do { n = send(st->cfd, st->buf + st->off, st->len, MSG_NOSIGNAL | MSG_DONTWAIT); } while (n < 0 && errno == EINTR);
-    if (n > 0) {
-        buf_consume(&st->buf, &st->off, &st->len, &st->cap, n);
-        if (!st->len) st_resume(epfd, st);
-    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        st_close(epfd, tfd, st->sid, st, 1); return -1;
-    }
-    return 0;
-}
-
-static void protect_fd(int fd) {
-    pthread_mutex_lock(&g.mu); net_handle_t net = g.net; jclass cls = g.pr_c; jmethodID mid = g.pr_m; jobject svc = g.svc; pthread_mutex_unlock(&g.mu);
-    if (net != NETWORK_UNSPECIFIED) android_setsocknetwork(net, fd);
-    if (!cls || !mid) return;
-    JNIEnv *e = jni_get(); if (!e) return;
-    if (svc) { (*e)->CallBooleanMethod(e, svc, mid, fd); if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e); }
-}
-
-static int make_sock(int af) {
-    int fd = socket(af, SOCK_STREAM, 0); if (fd < 0) return -1;
-    protect_fd(fd);
-
-    int gaming = atomic_load(&g.gaming_mode);
-    if (gaming) {
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-        int timeout = 15000;
-        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, sizeof(timeout));
-        int v = 15;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v));
-        v = 5; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
-        v = 3; setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v));
-    } else {
-        int zero = 0;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &zero, sizeof(zero));
-        int timeout = 60000;
-        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, sizeof(timeout));
-        int one = 1, v = 60;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v));
-        v = 15; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
-        v = 4; setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v));
-        int sndbuf = 131072;
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-        int rcvbuf = 131072;
-        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    }
-
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    return fd;
-}
-
-static int try_connect(int af, struct sockaddr *sa, socklen_t sl, int ms) {
-    int fd = make_sock(af); if (fd < 0) return -1;
-    if (connect(fd, sa, sl) != 0 && errno != EINPROGRESS) { close(fd); return -1; }
-    struct pollfd p = {fd, POLLOUT, 0}; int e = 0; socklen_t el = sizeof(e);
-    if (poll(&p, 1, ms) <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el) < 0 || e) { close(fd); return -1; }
-    return fd;
-}
-
-static int recv_headers(int fd, char *buf, int cap, int ms) {
-    for (int u = 0; u < cap - 1;) {
-        struct pollfd p = {fd, POLLIN, 0}; if (poll(&p, 1, ms) <= 0) break;
-        ssize_t n; do { n = recv(fd, buf + u, cap - 1 - u, 0); } while (n < 0 && errno == EINTR);
-        if (n > 0) { u += n; buf[u] = 0; if (strstr(buf, "\r\n\r\n")) return u; continue; }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; break;
-    }
-    return -1;
-}
-
-static void get_hdr(const char *h, const char *k, char *out, size_t cap) {
-    out[0] = 0; size_t kl = strlen(k);
-    for (const char *p = h; *p;) {
-        const char *eol = strstr(p, "\r\n"); size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        if (len >= kl && strncasecmp(p, k, kl) == 0) {
-            const char *v = p + kl; while (*v == ' ' || *v == '\t') v++;
-            size_t vl = len - (size_t)(v - p); if (vl >= cap) vl = cap - 1;
-            memcpy(out, v, vl); out[vl] = 0; return;
-        }
-        if (!eol) break; p = eol + 2;
-    }
-}
-
-static int do_handshake(int fd, const char *ph, const char *th) {
-    char buf[16384];
-    int n = snprintf(buf, sizeof(buf), "HEAD http://%s HTTP/1.1\r\nHost: %s\r\n\r\n", ph, ph);
-    send(fd, buf, n, MSG_NOSIGNAL);
-    if (recv_headers(fd, buf, sizeof(buf), HANDSHAKE_TIMEOUT) < 0) return -1;
-
-    int gaming = atomic_load(&g.gaming_mode);
-    const char *action = gaming ? "tunnel-gaming" : "tunnel";
-
-    n = snprintf(buf, sizeof(buf), "PACHTS http://%s HTTP/1.1\r\nHost: %s\r\n\r\nGET htt://%s HTTP/1.1\r\nHost: %s\r\nAction: %s\r\nX-Internal-ID: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", ph, ph, th, th, action, g.iid[0] ? g.iid : "unknown");
-    send(fd, buf, n, MSG_NOSIGNAL); usleep(800000);
-
-    char h[16384] = {0}; int code = -1;
-    for (int u = 0; u < (int)sizeof(h) - 1;) {
-        struct pollfd p = {fd, POLLIN, 0}; if (poll(&p, 1, HANDSHAKE_TIMEOUT) <= 0) break;
-        ssize_t nr; do { nr = recv(fd, h + u, sizeof(h) - 1 - u, 0); } while (nr < 0 && errno == EINTR);
-        if (nr > 0) {
-            u += nr; h[u] = 0;
-            const char *last = h, *ptr = h;
-            while ((ptr = strstr(ptr, "HTTP/")) != NULL) { last = ptr; ptr += 5; }
-            if (strstr(last, "\r\n\r\n") && sscanf(last, "HTTP/%*d.%*d %d", &code) == 1 && code != 200) break;
-            continue;
-        }
-        if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; break;
-    }
-
-    if (code >= 500 && code < 600) { push_event("service_unavailable"); return -1; }
-    if (code == 401 || code == 403 || code == 410) {
-        char r[64] = {0}, ev[96]; get_hdr(h, "X-Disconnect-Reason:", r, sizeof(r));
-        if (r[0]) { snprintf(ev, sizeof(ev), "disconnect_reason:%s", r); push_event(ev); }
-        push_event("auth_rejected"); return -2;
-    }
-    if (code != 101) return -1;
-
-    char ws[32] = {0}; get_hdr(h, "X-Wait-Status:", ws, sizeof(ws));
-    if (ws[0]) {
-        char ev[64], tmp[1024]; snprintf(ev, sizeof(ev), "waiting_status:%s", ws); push_event(ev);
-        if (strstr(h, "activated")) { push_event("wait_activated"); return -2; }
-        while (atomic_load(&g.run)) { struct pollfd p = {fd, POLLIN, 0}; if (poll(&p, 1, 1000) <= 0) continue; ssize_t nr = recv(fd, tmp, sizeof(tmp)-1, 0); if (nr <= 0) break; tmp[nr] = 0; if (strstr(tmp, "activated")) { push_event("wait_activated"); return -2; } }
-        return -2;
-    }
-    char un[128]={0}, us[32]={0}, ud[32]={0}, ev[160];
-    get_hdr(h, "X-User-Name:", un, sizeof(un)); get_hdr(h, "X-User-Secs:", us, sizeof(us)); get_hdr(h, "X-User-Days:", ud, sizeof(ud));
-    if (un[0]) { snprintf(ev, sizeof(ev), "user_name:%s", un); push_event(ev); }
-    if (us[0]) { snprintf(ev, sizeof(ev), "user_secs:%s", us); push_event(ev); } else if (ud[0]) { snprintf(ev, sizeof(ev), "user_days:%s", ud); push_event(ev); }
-    push_event("tunnel_ready"); return 0;
-}
-
-static int open_tunnel(void) {
-    push_event("connecting");
-    for (int i = 0; i < (int)(sizeof(PROXY_IPS_V6)/sizeof(*PROXY_IPS_V6)); i++) {
-        struct sockaddr_in6 a = {0}; a.sin6_family = AF_INET6; a.sin6_port = htons(PROXY_PORT);
-        if (inet_pton(AF_INET6, PROXY_IPS_V6[i], &a.sin6_addr) != 1) continue;
-        int fd = try_connect(AF_INET6, (struct sockaddr *)&a, sizeof(a), 300); if (fd < 0) continue;
-        int r = do_handshake(fd, PROXY_HOST_V6, TUNNEL_HOST_V6); if (r == 0) return fd;
-        close(fd); if (r == -2) return -2;
-    }
-    struct addrinfo hints = {.ai_family=AF_INET, .ai_socktype=SOCK_STREAM}, *res = NULL;
-    char port[8]; snprintf(port, sizeof(port), "%d", PROXY_PORT);
-    if (getaddrinfo(PROXY_HOST_V4, port, &hints, &res) != 0) return -1;
-    int fd = -1; for (struct addrinfo *c = res; c && fd < 0; c = c->ai_next) fd = try_connect(AF_INET, c->ai_addr, c->ai_addrlen, CONNECT_MS);
-    freeaddrinfo(res); if (fd < 0) return -1;
-    int r = do_handshake(fd, PROXY_HOST_V4, TUNNEL_HOST_V4); if (r < 0) { close(fd); return r; } return fd;
-}
-
-static int make_relay(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1; if (fd < 0) return -1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    struct sockaddr_in la = {.sin_family=AF_INET, .sin_port=htons(port), .sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-    if (bind(fd, (struct sockaddr *)&la, sizeof(la)) < 0 || listen(fd, SOMAXCONN) < 0) { close(fd); return -1; }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK); return fd;
-}
-
-static int handle_tun_rx(int epfd, int tfd) {
-    while (1) {
-        if (!tun.r_st) {
-            ssize_t n; do { n = recv(tfd, tun.r_hdr + tun.r_hlen, FRAME_HDR - tun.r_hlen, 0); } while (n < 0 && errno == EINTR);
-            if (n <= 0) return (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK));
-            if ((tun.r_hlen += n) == FRAME_HDR) {
-                tun.r_st = 1; tun.r_plen = 0; tun.r_exp = (tun.r_hdr[6] << 8) | tun.r_hdr[7];
-                if (tun.r_exp > MAX_PAYLOAD) return 1;
-            }
-        } else {
-            if (tun.r_exp) {
-                ssize_t n; do { n = recv(tfd, tun.r_pay + tun.r_plen, tun.r_exp - tun.r_plen, 0); } while (n < 0 && errno == EINTR);
-                if (n <= 0) return (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK));
-                tun.r_plen += n;
-            }
-            if (tun.r_plen == tun.r_exp) {
-                uint8_t op = tun.r_hdr[0];
-                uint32_t sid = ((uint32_t)tun.r_hdr[2]<<24) | ((uint32_t)tun.r_hdr[3]<<16) | ((uint32_t)tun.r_hdr[4]<<8) | tun.r_hdr[5];
-                st_node *st = st_get(sid);
-
-                if (op == OP_STRM_DATA && st && tun.r_exp) {
-                    if (!st->len) {
-                        ssize_t ns; do { ns = send(st->cfd, tun.r_pay, tun.r_exp, MSG_NOSIGNAL | MSG_DONTWAIT); } while (ns < 0 && errno == EINTR);
-                        size_t sent = (ns > 0) ? ns : 0;
-                        if (sent < tun.r_exp) {
-                            if (buf_append(&st->buf, &st->off, &st->len, &st->cap, tun.r_pay + sent, tun.r_exp - sent) < 0 || st->len > MAX_STREAM_BUF) {
-                                st_close(epfd, tfd, sid, st, 1);
-                            } else {
-                                st_pause(epfd, st);
-                            }
-                        }
-                    } else {
-                        if (buf_append(&st->buf, &st->off, &st->len, &st->cap, tun.r_pay, tun.r_exp) < 0 || st->len > MAX_STREAM_BUF) {
-                            st_close(epfd, tfd, sid, st, 1);
-                        }
-                    }
-                } else if (op == OP_STRM_DATA && !st) {
-                    tun_send_v(epfd, tfd, OP_SYNC_RST, 0, sid, NULL, 0);
-                } else if (op == OP_STRM_CLOSE || op == OP_SYNC_RST) {
-                    if (st) st_close(epfd, tfd, sid, st, 0);
-                } else if (op == OP_PING) {
-                    tun_send_v(epfd, tfd, OP_PONG, 0, 0, NULL, 0);
-                } else if (op == OP_PONG) {
-                } else if (op == OP_KICK || op == OP_EXPIRED) {
-                    if (op == OP_EXPIRED) push_event("auth_rejected");
-                    push_event("reconnect_required"); return 1;
-                } else if (op != OP_STRM_OPEN && op != OP_SYNC_STATE) {
-                    return 1;
-                }
-                tun.r_st = tun.r_hlen = 0;
-            }
-        }
-    }
-    return 0;
-}
-
-static void handle_stream_rx(int epfd, int tfd, uint32_t sid, st_node *st) {
-    int gaming = atomic_load(&g.gaming_mode);
-    size_t chunk = gaming ? 4096 : MAX_PAYLOAD;
-    if (tun.rtt_us > 200000) chunk = 16384;
-    if (tun.rtt_us > 400000) chunk = 8192;
-    if (tun.rtt_us > 800000) chunk = 4096;
-    if (chunk > MAX_PAYLOAD) chunk = MAX_PAYLOAD;
-
-    uint8_t buf[MAX_PAYLOAD];
-
-    while (!tun.blocked) {
-        ssize_t nr; do { nr = recv(st->cfd, buf, chunk, 0); } while (nr < 0 && errno == EINTR);
-        if (nr > 0) {
-            if (tun_send_v(epfd, tfd, OP_STRM_DATA, 0, sid, buf, (uint16_t)nr) < 0) {
-                st_close(epfd, tfd, sid, st, 1); break;
-            }
-            if (nr < (ssize_t)chunk) break;
-        } else {
-            if (nr == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-                st_close(epfd, tfd, sid, st, 1);
-            break;
-        }
-    }
-}
-
-static void handle_accept(int epfd, int tfd, int rfd) {
-    while (1) {
-        struct sockaddr_in ca; socklen_t cl = sizeof(ca);
-        int cfd = accept4(rfd, (struct sockaddr *)&ca, &cl, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (cfd < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) continue;
-            break;
-        }
-
-        int gaming = atomic_load(&g.gaming_mode);
-        if (gaming) {
-            int one = 1;
-            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-        }
-
-        uint32_t sid;
-        do { sid = (uint32_t)atomic_fetch_add(&g.sid_seq, 1) & 0x7FFFFFFF; } while (!sid || st_get(sid));
-
-        st_node *st = st_put(sid, cfd);
-        if (!st) { close(cfd); continue; }
-
-        if (tun_send_v(epfd, tfd, OP_STRM_OPEN, 0, sid, NULL, 0) < 0) {
-            st_close(epfd, tfd, sid, st, 0); continue;
-        }
-
-        epoll_set(epfd, EPOLL_CTL_ADD, cfd, EPOLLIN | EPOLLRDHUP, (uint64_t)sid<<32 | cfd);
-    }
-}
-
-static void *main_thread(void *arg) {
-    int port = (int)(intptr_t)arg; signal(SIGPIPE, SIG_IGN); jni_get();
-    while (atomic_load(&g.run)) {
-        int tfd = open_tunnel(); if (tfd < 0) { if (!atomic_load(&g.run) || tfd == -2) break; sleep(3); continue; }
-        int rfd = make_relay(port); if (rfd < 0) { close(tfd); sleep(2); continue; }
-        int wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        int timerfd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (timerfd < 0) timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        int epfd = epoll_create1(EPOLL_CLOEXEC);
-        if (epfd < 0 || wakefd < 0 || timerfd < 0) { if (epfd >= 0) close(epfd); if (timerfd >= 0) close(timerfd); if (wakefd >= 0) close(wakefd); close(rfd); close(tfd); sleep(1); continue; }
-        struct itimerspec its = { .it_interval={KEEPALIVE_SEC,0}, .it_value={KEEPALIVE_SEC,0} }; timerfd_settime(timerfd, 0, &its, NULL);
-        epoll_set(epfd, EPOLL_CTL_ADD, rfd, EPOLLIN, rfd);
-        epoll_set(epfd, EPOLL_CTL_ADD, wakefd, EPOLLIN, wakefd);
-        epoll_set(epfd, EPOLL_CTL_ADD, timerfd, EPOLLIN, timerfd);
-        epoll_set(epfd, EPOLL_CTL_ADD, tfd, EPOLLIN | EPOLLRDHUP, tfd);
-        pthread_mutex_lock(&g.mu); g.tfd = tfd; g.efd = epfd; g.wfd = wakefd; pthread_mutex_unlock(&g.mu);
-        st_init(); push_event("connected"); push_tunnel_latency(tfd);
-        struct epoll_event evs[EPOLL_BATCH_SIZE]; int dead = 0; int tick_counter = 0;
-
-        while (atomic_load(&g.run) && !dead) {
-            int n = epoll_wait(epfd, evs, EPOLL_BATCH_SIZE, -1); if (n < 0) { if (errno == EINTR) continue; break; }
-            for (int i = 0; i < n && !dead; i++) {
-                uint64_t edata = evs[i].data.u64; uint32_t evm = evs[i].events; int efd = (int)(uint32_t)edata;
-                if (efd == wakefd) { dead = 1; break; }
-                if (efd == timerfd) {
-                    uint64_t exp; read(timerfd, &exp, sizeof(exp));
-                    if (exp > 1) tun.missed_pings = 0; else tun.missed_pings++;
-                    if (tun.missed_pings >= 3) { dead = 1; continue; }
-                    tun_send_v(epfd, tfd, OP_PING, 0, 0, NULL, 0);
-                    push_tunnel_latency(tfd);
-                    tick_counter += exp;
-                    if (tick_counter >= 3) {
-                        tick_counter = 0;
-                        uint8_t payload[32760]; uint16_t count = 0;
-                        for (int k = 0; k < ST_SIZE; k++) {
-                            for (st_node *n = g_st[k]; n; n = n->next) {
-                                if (count >= 8190) break;
-                                payload[count*4] = n->sid >> 24; payload[count*4+1] = n->sid >> 16;
-                                payload[count*4+2] = n->sid >> 8; payload[count*4+3] = n->sid; count++;
-                            }
-                        }
-                        tun_send_v(epfd, tfd, OP_SYNC_STATE, 0, 0, payload, count * 4);
-                    }
-                    continue;
-                }
-                if (efd == tfd) {
-                    if (evm & EPOLLOUT) tun_flush(epfd, tfd);
-                    if (evm & EPOLLIN) {
-                        tun.missed_pings = 0;
-                        dead = handle_tun_rx(epfd, tfd);
-                    }
-                    if (!dead && (evm & (EPOLLHUP|EPOLLERR|EPOLLRDHUP))) dead = 1;
-                    continue;
-                }
-                if (efd == rfd) { handle_accept(epfd, tfd, rfd); continue; }
-
-                uint32_t sid = (uint32_t)(edata >> 32); st_node *st = st_get(sid); if (!st) continue;
-                if (evm & EPOLLOUT) { if (st_flush(epfd, tfd, st) < 0) continue; }
-                if ((evm & EPOLLIN) && !tun.blocked && !st->paused) handle_stream_rx(epfd, tfd, sid, st);
-                if ((evm & (EPOLLHUP|EPOLLERR|EPOLLRDHUP)) && st_get(sid)) st_close(epfd, tfd, sid, st, 1);
-            }
-        }
-
-        push_event("disconnected");
-        pthread_mutex_lock(&g.mu); g.tfd = g.efd = g.wfd = -1; pthread_mutex_unlock(&g.mu);
-        for (int i = 0; i < ST_SIZE; i++) while (g_st[i]) { st_node *nd = g_st[i]; shutdown(nd->cfd, SHUT_RDWR); close(nd->cfd); g_st[i] = nd->next; free(nd->buf); free(nd); }
-        free(tun.buf); tun.buf = NULL;
-        close(epfd); close(timerfd); close(wakefd); close(rfd); shutdown(tfd, SHUT_RDWR); close(tfd);
-        if (atomic_load(&g.run)) sleep(3);
-    }
-    jni_release(); return NULL;
-}
-
-JNIEXPORT jint JNICALL n_start(JNIEnv *env, jclass clazz, jint port, jobject svc, jstring iid) {
-    (void)clazz; pthread_mutex_lock(&g.mu); int already = atomic_load(&g.run); pthread_t ot = g.thr; pthread_mutex_unlock(&g.mu);
-    if (already) return 0; if (ot) { pthread_join(ot, NULL); pthread_mutex_lock(&g.mu); g.thr = 0; pthread_mutex_unlock(&g.mu); }
-    pthread_mutex_lock(&g.mu); (*env)->GetJavaVM(env, &g.jvm); g.svc = (*env)->NewGlobalRef(env, svc); g.iid[0] = 0;
-    if (iid) { const char *s = (*env)->GetStringUTFChars(env, iid, NULL); if (s) { snprintf(g.iid, sizeof(g.iid), "%s", s); (*env)->ReleaseStringUTFChars(env, iid, s); } }
-    jclass pc = (*env)->GetObjectClass(env, svc); if (pc) { g.pr_c = (*env)->NewGlobalRef(env, pc); g.pr_m = (*env)->GetMethodID(env, pc, "protect", "(I)Z"); (*env)->DeleteLocalRef(env, pc); }
-    atomic_store(&g.run, 1); atomic_init(&g.sid_seq, 1); pthread_mutex_unlock(&g.mu); pthread_t thr;
-    if (pthread_create(&thr, NULL, main_thread, (void *)(intptr_t)port) != 0) { pthread_mutex_lock(&g.mu); atomic_store(&g.run, 0); (*env)->DeleteGlobalRef(env, g.svc); g.svc = NULL; g.jvm = NULL; pthread_mutex_unlock(&g.mu); return -1; }
-    pthread_mutex_lock(&g.mu); g.thr = thr; pthread_mutex_unlock(&g.mu); return 0;
-}
-
-JNIEXPORT void JNICALL n_stop(JNIEnv *env, jclass clazz) {
-    (void)clazz; pthread_mutex_lock(&g.mu); if (!atomic_load(&g.run) && !g.thr) { pthread_mutex_unlock(&g.mu); return; }
-    pthread_t th = g.thr; g.thr = 0; atomic_store(&g.run, 0); g.iid[0] = 0; jobject svc = g.svc; g.svc = NULL; g.jvm = NULL; int ww = g.wfd; pthread_mutex_unlock(&g.mu);
-    if (ww >= 0) { uint64_t v = 1; write(ww, &v, 8); } if (th) pthread_join(th, NULL);
-    pthread_mutex_lock(&g.mu); int epfd = g.efd, tfd = g.tfd, wfd = g.wfd; g.efd = g.tfd = g.wfd = -1; pthread_mutex_unlock(&g.mu);
-    if (epfd >= 0) close(epfd); if (tfd >= 0) { shutdown(tfd, SHUT_RDWR); close(tfd); } if (wfd >= 0) close(wfd);
-    if (g.pr_c) { (*env)->DeleteGlobalRef(env, g.pr_c); g.pr_c = NULL; } g.pr_m = NULL; if (svc) (*env)->DeleteGlobalRef(env, svc);
-}
-
-JNIEXPORT void JNICALL n_net(JNIEnv *e, jclass c, jlong net) {
-    (void)e; (void)c;
-    pthread_mutex_lock(&g.mu); net_handle_t old_net = g.net; g.net = (net_handle_t)net; int ww = g.wfd; pthread_mutex_unlock(&g.mu);
-    if (old_net != (net_handle_t)net && ww >= 0) { uint64_t v = 1; write(ww, &v, 8); }
-}
-
-JNIEXPORT jstring JNICALL n_status(JNIEnv *env, jclass c) {
-    (void)c; char buf[64];
-    snprintf(buf, sizeof(buf), "%s\n0", atomic_load(&g.run) && g.tfd >= 0 ? "connected" : "disconnected");
-    return (*env)->NewStringUTF(env, buf);
-}
-
-JNIEXPORT void JNICALL n_set_gaming(JNIEnv *e, jclass c, jboolean is_gaming) {
-    (void)e; (void)c;
-    atomic_store(&g.gaming_mode, is_gaming ? 1 : 0);
-}
-
-static JNINativeMethod g_m[] = {
-    {"nativeStart",      "(ILandroid/net/VpnService;Ljava/lang/String;)I", (void *)n_start},
-    {"nativeStop",       "()V",                                             (void *)n_stop},
-    {"nativeSetNetwork", "(J)V",                                            (void *)n_net},
-    {"nativeGetStatus",  "()Ljava/lang/String;",                            (void *)n_status},
-    {"nativeSetGamingMode", "(Z)V",                                         (void *)n_set_gaming}
+#!/bin/bash
+set -e
+
+PROJ=/opt/btserver/btsrc
+mkdir -p "$PROJ/src/bin"
+
+cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
+[package]
+name    = "btserver"
+version = "9.0.0"
+edition = "2021"
+
+[[bin]]
+name = "btserver"
+path = "src/bin/btserver.rs"
+
+[[bin]]
+name = "panel"
+path = "src/bin/panel.rs"
+
+[dependencies]
+tokio              = { version = "1",    features = ["full"] }
+axum               = { version = "0.8"  }
+bytes              = "1"
+dashmap            = "6"
+socket2            = { version = "0.5", features = ["all"] }
+libc               = "0.2"
+serde              = { version = "1",   features = ["derive"] }
+serde_json         = "1"
+anyhow             = "1"
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+panic         = "abort"
+TOMLEOF
+
+cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    os::unix::io::AsRawFd,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *r) {
-    (void)r; JNIEnv *env = NULL; if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
-    jclass cls = (*env)->FindClass(env, "com/blacktunnel/BtProxy"); if (!cls) return JNI_ERR;
-    if ((*env)->RegisterNatives(env, cls, g_m, sizeof(g_m)/sizeof(*g_m)) < 0) return JNI_ERR;
-    jmethodID cb = (*env)->GetStaticMethodID(env, cls, "onNativeEvent", "(Ljava/lang/String;)V"); if (!cb) return JNI_ERR;
-    pthread_mutex_lock(&g.mu); g.cb_c = (*env)->NewGlobalRef(env, cls); g.cb_m = cb; pthread_mutex_unlock(&g.mu);
-    (*env)->DeleteLocalRef(env, cls); return JNI_VERSION_1_6;
+use anyhow::Result;
+use bytes::Bytes;
+use dashmap::DashMap;
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    sync::{mpsc, watch},
+    time,
+};
+use tracing::subscriber;
+
+const HEV_ADDR:      &str = "127.0.0.1:1080";
+const LISTEN_ADDR:   &str = "0.0.0.0:80";
+const KICK_ADDR:     &str = "127.0.0.1:8091";
+const USERS_FILE:    &str = "/opt/btserver/users.txt";
+
+const MAX_STREAMS:     usize = 10000;
+const MAX_PAYLOAD:     usize = 32768;
+const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
+const WAIT_MAX_PER_IP: usize = 3;
+
+const OP_PING:       u8 = 0x10;
+const OP_PONG:       u8 = 0x11;
+const OP_STRM_OPEN:  u8 = 0x12;
+const OP_STRM_DATA:  u8 = 0x13;
+const OP_STRM_CLOSE: u8 = 0x14;
+const OP_SYNC_STATE: u8 = 0x15;
+const OP_SYNC_RST:   u8 = 0x16;
+const OP_KICK:       u8 = 0x18;
+const OP_EXPIRED:    u8 = 0x19;
+
+const TCP_QUICKACK: i32 = 12;
+
+#[derive(Clone, Copy, PartialEq)]
+enum TunnelMode {
+    Normal,
+    Gaming,
 }
+
+fn maximize_fd_limit() {
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            rl.rlim_cur = rl.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    if let Some(rest) = id.strip_prefix("S-") {
+        return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = id.strip_prefix("STRK-") {
+        return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    false
+}
+
+type WaitRoom = Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>;
+type IpCount  = Arc<DashMap<String, usize>>;
+
+#[inline(always)]
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
+fn parse_expires(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(ts) = s.parse::<i64>() { return Some(ts); }
+    let mut it = s.splitn(3, '-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if y < 2000 || y > 2100 { return None; }
+    let m2 = if m <= 2 { m + 12 } else { m };
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let a  = y2 / 100;
+    let b  = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64
+        + (30.6001 * (m2 + 1) as f64) as i64
+        + d + b - 1524 - 2440588;
+    Some(days * 86400 + 86399)
+}
+
+enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
+
+fn check_auth_blocking(id: &str) -> AuthResult {
+    let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return AuthResult::NotFound; };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let mut parts = line.splitn(3, ':');
+        let Some(uid)  = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let Some(exp)  = parts.next() else { continue };
+        if uid != id { continue; }
+        let Some(exp_ts) = parse_expires(exp) else { continue };
+        let now = now_secs();
+        if now > exp_ts { return AuthResult::Expired; }
+        return AuthResult::Ok { name: name.to_string(), secs_left: exp_ts - now };
+    }
+    AuthResult::NotFound
+}
+
+async fn check_auth(id: String) -> AuthResult {
+    tokio::task::spawn_blocking(move || check_auth_blocking(&id))
+        .await
+        .unwrap_or(AuthResult::NotFound)
+}
+
+#[inline(always)]
+fn build_frame(op: u8, flags: u8, sid: u32, payload: &[u8]) -> Bytes {
+    let mut v = Vec::with_capacity(8 + payload.len());
+    v.push(op);
+    v.push(flags);
+    v.extend_from_slice(&sid.to_be_bytes());
+    v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    if !payload.is_empty() {
+        v.extend_from_slice(payload);
+    }
+    Bytes::from(v)
+}
+
+#[inline(always)]
+unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
+    libc::setsockopt(fd, level, opt, &val as *const i32 as *const libc::c_void, 4);
+}
+
+fn tune_client_fd(fd: i32, mode: TunnelMode) {
+    unsafe {
+        if mode == TunnelMode::Gaming {
+            setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        } else {
+            setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 0);
+        }
+        
+        let timeout: i32 = 15000;
+        libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
+
+        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
+    }
+}
+
+fn tune_hev_fd(fd: i32, mode: TunnelMode) {
+    unsafe {
+        if mode == TunnelMode::Gaming {
+            setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
+        } else {
+            setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 0);
+        }
+        
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
+    }
+}
+
+fn get_rtt_us(fd: i32) -> u32 {
+    unsafe {
+        let mut info: libc::tcp_info = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        if libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info as *mut _ as *mut libc::c_void, &mut len) == 0 {
+            info.tcpi_rtt
+        } else { 0 }
+    }
+}
+
+struct Stream {
+    tx:     mpsc::Sender<Bytes>,
+    closed: AtomicBool,
+}
+
+impl Stream {
+    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+        Arc::new(Self { tx, closed: AtomicBool::new(false) })
+    }
+    #[inline(always)] fn try_close(&self) -> bool {
+        self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+    #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+}
+
+struct LinkMux {
+    write_tx: mpsc::Sender<Bytes>,
+    ctrl_tx:  mpsc::Sender<Bytes>,
+    kill_tx:  watch::Sender<bool>,
+    streams:  Arc<DashMap<u32, Arc<Stream>>>,
+    count:    AtomicU32,
+    dead:     AtomicBool,
+    rtt_us:   AtomicU32,
+}
+
+impl LinkMux {
+    fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+        let (kill_tx, _) = watch::channel(false);
+        Arc::new(Self {
+            write_tx, ctrl_tx, kill_tx,
+            streams: Arc::new(DashMap::with_capacity(32)),
+            count:   AtomicU32::new(0),
+            dead:    AtomicBool::new(false),
+            rtt_us:  AtomicU32::new(0),
+        })
+    }
+
+    #[inline(always)] fn kill(&self) {
+        if self.dead.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let _ = self.kill_tx.send(true);
+            self.streams.clear();
+        }
+    }
+
+    #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
+
+    #[inline(always)] fn has_stream_sync(&self, sid: u32) -> bool {
+        self.streams.contains_key(&sid)
+    }
+
+    #[inline(always)] fn get_stream_sync(&self, sid: u32) -> Option<Arc<Stream>> {
+        self.streams.get(&sid).map(|r| r.clone())
+    }
+
+    #[inline(always)] async fn send_data_async(&self, sid: u32, data: &[u8]) -> bool {
+        if self.is_dead() { return false; }
+        if self.write_tx.send(build_frame(OP_STRM_DATA, 0, sid, data)).await.is_err() {
+            self.close_stream_sync(sid);
+            self.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+            return false;
+        }
+        true
+    }
+
+    #[inline(always)] async fn send_ctrl_async(&self, op: u8, sid: u32) {
+        if self.is_dead() { return; }
+        let _ = self.ctrl_tx.send(build_frame(op, 0, sid, &[])).await;
+    }
+
+    fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
+        if self.count.load(Ordering::Relaxed) as usize >= MAX_STREAMS { return false; }
+        self.streams.insert(sid, s);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn close_stream_sync(&self, sid: u32) {
+        if let Some((_, s)) = self.streams.remove(&sid) {
+            s.try_close();
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+type SessionMap = Arc<DashMap<String, Arc<LinkMux>>>;
+
+fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
+    if let Some((_, mux)) = sessions.remove(id) {
+        let _ = mux.ctrl_tx.try_send(build_frame(reason, 0, 0, &[]));
+        mux.kill();
+        true
+    } else {
+        false
+    }
+}
+
+async fn write_loop(
+    mut writer:   OwnedWriteHalf,
+    mut write_rx: mpsc::Receiver<Bytes>,
+    mut ctrl_rx:  mpsc::Receiver<Bytes>,
+    mut kill_rx:  watch::Receiver<bool>,
+    mux:          Arc<LinkMux>,
+) {
+    let mut buf = bytes::BytesMut::with_capacity(32768);
+
+    loop {
+        buf.clear();
+        if buf.capacity() > 131072 {
+            buf = bytes::BytesMut::with_capacity(32768);
+        }
+
+        tokio::select! {
+            biased;
+            _ = kill_rx.changed() => break,
+            frame = ctrl_rx.recv() => {
+                let Some(f) = frame else { break; };
+                buf.extend_from_slice(&f);
+                while let Ok(f) = ctrl_rx.try_recv() { buf.extend_from_slice(&f); }
+            }
+            frame = write_rx.recv() => {
+                let Some(f) = frame else { break; };
+                buf.extend_from_slice(&f);
+                while let Ok(f) = write_rx.try_recv() { buf.extend_from_slice(&f); }
+            }
+        }
+
+        if buf.is_empty() { continue; }
+        if writer.write_all(&buf).await.is_err() { break; }
+    }
+    mux.kill();
+}
+
+async fn handle_stream(
+    mux:    Arc<LinkMux>,
+    sid:    u32,
+    _stream: Arc<Stream>,
+    mut rx: mpsc::Receiver<Bytes>,
+    first:  Bytes,
+    mode:   TunnelMode,
+) {
+    let mut kill_rx1 = mux.kill_tx.subscribe();
+    let mut kill_rx2 = mux.kill_tx.subscribe();
+
+    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
+        mux.close_stream_sync(sid);
+        mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+        return;
+    };
+    
+    tune_hev_fd(hev.as_raw_fd(), mode);
+    let (mut hev_r, mut hev_w) = hev.into_split();
+
+    if !first.is_empty() {
+        if hev_w.write_all(&first).await.is_err() {
+            mux.close_stream_sync(sid);
+            mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+            return;
+        }
+    }
+
+    let (close_tx, _) = watch::channel(false);
+    let mut close_rx_c2h = close_tx.subscribe();
+    let close_tx_h2c = close_tx.clone();
+
+    let mux2 = mux.clone();
+
+    let t_c2h = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = kill_rx1.changed() => break,
+                _ = close_rx_c2h.changed() => break,
+                data = rx.recv() => {
+                    match data {
+                        Some(data) => { 
+                            if hev_w.write_all(&data).await.is_err() { 
+                                break; 
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        let _ = hev_w.shutdown().await;
+    });
+
+    let t_h2c = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            let rtt = mux2.rtt_us.load(Ordering::Relaxed);
+            let mut limit = if mode == TunnelMode::Gaming { 4096 } else { 32768 };
+            
+            if rtt > 200_000 { limit = std::cmp::min(limit, 16384); }
+            if rtt > 400_000 { limit = std::cmp::min(limit, 8192);  }
+            if rtt > 800_000 { limit = std::cmp::min(limit, 4096);  }
+
+            tokio::select! {
+                biased;
+                _ = kill_rx2.changed() => break,
+                res = hev_r.read(&mut buf[..limit]) => {
+                    match res {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { 
+                            if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
+                        }
+                    }
+                }
+            }
+        }
+        let _ = close_tx_h2c.send(true);
+    });
+
+    let _ = tokio::join!(t_c2h, t_h2c);
+    mux.close_stream_sync(sid);
+    mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+}
+
+async fn mux_run(mux: Arc<LinkMux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
+    let mut hdr  = [0u8; 8];
+    let mut rbuf = vec![0u8; MAX_PAYLOAD];
+    let mut kill_rx = mux.kill_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = kill_rx.changed() => break,
+            res = reader.read_exact(&mut hdr) => { if res.is_err() { break; } }
+        }
+
+        let op    = hdr[0];
+        let _flag = hdr[1];
+        let sid   = u32::from_be_bytes(hdr[2..6].try_into().unwrap());
+        let ln    = u16::from_be_bytes(hdr[6..8].try_into().unwrap()) as usize;
+        
+        if ln > MAX_PAYLOAD { break; }
+
+        if ln > 0 {
+            tokio::select! {
+                biased;
+                _ = kill_rx.changed() => break,
+                res = reader.read_exact(&mut rbuf[..ln]) => { if res.is_err() { break; } }
+            }
+        }
+
+        match op {
+            OP_PING => { mux.send_ctrl_async(OP_PONG, 0).await; }
+            OP_PONG => {}
+            OP_SYNC_STATE => {
+                let client_sids: HashSet<u32> = rbuf[..ln]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+                    .collect();
+                
+                let local_sids: Vec<u32> = mux.streams.iter().map(|r| *r.key()).collect();
+                
+                for local_sid in local_sids {
+                    if !client_sids.contains(&local_sid) {
+                        mux.close_stream_sync(local_sid);
+                    }
+                }
+                for client_sid in client_sids {
+                    if !mux.has_stream_sync(client_sid) {
+                        mux.send_ctrl_async(OP_SYNC_RST, client_sid).await;
+                    }
+                }
+            }
+            OP_STRM_OPEN => {
+                if mux.has_stream_sync(sid) {
+                    continue;
+                }
+                let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
+                let queue_size = if mode == TunnelMode::Gaming { 64 } else { 512 };
+                let (tx, rx) = mpsc::channel(queue_size);
+                let s = Stream::new(tx);
+                if !mux.add_stream_sync(sid, s.clone()) {
+                    mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+                    continue;
+                }
+                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload, mode));
+            }
+            OP_STRM_DATA => {
+                if let Some(s) = mux.get_stream_sync(sid) {
+                    if !s.is_closed() {
+                        let payload = Bytes::copy_from_slice(&rbuf[..ln]);
+                        if s.tx.try_send(payload).is_err() {
+                            mux.close_stream_sync(sid);
+                            mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
+                        }
+                    }
+                } else {
+                    mux.send_ctrl_async(OP_SYNC_RST, sid).await;
+                }
+            }
+            OP_STRM_CLOSE | OP_SYNC_RST => { mux.close_stream_sync(sid); }
+            _ => { break; }
+        }
+    }
+    mux.kill();
+}
+
+fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
+    for line in raw.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() <= needle.len() { continue; }
+        if !line[..needle.len()].eq_ignore_ascii_case(needle) { continue; }
+        return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
+    }
+    None
+}
+
+async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, ip_count: IpCount) {
+    let peer_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let mut buf = vec![0u8; 8192];
+    let mut n   = 0usize;
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    
+    let fd = tcp.as_raw_fd();
+    let (mut reader, mut writer) = tcp.into_split();
+
+    loop {
+        if time::Instant::now() > deadline || n >= buf.len() { return; }
+        match reader.read(&mut buf[n..]).await {
+            Ok(0) | Err(_) => return,
+            Ok(nr) => {
+                n += nr;
+                let raw = &buf[..n];
+                if raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:")) && raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            }
+        }
+    }
+
+    let raw = &buf[..n];
+    let action_str = extract_header(raw, b"action:");
+    
+    let mode = match action_str {
+        Some("tunnel-gaming") => TunnelMode::Gaming,
+        Some("tunnel") | Some("tunnel-tcp") => TunnelMode::Normal,
+        _ => return,
+    };
+
+    tune_client_fd(fd, mode);
+
+    let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    if !valid_id(&user_id) { return; }
+
+    let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+
+    match check_auth(user_id.clone()).await {
+        AuthResult::Ok { name, secs_left } => {
+            let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
+            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+
+            let mux_write_queue = if mode == TunnelMode::Gaming { 64 } else { 512 };
+            let (write_tx, write_rx) = mpsc::channel::<Bytes>(mux_write_queue);
+            let ctrl_queue = if mode == TunnelMode::Gaming { 32 } else { 128 };
+            let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(ctrl_queue);
+            
+            let mux = LinkMux::new(write_tx, ctrl_tx);
+            let kill_rx = mux.kill_tx.subscribe();
+
+            if let Some((_, prev_mux)) = sessions.remove(&user_id) {
+                let _ = prev_mux.ctrl_tx.try_send(build_frame(OP_KICK, 0, 0, &[]));
+                prev_mux.kill();
+            }
+
+            sessions.insert(user_id.clone(), mux.clone());
+
+            let mut kill_rx3 = mux.kill_tx.subscribe();
+            let mux_clone_metrics = mux.clone();
+            tokio::spawn(async move {
+                let mut ticker = time::interval(Duration::from_secs(2));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = kill_rx3.changed() => break,
+                        _ = ticker.tick() => {
+                            let rtt = get_rtt_us(fd);
+                            mux_clone_metrics.rtt_us.store(rtt, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
+            tokio::spawn(write_loop(writer, write_rx, ctrl_rx, kill_rx, mux.clone()));
+            mux_run(mux.clone(), reader, mode).await;
+            sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
+            mux.kill();
+        }
+        AuthResult::NotFound | AuthResult::Expired => {
+            let ip_conns = ip_count.get(&peer_ip).map(|v| *v).unwrap_or(0);
+            if ip_conns >= WAIT_MAX_PER_IP { return; }
+            let status = match check_auth(user_id.clone()).await { AuthResult::Expired => "expired", _ => "waiting" };
+            let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
+            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+            wait_room(writer, reader, user_id, peer_ip, waitroom, ip_count).await;
+        }
+    }
+}
+
+async fn wait_room(mut writer: OwnedWriteHalf, mut reader: OwnedReadHalf, user_id: String, ip: String, waitroom: WaitRoom, ip_count: IpCount) {
+    let activated_msg = b"{\"status\":\"activated\"}\n";
+    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
+    if let Some(prev_tx) = waitroom.insert(user_id.clone(), promote_tx) { let _ = prev_tx.send(()); }
+    *ip_count.entry(ip.clone()).or_insert(0) += 1;
+
+    let result = tokio::select! {
+        _ = promote_rx => "promoted",
+        _ = time::sleep(WAIT_TIMEOUT) => "timeout",
+        _ = async {
+            let mut drain = [0u8; 256];
+            loop { if reader.read(&mut drain).await.unwrap_or(0) == 0 { break; } }
+        } => "disconnected",
+    };
+
+    if result == "promoted" { let _ = writer.write_all(activated_msg).await; }
+    waitroom.remove(&user_id);
+    ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
+}
+
+#[derive(Clone)] struct InternalState { sessions: SessionMap, waitroom: WaitRoom }
+
+async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
+    use axum::{extract::{Query, State}, routing::get, Router};
+    async fn kick_handler(State(s): State<InternalState>, Query(p): Query<HashMap<String, String>>) -> String {
+        let Some(id) = p.get("id").filter(|id| !id.is_empty()) else { return "missing_id".into(); };
+        let reason = if p.get("reason").map(|s| s.as_str()) == Some("expired") { OP_EXPIRED } else { OP_KICK };
+        if kick_session_sync(&s.sessions, id, reason) { "kicked".into() } else { "not_connected".into() }
+    }
+    async fn active_handler(State(s): State<InternalState>) -> String {
+        let ids: Vec<String> = s.sessions.iter().filter(|r| !r.value().is_dead()).map(|r| r.key().clone()).collect();
+        serde_json::json!({ "active": ids, "count": ids.len() }).to_string()
+    }
+    async fn promote_handler(State(s): State<InternalState>, Query(p): Query<HashMap<String, String>>) -> String {
+        let Some(id) = p.get("id").filter(|id| !id.is_empty()) else { return "missing_id".into(); };
+        if let Some((_, tx)) = s.waitroom.remove(id.as_str()) { let _ = tx.send(()); "promoted".into() } else { "not_waiting".into() }
+    }
+    let state = InternalState { sessions, waitroom };
+    let app = Router::new().route("/kick", get(kick_handler)).route("/active", get(active_handler)).route("/promote", get(promote_handler)).with_state(state);
+    let ln = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
+    axum::serve(ln, app).await.expect("kick serve");
+}
+
+async fn session_monitor(sessions: SessionMap) {
+    loop {
+        time::sleep(Duration::from_secs(60)).await;
+        let ids: Vec<String> = sessions.iter().map(|r| r.key().clone()).collect();
+        for id in ids {
+            match check_auth(id.clone()).await {
+                AuthResult::Ok { .. } => continue,
+                AuthResult::Expired => { kick_session_sync(&sessions, &id, OP_EXPIRED); }
+                AuthResult::NotFound => { kick_session_sync(&sessions, &id, OP_KICK); }
+            }
+        }
+    }
+}
+
+fn build_listener() -> std::io::Result<std::net::TcpListener> {
+    let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?;
+    
+    let ka = TcpKeepalive::new().with_time(Duration::from_secs(15)).with_interval(Duration::from_secs(5));
+    sock.set_tcp_keepalive(&ka)?;
+    
+    unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); }
+    sock.set_nonblocking(true)?; sock.bind(&addr.into())?; sock.listen(65535)?;
+    Ok(sock.into())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    maximize_fd_limit();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
+    let sessions: SessionMap = Arc::new(DashMap::new());
+    let waitroom: WaitRoom   = Arc::new(DashMap::new());
+    let ip_count: IpCount    = Arc::new(DashMap::new());
+    tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
+    tokio::spawn(session_monitor(sessions.clone()));
+    let std_ln = build_listener().expect("listener");
+    let listener = TcpListener::from_std(std_ln).expect("tokio listener");
+    loop {
+        match listener.accept().await {
+            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
+            Err(_) => {}
+        }
+    }
+}
+RSEOF
+
+cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use anyhow::Result;
+use axum::{extract::{ConnectInfo, Query, State}, http::{HeaderMap, StatusCode}, routing::{delete, get, post, put}, Json, Router};
+use serde::{Deserialize, Serialize};
+use tokio::{net::TcpListener, sync::Mutex};
+
+const PANEL_ADDR: &str = "0.0.0.0:8090";
+const USERS_PATH: &str = "/opt/btserver/users.txt";
+const TOKEN_PATH: &str = "/opt/btserver/token.txt";
+const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
+const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
+
+#[inline(always)] fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
+fn expires_from_days(days: i64) -> i64 { now_secs() + days * 86400 }
+
+fn migrate_date_to_ts(s: &str) -> Option<i64> {
+    let s = s.trim(); let mut it = s.splitn(3, '-');
+    let y: i64 = it.next()?.parse().ok()?; let m: i64 = it.next()?.parse().ok()?; let d: i64 = it.next()?.parse().ok()?;
+    if y < 2000 || y > 2100 { return None; }
+    let m2 = if m <= 2 { m + 12 } else { m }; let y2 = if m <= 2 { y - 1 } else { y };
+    let a  = y2 / 100; let b  = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64 + (30.6001 * (m2 + 1) as f64) as i64 + d + b - 1524 - 2440588;
+    Some(days * 86400 + 86399)
+}
+
+fn parse_expires(s: &str) -> i64 { let s = s.trim(); if let Ok(ts) = s.parse::<i64>() { return ts; } migrate_date_to_ts(s).unwrap_or(0) }
+
+#[derive(Clone)] struct AppState { token: Arc<String>, users_mu: Arc<Mutex<()>>, rate: Arc<std::sync::Mutex<HashMap<String, Vec<i64>>>> }
+impl AppState {
+    fn new() -> Self {
+        let token = std::fs::read_to_string(TOKEN_PATH).map(|s| s.trim().to_string()).unwrap_or_default();
+        Self { token: Arc::new(token), users_mu: Arc::new(Mutex::new(())), rate: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+    }
+    fn rate_ok(&self, ip: &str) -> bool {
+        let now = now_secs(); let mut map = self.rate.lock().unwrap();
+        let hits = map.entry(ip.to_string()).or_default();
+        hits.retain(|&t| now - t < 60);
+        if hits.len() >= 30 { return false; }
+        hits.push(now); if map.len() > 1000 { map.clear(); }
+        true
+    }
+    fn check_token(&self, headers: &HeaderMap) -> bool {
+        headers.get("x-token").and_then(|v| v.to_str().ok()).map(|t| t.trim() == self.token.as_str()).unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)] struct User { name: String, expires_ts: i64 }
+
+fn load_users_blocking() -> HashMap<String, User> {
+    let Ok(c) = std::fs::read_to_string(USERS_PATH) else { return HashMap::new(); };
+    let mut map = HashMap::new();
+    for line in c.lines() {
+        let line = line.trim(); if line.is_empty() || line.starts_with('#') { continue; }
+        let mut parts = line.splitn(3, ':');
+        let Some(id)   = parts.next().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let Some(name) = parts.next().map(str::trim) else { continue };
+        let Some(exp)  = parts.next().map(str::trim) else { continue };
+        let expires_ts = parse_expires(exp);
+        map.insert(id.to_string(), User { name: name.to_string(), expires_ts });
+    }
+    map
+}
+
+fn save_users_blocking(users: &HashMap<String, User>) {
+    let tmp = format!("{USERS_PATH}.tmp"); let mut out = String::new();
+    for (id, u) in users { out.push_str(&format!("{id}:{}:{}\n", u.name, u.expires_ts)); }
+    if std::fs::write(&tmp, &out).is_ok() { let _ = std::fs::rename(&tmp, USERS_PATH); }
+}
+
+async fn load_users() -> HashMap<String, User> {
+    tokio::task::spawn_blocking(load_users_blocking).await.unwrap_or_default()
+}
+
+async fn save_users(users: HashMap<String, User>) {
+    let _ = tokio::task::spawn_blocking(move || save_users_blocking(&users)).await;
+}
+
+fn user_row(id: &str, u: &User) -> serde_json::Value {
+    let secs_left = (u.expires_ts - now_secs()).max(0);
+    serde_json::json!({ "id": id, "name": u.name, "expires_ts": u.expires_ts, "secs_left": secs_left, "active": secs_left > 0 })
+}
+
+async fn kick_user(id: String, reason: &'static str) {
+    let url = format!("{KICK_BASE}{id}&reason={reason}");
+    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(&url).send().await; }
+}
+async fn promote_user(id: String) {
+    let url = format!("{PROMOTE_BASE}{id}");
+    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(&url).send().await; }
+}
+
+type ApiResult = (StatusCode, Json<serde_json::Value>);
+fn err_resp(code: StatusCode, msg: &str) -> ApiResult { (code, Json(serde_json::json!({"error": msg}))) }
+
+fn auth_check(state: &AppState, headers: &HeaderMap, addr: &SocketAddr) -> Option<ApiResult> {
+    let ip = addr.ip().to_string();
+    if !state.rate_ok(&ip) { return Some(err_resp(StatusCode::TOO_MANY_REQUESTS, "too many requests")); }
+    if !state.check_token(headers) { return Some(err_resp(StatusCode::UNAUTHORIZED, "unauthorized")); }
+    None
+}
+
+async fn fetch_active_ids() -> std::collections::HashSet<String> {
+    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() {
+        if let Ok(resp) = c.get("http://127.0.0.1:8091/active").send().await {
+            if let Ok(text) = resp.text().await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return val["active"].as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+                }
+            }
+        }
+    }
+    Default::default()
+}
+
+async fn handle_clients(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let active = fetch_active_ids().await;
+    let _l = st.users_mu.lock().await;
+    let users = load_users().await;
+    let rows: Vec<_> = users.iter().map(|(id, u)| {
+        let mut row = user_row(id, u); row["connected"] = serde_json::json!(active.contains(id.as_str())); row
+    }).collect();
+    (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len()})))
+}
+
+async fn handle_client(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Query(p): Query<HashMap<String, String>>) -> ApiResult {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let id = match p.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) { Some(id) => id, None => return err_resp(StatusCode::BAD_REQUEST, "falta id") };
+    let _l = st.users_mu.lock().await;
+    match load_users().await.get(&id).cloned() { Some(u) => (StatusCode::OK, Json(user_row(&id, &u))), None => err_resp(StatusCode::NOT_FOUND, "no encontrado") }
+}
+
+#[derive(Deserialize)] struct CreateBody { id: String, name: Option<String>, days: Option<i64> }
+async fn handle_create(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(body): Json<CreateBody>) -> ApiResult {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    let name = body.name.as_deref().unwrap_or("").trim().to_string(); let name = if name.is_empty() { "sin-nombre".to_string() } else { name };
+    let days = body.days.unwrap_or(30).max(0);
+    let _l = st.users_mu.lock().await;
+    let mut users = load_users().await;
+    if users.contains_key(&id) { return err_resp(StatusCode::CONFLICT, "ya existe"); }
+    let expires_ts = expires_from_days(days);
+    users.insert(id.clone(), User { name: name.clone(), expires_ts });
+    save_users(users).await;
+    drop(_l);
+    tokio::spawn(promote_user(id.clone()));
+    (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
+}
+
+#[derive(Deserialize)] struct IdBody { id: String }
+async fn handle_delete(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(body): Json<IdBody>) -> ApiResult {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    {
+        let _l = st.users_mu.lock().await;
+        let mut users = load_users().await;
+        if !users.contains_key(&id) { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); }
+        users.remove(&id);
+        save_users(users).await;
+    }
+    tokio::spawn(kick_user(id, "kicked"));
+    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+}
+
+#[derive(Deserialize)] struct UpdateBody { id: String, name: Option<String>, new_id: Option<String>, days: Option<i64> }
+async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(body): Json<UpdateBody>) -> ApiResult {
+    if let Some(e) = auth_check(&st, &headers, &addr) { return e; }
+    let id = body.id.trim().to_string(); if id.is_empty() { return err_resp(StatusCode::BAD_REQUEST, "falta id"); }
+    let (final_id, u, kick_old) = {
+        let _l = st.users_mu.lock().await;
+        let mut users = load_users().await;
+        let Some(mut u) = users.get(&id).cloned() else { return err_resp(StatusCode::NOT_FOUND, "no encontrado"); };
+        if let Some(n) = body.name.as_deref() { let n = n.trim(); if !n.is_empty() { u.name = n.to_string(); } }
+        if let Some(d) = body.days { u.expires_ts = expires_from_days(d.max(0)); }
+        let (final_id, kick_old) = match body.new_id.as_deref().map(str::trim) {
+            Some(nid) if !nid.is_empty() && nid != id => { users.remove(&id); (nid.to_string(), true) }
+            _ => (id.clone(), false),
+        };
+        users.insert(final_id.clone(), u.clone());
+        save_users(users).await;
+        (final_id, u, kick_old)
+    };
+    if kick_old { tokio::spawn(kick_user(id, "kicked")); }
+    if u.expires_ts <= now_secs() { tokio::spawn(kick_user(final_id.clone(), "expired")); } else { tokio::spawn(promote_user(final_id.clone())); }
+    (StatusCode::OK, Json(user_row(&final_id, &u)))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
+    let state = AppState::new();
+    let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
+    let ln = TcpListener::bind(PANEL_ADDR).await?;
+    axum::serve(ln, app).await?;
+    Ok(())
+}
+RSEOF
+
+cd "$PROJ"
+cargo build --release
