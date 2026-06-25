@@ -46,7 +46,7 @@ use std::{
     net::SocketAddr,
     os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -76,15 +76,16 @@ const MAX_PAYLOAD:     usize = 32768;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
 
-const T_OPEN:    u8 = 0x01;
-const T_DATA:    u8 = 0x02;
-const T_CLOSE:   u8 = 0x03;
-const T_PING:    u8 = 0x04;
-const T_PONG:    u8 = 0x05;
-const T_KICK:    u8 = 0x06;
-const T_EXPIRED: u8 = 0x07;
-const T_SYNC:    u8 = 0x08;
-const T_WND:     u8 = 0x09;
+const T_OPEN:     u8 = 0x01;
+const T_DATA:     u8 = 0x02;
+const T_CLOSE:    u8 = 0x03;
+const T_PING:     u8 = 0x04;
+const T_PONG:     u8 = 0x05;
+const T_KICK:     u8 = 0x06;
+const T_EXPIRED:  u8 = 0x07;
+const T_SYNC:     u8 = 0x08;
+const T_WND:      u8 = 0x09;
+const T_OPEN_ACK: u8 = 0x0A;
 
 const TCP_QUICKACK: i32 = 12;
 
@@ -240,6 +241,7 @@ struct Stream {
     closed:    AtomicBool,
     tx_window: AtomicI32,
     notify:    Notify,
+    last_seen: AtomicU64,
 }
 
 impl Stream {
@@ -249,6 +251,7 @@ impl Stream {
             closed:    AtomicBool::new(false),
             tx_window: AtomicI32::new(65536),
             notify:    Notify::new(),
+            last_seen: AtomicU64::new(now_secs() as u64),
         })
     }
     #[inline(always)] fn try_close(&self) -> bool {
@@ -387,6 +390,30 @@ async fn write_loop(
     mux.kill();
 }
 
+async fn mux_gc(mux: Arc<Mux>) {
+    let mut interval = time::interval(Duration::from_secs(15));
+    let mut kill_rx = mux.kill_tx.subscribe();
+    loop {
+        tokio::select! {
+            biased;
+            _ = kill_rx.changed() => break,
+            _ = interval.tick() => {
+                let now = now_secs() as u64;
+                let mut to_remove = Vec::new();
+                for entry in mux.streams.iter() {
+                    if now.saturating_sub(entry.value().last_seen.load(Ordering::Relaxed)) > 15 {
+                        to_remove.push(*entry.key());
+                    }
+                }
+                for sid in to_remove {
+                    mux.close_stream_sync(sid);
+                    mux.send_ctrl_async(T_CLOSE, sid).await;
+                }
+            }
+        }
+    }
+}
+
 async fn handle_stream(
     mux:    Arc<Mux>,
     sid:    u32,
@@ -407,6 +434,8 @@ async fn handle_stream(
     tune_hev_fd(hev.as_raw_fd(), mode);
     let (mut hev_r, mut hev_w) = hev.into_split();
 
+    mux.send_ctrl_async(T_OPEN_ACK, sid).await;
+
     if !first.is_empty() {
         if hev_w.write_all(&first).await.is_err() {
             mux.close_stream_sync(sid);
@@ -415,10 +444,6 @@ async fn handle_stream(
         }
     }
 
-    let (close_tx, _) = watch::channel(false);
-    let mut close_rx_c2h = close_tx.subscribe();
-    let close_tx_h2c = close_tx.clone();
-
     let mux_clone = mux.clone();
     let t_c2h = tokio::spawn(async move {
         let mut rx_acked = 0u32;
@@ -426,7 +451,6 @@ async fn handle_stream(
             tokio::select! {
                 biased;
                 _ = kill_rx1.changed() => break,
-                _ = close_rx_c2h.changed() => break,
                 data = rx.recv() => {
                     match data {
                         Some(data) => { 
@@ -476,7 +500,7 @@ async fn handle_stream(
                 }
             }
         }
-        let _ = close_tx_h2c.send(true);
+        mux2.send_ctrl_async(T_CLOSE, sid).await;
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
@@ -514,11 +538,12 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
             T_PING => { mux.send_ctrl_async(T_PONG, sid).await; }
             T_PONG => {}
             T_SYNC => {
+                let now = now_secs() as u64;
                 let mut i = 0;
                 while i + 4 <= ln {
                     let client_sid = u32::from_be_bytes(rbuf[i..i+4].try_into().unwrap());
-                    if !mux.has_stream_sync(client_sid) {
-                        mux.send_ctrl_async(T_CLOSE, client_sid).await;
+                    if let Some(s) = mux.get_stream_sync(client_sid) {
+                        s.last_seen.store(now, Ordering::Relaxed);
                     }
                     i += 4;
                 }
@@ -527,6 +552,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
                 if ln == 4 {
                     let credit = u32::from_be_bytes(rbuf[..4].try_into().unwrap()) as i32;
                     if let Some(s) = mux.get_stream_sync(sid) {
+                        s.last_seen.store(now_secs() as u64, Ordering::Relaxed);
                         s.add_window(credit);
                     }
                 }
@@ -548,6 +574,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
+                        s.last_seen.store(now_secs() as u64, Ordering::Relaxed);
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
                         if s.tx.send(payload).await.is_err() {
                             mux.close_stream_sync(sid);
@@ -635,6 +662,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             sessions.insert(user_id.clone(), mux.clone());
 
             tokio::spawn(write_loop(writer, write_rx, ctrl_rx, kill_rx, mux.clone()));
+            tokio::spawn(mux_gc(mux.clone()));
             mux_run(mux.clone(), reader, mode).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
             mux.kill();
