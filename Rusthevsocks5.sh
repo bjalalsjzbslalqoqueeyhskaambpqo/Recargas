@@ -41,36 +41,32 @@ panic         = "abort"
 TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-use std::{collections::HashMap, net::SocketAddr, os::unix::io::AsRawFd, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, net::SocketAddr, os::unix::io::AsRawFd, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream}, sync::{mpsc, watch, Semaphore}, time};
 
-const HEV_ADDR:        &str = "127.0.0.1:1080";
-const LISTEN_ADDR:     &str = "0.0.0.0:80";
-const KICK_ADDR:       &str = "127.0.0.1:8091";
-const USERS_FILE:      &str = "/opt/btserver/users.txt";
+const HEV_ADDR:      &str = "127.0.0.1:1080";
+const LISTEN_ADDR:   &str = "0.0.0.0:80";
+const KICK_ADDR:     &str = "127.0.0.1:8091";
+const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
 const MAX_STREAMS:     usize = 10000;
-const MAX_PAYLOAD:     usize = 32768;
 const INITIAL_WINDOW:  usize = 4194304;
-const QUEUE_SIZE:      usize = 512;
-const MUX_WRITE_QUEUE: usize = 256;
-const CTRL_QUEUE:      usize = 128;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
 
-const T_SYN:     u8 = 0x01;
-const T_FIN:     u8 = 0x02;
-const T_RST:     u8 = 0x03;
-const T_DATA:    u8 = 0x04;
-const T_WND_UPD: u8 = 0x05;
-const T_PING:    u8 = 0x06;
-const T_PONG:    u8 = 0x07;
-const T_KICK:    u8 = 0x08;
-const T_EXPIRED: u8 = 0x09;
+const CMD_SYN:   u8 = 0x01;
+const CMD_FIN:   u8 = 0x02;
+const CMD_RST:   u8 = 0x03;
+const CMD_DATA:  u8 = 0x04;
+const CMD_WND:   u8 = 0x05;
+const CMD_PING:  u8 = 0x06;
+const CMD_PONG:  u8 = 0x07;
+const CMD_SYNC:  u8 = 0x08;
+const CMD_KICK:  u8 = 0x09;
 
 fn maximize_fd_limit() {
     unsafe {
@@ -125,9 +121,9 @@ fn check_auth_blocking(id: &str) -> AuthResult {
 
 async fn check_auth(id: String) -> AuthResult { tokio::task::spawn_blocking(move || check_auth_blocking(&id)).await.unwrap_or(AuthResult::NotFound) }
 
-#[inline(always)] fn build_frame(t: u8, sid: u32, len: u32, payload: &[u8]) -> Bytes {
+#[inline(always)] fn build_frame(cmd: u8, sid: u32, len: u32, payload: &[u8]) -> Bytes {
     let mut v = Vec::with_capacity(12 + payload.len());
-    v.push(1); v.push(t); v.extend_from_slice(&[0, 0]);
+    v.push(0x42); v.push(0x54); v.push(cmd); v.push(0);
     v.extend_from_slice(&sid.to_be_bytes());
     v.extend_from_slice(&len.to_be_bytes());
     if !payload.is_empty() { v.extend_from_slice(payload); }
@@ -145,7 +141,7 @@ fn tune_client_fd(fd: i32) {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
         let bbr = b"bbr\0"; libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, bbr.as_ptr() as *const _, 3);
-        let huge_buf: i32 = 262144;
+        let huge_buf: i32 = 4194304;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &huge_buf as *const _ as _, 4);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &huge_buf as *const _ as _, 4);
     }
@@ -154,7 +150,7 @@ fn tune_client_fd(fd: i32) {
 fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        let huge_buf: i32 = 262144;
+        let huge_buf: i32 = 4194304;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &huge_buf as *const _ as _, 4);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &huge_buf as *const _ as _, 4);
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
@@ -207,13 +203,13 @@ impl Mux {
     
     #[inline(always)] async fn send_data_async(&self, sid: u32, data: &[u8]) -> bool {
         if self.is_dead() { return false; }
-        if self.write_tx.send(build_frame(T_DATA, sid, data.len() as u32, data)).await.is_err() {
-            self.close_stream_sync(sid); self.send_ctrl_async(T_FIN, sid, 0).await; return false;
+        if self.write_tx.send(build_frame(CMD_DATA, sid, data.len() as u32, data)).await.is_err() {
+            self.close_stream_sync(sid); self.send_ctrl_async(CMD_FIN, sid, 0).await; return false;
         } true
     }
 
-    #[inline(always)] async fn send_ctrl_async(&self, t: u8, sid: u32, len: u32) {
-        if self.is_dead() { return; } let _ = self.ctrl_tx.send(build_frame(t, sid, len, &[])).await;
+    #[inline(always)] async fn send_ctrl_async(&self, cmd: u8, sid: u32, len: u32) {
+        if self.is_dead() { return; } let _ = self.ctrl_tx.send(build_frame(cmd, sid, len, &[])).await;
     }
 
     fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
@@ -230,7 +226,7 @@ impl Mux {
 
 fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
-        let _ = mux.ctrl_tx.try_send(build_frame(reason, 0, 0, &[]));
+        let _ = mux.ctrl_tx.try_send(build_frame(CMD_KICK, 0, reason as u32, &[]));
         mux.kill(); true
     } else { false }
 }
@@ -238,7 +234,7 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
 async fn write_loop(mut writer: OwnedWriteHalf, mut write_rx: mpsc::Receiver<Bytes>, mut ctrl_rx: mpsc::Receiver<Bytes>, mut kill_rx: watch::Receiver<bool>, mux: Arc<Mux>) {
     let mut buf = bytes::BytesMut::with_capacity(65536);
     loop {
-        buf.clear(); if buf.capacity() > 1048576 { buf = bytes::BytesMut::with_capacity(65536); }
+        buf.clear(); if buf.capacity() > 4194304 { buf = bytes::BytesMut::with_capacity(65536); }
         tokio::select! {
             biased;
             _ = kill_rx.changed() => break,
@@ -253,7 +249,7 @@ async fn write_loop(mut writer: OwnedWriteHalf, mut write_rx: mpsc::Receiver<Byt
 
 async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mpsc::Receiver<Bytes>) {
     let mut kill_rx1 = mux.kill_tx.subscribe(); let mut kill_rx2 = mux.kill_tx.subscribe();
-    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(5000), TcpStream::connect(HEV_ADDR)).await else { mux.close_stream_sync(sid); mux.send_ctrl_async(T_RST, sid, 0).await; return; };
+    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(5000), TcpStream::connect(HEV_ADDR)).await else { mux.close_stream_sync(sid); mux.send_ctrl_async(CMD_RST, sid, 0).await; return; };
     tune_hev_fd(hev.as_raw_fd()); let (mut hev_r, mut hev_w) = hev.into_split();
     let (close_tx, _) = watch::channel(false); let mut close_rx_c2h = close_tx.subscribe(); let close_tx_h2c = close_tx.clone(); let mux2 = mux.clone();
 
@@ -265,7 +261,7 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
                     match data { 
                         Some(data) => { 
                             if hev_w.write_all(&data).await.is_err() { break; } 
-                            mux2.send_ctrl_async(T_WND_UPD, sid, data.len() as u32).await;
+                            mux2.send_ctrl_async(CMD_WND, sid, data.len() as u32).await;
                         } 
                         None => break, 
                     } 
@@ -277,7 +273,7 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
 
     let mux3 = mux.clone();
     let t_h2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_PAYLOAD];
+        let mut buf = vec![0u8; 32768];
         loop { 
             tokio::select! { 
                 biased; _ = kill_rx2.changed() => break, 
@@ -298,31 +294,68 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
         let _ = close_tx_h2c.send(true);
     });
 
-    let _ = tokio::join!(t_c2h, t_h2c); mux.close_stream_sync(sid); mux.send_ctrl_async(T_FIN, sid, 0).await;
+    let _ = tokio::join!(t_c2h, t_h2c); mux.close_stream_sync(sid); mux.send_ctrl_async(CMD_FIN, sid, 0).await;
+}
+
+async fn read_frame(reader: &mut OwnedReadHalf) -> Result<(u8, u32, u32, Vec<u8>)> {
+    let mut magic = [0u8; 1];
+    loop {
+        reader.read_exact(&mut magic).await?;
+        if magic[0] == 0x42 {
+            reader.read_exact(&mut magic).await?;
+            if magic[0] == 0x54 { break; }
+        }
+    }
+    let mut hdr = [0u8; 10];
+    reader.read_exact(&mut hdr).await?;
+    let cmd = hdr[0];
+    let sid = u32::from_be_bytes(hdr[2..6].try_into().unwrap());
+    let len = u32::from_be_bytes(hdr[6..10].try_into().unwrap());
+    if len > 2097152 { return Err(anyhow::anyhow!("payload too large")); }
+    let mut payload = vec![0u8; len as usize];
+    if len > 0 { reader.read_exact(&mut payload).await?; }
+    Ok((cmd, sid, len, payload))
 }
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
-    let mut hdr  = [0u8; 12]; let mut rbuf = vec![0u8; MAX_PAYLOAD]; let mut kill_rx = mux.kill_tx.subscribe();
+    let mut kill_rx = mux.kill_tx.subscribe();
     loop {
-        tokio::select! { biased; _ = kill_rx.changed() => break, res = reader.read_exact(&mut hdr) => { if res.is_err() { break; } } }
-        let ft = hdr[1]; let sid = u32::from_be_bytes(hdr[4..8].try_into().unwrap()); let ln = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
-        if ln > (MAX_PAYLOAD as u32) && ft == T_DATA { break; }
-        if ln > 0 && ft == T_DATA { tokio::select! { biased; _ = kill_rx.changed() => break, res = reader.read_exact(&mut rbuf[..ln as usize]) => { if res.is_err() { break; } } } }
-        match ft {
-            T_PING => { mux.send_ctrl_async(T_PONG, sid, ln).await; } T_PONG => {}
-            T_SYN => {
+        let (cmd, sid, len, payload) = tokio::select! {
+            biased;
+            _ = kill_rx.changed() => break,
+            res = read_frame(&mut reader) => {
+                match res { Ok(f) => f, Err(_) => break }
+            }
+        };
+
+        match cmd {
+            CMD_PING => { mux.send_ctrl_async(CMD_PONG, sid, len).await; }
+            CMD_PONG => {}
+            CMD_SYN => {
                 if mux.has_stream_sync(sid) { continue; }
-                let (tx, rx) = mpsc::channel(QUEUE_SIZE); let s = Stream::new(tx);
-                if !mux.add_stream_sync(sid, s.clone()) { mux.send_ctrl_async(T_RST, sid, 0).await; continue; }
+                let (tx, rx) = mpsc::channel(512); let s = Stream::new(tx);
+                if !mux.add_stream_sync(sid, s.clone()) { mux.send_ctrl_async(CMD_RST, sid, 0).await; continue; }
                 tokio::spawn(handle_stream(mux.clone(), sid, s, rx));
             }
-            T_WND_UPD => { if let Some(s) = mux.get_stream_sync(sid) { s.send_window.add_permits(ln as usize); } }
-            T_DATA => {
+            CMD_WND => { if let Some(s) = mux.get_stream_sync(sid) { s.send_window.add_permits(len as usize); } }
+            CMD_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
-                    if !s.is_closed() { let payload = Bytes::copy_from_slice(&rbuf[..ln as usize]); if s.tx.try_send(payload).is_err() { mux.close_stream_sync(sid); mux.send_ctrl_async(T_RST, sid, 0).await; } }
+                    if !s.is_closed() { let pb = Bytes::copy_from_slice(&payload); if s.tx.try_send(pb).is_err() { mux.close_stream_sync(sid); mux.send_ctrl_async(CMD_RST, sid, 0).await; } }
                 }
             }
-            T_FIN | T_RST => { mux.close_stream_sync(sid); } _ => { break; }
+            CMD_SYNC => {
+                if len % 4 == 0 {
+                    let mut client_sids = HashSet::new();
+                    for i in 0..(len as usize / 4) {
+                        let c_sid = u32::from_be_bytes(payload[i*4..i*4+4].try_into().unwrap());
+                        client_sids.insert(c_sid);
+                    }
+                    let mut to_kill = Vec::new();
+                    for r in mux.streams.iter() { if !client_sids.contains(r.key()) { to_kill.push(*r.key()); } }
+                    for k_sid in to_kill { mux.close_stream_sync(k_sid); mux.send_ctrl_async(CMD_RST, k_sid, 0).await; }
+                }
+            }
+            CMD_FIN | CMD_RST => { mux.close_stream_sync(sid); } _ => { break; }
         }
     }
     mux.kill();
@@ -356,7 +389,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
     }
     let raw = &buf[..n];
     let action_str = extract_header(raw, b"action:");
-    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") && action_str != Some("tunnel-gaming") { return; }
+    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") { return; }
     
     tune_client_fd(fd);
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) { Some(id) => id.to_string(), None => return, };
@@ -366,8 +399,8 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
-            let (write_tx, write_rx) = mpsc::channel::<Bytes>(MUX_WRITE_QUEUE);
-            let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(CTRL_QUEUE);
+            let (write_tx, write_rx) = mpsc::channel::<Bytes>(512);
+            let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(256);
             let mux = Mux::new(write_tx, ctrl_tx); let kill_rx = mux.kill_tx.subscribe();
             if let Some((_, prev_mux)) = sessions.remove(&user_id) { prev_mux.kill(); }
             sessions.insert(user_id.clone(), mux.clone());
@@ -406,8 +439,8 @@ async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
     use axum::{extract::{Query, State}, routing::get, Router};
     async fn kick_handler(State(s): State<InternalState>, Query(p): Query<HashMap<String, String>>) -> String {
         let Some(id) = p.get("id").filter(|id| !id.is_empty()) else { return "missing_id".into(); };
-        let reason = if p.get("reason").map(|s| s.as_str()) == Some("expired") { T_EXPIRED } else { T_KICK };
-        if kick_session_sync(&s.sessions, id, reason) { "kicked".into() } else { "not_connected".into() }
+        let reason = if p.get("reason").map(|s| s.as_str()) == Some("expired") { CMD_EXPIRED } else { CMD_KICK };
+        if let Some((_, mux)) = s.sessions.remove(id) { let _ = mux.ctrl_tx.try_send(build_frame(reason, 0, 0, &[])); mux.kill(); "kicked".into() } else { "not_connected".into() }
     }
     async fn active_handler(State(s): State<InternalState>) -> String {
         let ids: Vec<String> = s.sessions.iter().map(|r| r.key().clone()).collect();
@@ -428,8 +461,8 @@ async fn session_monitor(sessions: SessionMap) {
         for id in ids {
             match check_auth(id.clone()).await {
                 AuthResult::Ok { .. } => continue,
-                AuthResult::Expired => { kick_session_sync(&sessions, &id, T_EXPIRED); }
-                AuthResult::NotFound => { kick_session_sync(&sessions, &id, T_KICK); }
+                AuthResult::Expired => { if let Some((_, mux)) = sessions.remove(&id) { let _ = mux.ctrl_tx.try_send(build_frame(CMD_EXPIRED, 0, 0, &[])); mux.kill(); } }
+                AuthResult::NotFound => { if let Some((_, mux)) = sessions.remove(&id) { let _ = mux.ctrl_tx.try_send(build_frame(CMD_KICK, 0, 0, &[])); mux.kill(); } }
             }
         }
     }
