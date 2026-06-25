@@ -73,7 +73,7 @@ const KICK_ADDR:     &str = "127.0.0.1:8091";
 const USERS_FILE:    &str = "/opt/btserver/users.txt";
 
 const MAX_STREAMS:     usize = 10000;
-const MAX_PAYLOAD:     usize = 32768;
+const MAX_PAYLOAD:     usize = 65535;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
 
@@ -331,12 +331,12 @@ async fn write_loop(
     mut kill_rx:  watch::Receiver<bool>,
     mux:          Arc<LinkMux>,
 ) {
-    let mut buf = bytes::BytesMut::with_capacity(32768);
+    let mut buf = bytes::BytesMut::with_capacity(65536);
 
     loop {
         buf.clear();
-        if buf.capacity() > 131072 {
-            buf = bytes::BytesMut::with_capacity(32768);
+        if buf.capacity() > 262144 {
+            buf = bytes::BytesMut::with_capacity(65536);
         }
 
         tokio::select! {
@@ -365,7 +365,7 @@ async fn handle_stream(
     sid:    u32,
     _stream: Arc<Stream>,
     mut rx: mpsc::Receiver<Bytes>,
-    first:  Bytes,
+    chunk_size: usize,
     mode:   TunnelMode,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
@@ -379,14 +379,6 @@ async fn handle_stream(
     
     tune_hev_fd(hev.as_raw_fd(), mode);
     let (mut hev_r, mut hev_w) = hev.into_split();
-
-    if !first.is_empty() {
-        if hev_w.write_all(&first).await.is_err() {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
-            return;
-        }
-    }
 
     let (close_tx, _) = watch::channel(false);
     let mut close_rx_c2h = close_tx.subscribe();
@@ -416,14 +408,14 @@ async fn handle_stream(
     });
 
     let t_h2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; 32768];
+        let mut buf = vec![0u8; chunk_size];
         loop {
             let rtt = mux2.rtt_us.load(Ordering::Relaxed);
-            let mut limit = if mode == TunnelMode::Gaming { 4096 } else { 32768 };
+            let mut limit = chunk_size;
             
-            if rtt > 200_000 { limit = std::cmp::min(limit, 16384); }
-            if rtt > 400_000 { limit = std::cmp::min(limit, 8192);  }
-            if rtt > 800_000 { limit = std::cmp::min(limit, 4096);  }
+            if rtt > 200_000 { limit = std::cmp::min(limit, chunk_size / 2); }
+            if rtt > 400_000 { limit = std::cmp::min(limit, chunk_size / 4); }
+            if limit < 1024 { limit = 1024; }
 
             tokio::select! {
                 biased;
@@ -499,21 +491,27 @@ async fn mux_run(mux: Arc<LinkMux>, mut reader: OwnedReadHalf, mode: TunnelMode)
                 if mux.has_stream_sync(sid) {
                     continue;
                 }
-                let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let queue_size = if mode == TunnelMode::Gaming { 64 } else { 512 };
+                let mut chunk_size: usize = if mode == TunnelMode::Gaming { 4096 } else { 32768 };
+                if ln >= 2 {
+                    chunk_size = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
+                    if chunk_size < 512 { chunk_size = 512; }
+                    if chunk_size > 65535 { chunk_size = 65535; }
+                }
+
+                let queue_size = if mode == TunnelMode::Gaming { 512 } else { 2048 };
                 let (tx, rx) = mpsc::channel(queue_size);
                 let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
                     mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
                     continue;
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, payload, mode));
+                tokio::spawn(handle_stream(mux.clone(), sid, s, rx, chunk_size, mode));
             }
             OP_STRM_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.try_send(payload).is_err() {
+                        if s.tx.send(payload).await.is_err() {
                             mux.close_stream_sync(sid);
                             mux.send_ctrl_async(OP_STRM_CLOSE, sid).await;
                         }
@@ -585,9 +583,9 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-            let mux_write_queue = if mode == TunnelMode::Gaming { 64 } else { 512 };
+            let mux_write_queue = if mode == TunnelMode::Gaming { 512 } else { 2048 };
             let (write_tx, write_rx) = mpsc::channel::<Bytes>(mux_write_queue);
-            let ctrl_queue = if mode == TunnelMode::Gaming { 32 } else { 128 };
+            let ctrl_queue = if mode == TunnelMode::Gaming { 128 } else { 512 };
             let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(ctrl_queue);
             
             let mux = LinkMux::new(write_tx, ctrl_tx);
