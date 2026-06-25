@@ -41,38 +41,21 @@ panic         = "abort"
 TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    os::unix::io::AsRawFd,
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
+use std::{collections::HashMap, net::SocketAddr, os::unix::io::AsRawFd, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
-    sync::{mpsc, watch, Semaphore},
-    time,
-};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream}, sync::{mpsc, watch, Semaphore}, time};
 
-const HEV_ADDR:      &str = "127.0.0.1:1080";
-const LISTEN_ADDR:   &str = "0.0.0.0:80";
-const KICK_ADDR:     &str = "127.0.0.1:8091";
-const USERS_FILE:    &str = "/opt/btserver/users.txt";
+const HEV_ADDR:        &str = "127.0.0.1:1080";
+const LISTEN_ADDR:     &str = "0.0.0.0:80";
+const KICK_ADDR:       &str = "127.0.0.1:8091";
+const USERS_FILE:      &str = "/opt/btserver/users.txt";
 
 const MAX_STREAMS:     usize = 10000;
-const INITIAL_WINDOW:  usize = 1048576;
+const MAX_PAYLOAD:     usize = 32768;
+const INITIAL_WINDOW:  usize = 4194304;
 const QUEUE_SIZE:      usize = 512;
 const MUX_WRITE_QUEUE: usize = 256;
 const CTRL_QUEUE:      usize = 128;
@@ -161,7 +144,6 @@ fn tune_client_fd(fd: i32) {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5);
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   3);
-
         let bbr = b"bbr\0"; libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, bbr.as_ptr() as *const _, 3);
         let huge_buf: i32 = 262144;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &huge_buf as *const _ as _, 4);
@@ -210,7 +192,7 @@ struct Mux {
 impl Mux {
     fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>) -> Arc<Self> {
         let (kill_tx, _) = watch::channel(false);
-        Arc::new(Self { write_tx, ctrl_tx, kill_tx, streams: Arc::new(DashMap::with_capacity(64)), count: AtomicU32::new(0), dead: AtomicBool::new(false) })
+        Arc::new(Self { write_tx, ctrl_tx, kill_tx, streams: Arc::new(DashMap::with_capacity(128)), count: AtomicU32::new(0), dead: AtomicBool::new(false) })
     }
     #[inline(always)] fn kill(&self) {
         if self.dead.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
@@ -254,9 +236,9 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
 }
 
 async fn write_loop(mut writer: OwnedWriteHalf, mut write_rx: mpsc::Receiver<Bytes>, mut ctrl_rx: mpsc::Receiver<Bytes>, mut kill_rx: watch::Receiver<bool>, mux: Arc<Mux>) {
-    let mut buf = bytes::BytesMut::with_capacity(32768);
+    let mut buf = bytes::BytesMut::with_capacity(65536);
     loop {
-        buf.clear(); if buf.capacity() > 1048576 { buf = bytes::BytesMut::with_capacity(32768); }
+        buf.clear(); if buf.capacity() > 1048576 { buf = bytes::BytesMut::with_capacity(65536); }
         tokio::select! {
             biased;
             _ = kill_rx.changed() => break,
@@ -295,13 +277,12 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
 
     let mux3 = mux.clone();
     let t_h2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; MAX_PAYLOAD];
         loop { 
             tokio::select! { 
                 biased; _ = kill_rx2.changed() => break, 
                 permit_res = stream.send_window.acquire() => {
-                    let permit = match permit_res { Ok(p) => p, Err(_) => break };
-                    permit.forget();
+                    let permit = match permit_res { Ok(p) => p, Err(_) => break }; permit.forget();
                     let available = stream.send_window.available_permits() as usize;
                     let to_read = std::cmp::min(buf.len(), available + 1);
                     match hev_r.read(&mut buf[..to_read]).await { 
@@ -321,11 +302,11 @@ async fn handle_stream(mux: Arc<Mux>, sid: u32, stream: Arc<Stream>, mut rx: mps
 }
 
 async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
-    let mut hdr  = [0u8; 12]; let mut rbuf = vec![0u8; 65536]; let mut kill_rx = mux.kill_tx.subscribe();
+    let mut hdr  = [0u8; 12]; let mut rbuf = vec![0u8; MAX_PAYLOAD]; let mut kill_rx = mux.kill_tx.subscribe();
     loop {
         tokio::select! { biased; _ = kill_rx.changed() => break, res = reader.read_exact(&mut hdr) => { if res.is_err() { break; } } }
         let ft = hdr[1]; let sid = u32::from_be_bytes(hdr[4..8].try_into().unwrap()); let ln = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
-        if ln > 65536 && ft == T_DATA { break; }
+        if ln > (MAX_PAYLOAD as u32) && ft == T_DATA { break; }
         if ln > 0 && ft == T_DATA { tokio::select! { biased; _ = kill_rx.changed() => break, res = reader.read_exact(&mut rbuf[..ln as usize]) => { if res.is_err() { break; } } } }
         match ft {
             T_PING => { mux.send_ctrl_async(T_PONG, sid, ln).await; } T_PONG => {}
@@ -375,7 +356,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
     }
     let raw = &buf[..n];
     let action_str = extract_header(raw, b"action:");
-    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") { return; }
+    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") && action_str != Some("tunnel-gaming") { return; }
     
     tune_client_fd(fd);
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) { Some(id) => id.to_string(), None => return, };
