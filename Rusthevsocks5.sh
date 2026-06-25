@@ -58,15 +58,16 @@ const INITIAL_WINDOW:  usize = 4194304;
 const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
 const WAIT_MAX_PER_IP: usize = 3;
 
-const CMD_SYN:   u8 = 0x01;
-const CMD_FIN:   u8 = 0x02;
-const CMD_RST:   u8 = 0x03;
-const CMD_DATA:  u8 = 0x04;
-const CMD_WND:   u8 = 0x05;
-const CMD_PING:  u8 = 0x06;
-const CMD_PONG:  u8 = 0x07;
-const CMD_SYNC:  u8 = 0x08;
-const CMD_KICK:  u8 = 0x09;
+const CMD_SYN:     u8 = 0x01;
+const CMD_FIN:     u8 = 0x02;
+const CMD_RST:     u8 = 0x03;
+const CMD_DATA:    u8 = 0x04;
+const CMD_WND:     u8 = 0x05;
+const CMD_PING:    u8 = 0x06;
+const CMD_PONG:    u8 = 0x07;
+const CMD_SYNC:    u8 = 0x08;
+const CMD_KICK:    u8 = 0x09;
+const CMD_EXPIRED: u8 = 0x0A;
 
 fn maximize_fd_limit() {
     unsafe {
@@ -165,14 +166,8 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
-        Arc::new(Self { tx, send_window: Arc::new(Semaphore::new(INITIAL_WINDOW)), closed: AtomicBool::new(false) })
-    }
-    #[inline(always)] fn try_close(&self) -> bool {
-        if self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            self.send_window.close(); true
-        } else { false }
-    }
+    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> { Arc::new(Self { tx, send_window: Arc::new(Semaphore::new(INITIAL_WINDOW)), closed: AtomicBool::new(false) }) }
+    #[inline(always)] fn try_close(&self) -> bool { if self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() { self.send_window.close(); true } else { false } }
     #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
 }
 
@@ -225,10 +220,7 @@ impl Mux {
 }
 
 fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
-    if let Some((_, mux)) = sessions.remove(id) {
-        let _ = mux.ctrl_tx.try_send(build_frame(CMD_KICK, 0, reason as u32, &[]));
-        mux.kill(); true
-    } else { false }
+    if let Some((_, mux)) = sessions.remove(id) { let _ = mux.ctrl_tx.try_send(build_frame(reason, 0, 0, &[])); mux.kill(); true } else { false }
 }
 
 async fn write_loop(mut writer: OwnedWriteHalf, mut write_rx: mpsc::Receiver<Bytes>, mut ctrl_rx: mpsc::Receiver<Bytes>, mut kill_rx: watch::Receiver<bool>, mux: Arc<Mux>) {
@@ -389,7 +381,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
     }
     let raw = &buf[..n];
     let action_str = extract_header(raw, b"action:");
-    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") { return; }
+    if action_str != Some("tunnel") && action_str != Some("tunnel-tcp") && action_str != Some("tunnel-gaming") { return; }
     
     tune_client_fd(fd);
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) { Some(id) => id.to_string(), None => return, };
