@@ -44,12 +44,6 @@ TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -63,7 +57,6 @@ use tokio::{
 
 const LISTEN_ADDR: &str = "0.0.0.0:80";
 const USERS_FILE:  &str = "/opt/btserver/users.txt";
-const KICK_ADDR:   &str = "127.0.0.1:8091";
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -144,15 +137,15 @@ async fn handle_stream(
         format!("{}:80", authority)
     };
 
-    let Ok(Ok(mut tcp)) = time::timeout(
+    let Ok(Ok(tcp)) = time::timeout(
         Duration::from_millis(3000),
-        TcpStream::connect(&connect_addr)
+        TcpStream::connect(&connect_addr),
     ).await else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR);
         return;
     };
 
-    let (mut tcp_r, mut tcp_w) = tcp.split();
+    let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
@@ -269,7 +262,7 @@ async fn main() -> Result<()> {
             Err(_) => {}
         }
     }
-} 
+}
 RSEOF
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
