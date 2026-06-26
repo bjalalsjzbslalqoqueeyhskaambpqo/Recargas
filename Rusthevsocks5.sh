@@ -44,7 +44,6 @@ TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -52,7 +51,7 @@ use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, oneshot, mpsc},
+    sync::mpsc,
     time,
 };
 use dashmap::DashMap;
@@ -62,8 +61,7 @@ const USERS_FILE:  &str = "/opt/btserver/users.txt";
 const KICK_ADDR:   &str = "127.0.0.1:8091";
 const SOCKS5_LOCAL: &str = "127.0.0.1:1080";
 
-type KickTx = oneshot::Sender<()>;
-type Sessions = Arc<Mutex<HashMap<String, KickTx>>>;
+type Sessions = Arc<DashMap<String, mpsc::Sender<String>>>;
 
 struct Frame { id: u32, data: Vec<u8> }
 
@@ -235,30 +233,27 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
     let is_gaming = extract_header(raw, b"action:").unwrap_or("").trim().eq_ignore_ascii_case("gaming");
     let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
+    let (tx, mut rx) = mpsc::channel::<String>(10);
+    sessions.insert(user_id.clone(), tx);
+
     let auth_res = check_auth(user_id.clone()).await;
     match auth_res {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
-            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
+            if writer.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
             let stream = reader.reunite(writer).unwrap();
-
-            let (kick_tx, mut kick_rx) = oneshot::channel::<()>();
-            {
-                let mut map = sessions.lock().await;
-                if let Some(old_tx) = map.insert(user_id.clone(), kick_tx) { let _ = old_tx.send(()); }
-            }
 
             if is_gaming {
                 tokio::select! {
                     _ = handle_gaming(stream) => {},
-                    _ = &mut kick_rx => {}
+                    _ = rx.recv() => {}
                 }
             } else {
                 let mut preface_buf = [0u8; 24];
                 let mut stream = tokio::io::BufReader::new(stream);
-                if stream.read_exact(&mut preface_buf).await.is_err() { return; }
+                if stream.read_exact(&mut preface_buf).await.is_err() { sessions.remove(&user_id); return; }
                 let mut h2 = match server::Builder::new().initial_connection_window_size(1 << 20).initial_window_size(1 << 20).max_concurrent_streams(4096).handshake(stream).await {
-                    Ok(h) => h, Err(_) => return,
+                    Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
                 };
                 loop {
                     tokio::select! {
@@ -270,19 +265,30 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
                             let resp_tx = match respond.send_response(response, false) { Ok(tx) => tx, Err(_) => continue };
                             tokio::spawn(handle_stream(req.into_body(), resp_tx, authority));
                         }
-                        _ = &mut kick_rx => { break; }
+                        _ = rx.recv() => { break; }
                     }
                 }
             }
-            let mut map = sessions.lock().await; map.remove(&user_id);
         }
         AuthResult::NotFound | AuthResult::Expired => {
             let status = match auth_res { AuthResult::Expired => "expired", _ => "waiting" };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
-            let _ = writer.write_all(resp.as_bytes()).await;
-            tokio::time::sleep(Duration::from_secs(180)).await;
+            if writer.write_all(resp.as_bytes()).await.is_ok() {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        if let Some(m) = msg {
+                            if m == "PROMOTE" { let _ = writer.write_all(b"PROMOTED\n").await; }
+                            else if m.starts_with("KICK:") { let _ = writer.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(180)) => {
+                        let _ = writer.write_all(b"TIMEOUT\n").await;
+                    }
+                }
+            }
         }
     }
+    sessions.remove(&user_id);
 }
 
 async fn internal_server(sessions: Sessions) {
@@ -298,18 +304,21 @@ async fn internal_server(sessions: Sessions) {
 
             if first_line.starts_with("GET /kick?") {
                 let id = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").split_whitespace().next().unwrap_or("");
-                let kicked = { let mut map = sessions.lock().await; if let Some(tx) = map.remove(id) { let _ = tx.send(()); true } else { false } };
+                let reason = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("reason=")).unwrap_or("").split_whitespace().next().unwrap_or("kicked");
+                let kicked = if let Some(tx) = sessions.get(id) { let _ = tx.send(format!("KICK:{}", reason)).await; true } else { false };
                 let body = if kicked { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
             } else if first_line.starts_with("GET /active") {
-                let map = sessions.lock().await;
-                let ids: Vec<_> = map.keys().collect();
+                let ids: Vec<_> = sessions.iter().map(|kv| kv.key().clone()).collect();
                 let body = format!(r#"{{"active":{}}}"#, serde_json::json!(ids));
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
-            } else if first_line.starts_with("GET /promote") {
-                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"ok\":true}";
+            } else if first_line.starts_with("GET /promote?") {
+                let id = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").split_whitespace().next().unwrap_or("");
+                let promoted = if let Some(tx) = sessions.get(id) { let _ = tx.send("PROMOTE".to_string()).await; true } else { false };
+                let body = if promoted { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
             } else {
                 let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -321,7 +330,7 @@ async fn internal_server(sessions: Sessions) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Sessions = Arc::new(DashMap::new());
     tokio::spawn(internal_server(sessions.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
