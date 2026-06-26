@@ -142,13 +142,11 @@ async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<byte
     let _ = tokio::join!(t_up, t_dn);
 }
 
-// --- NUEVO: MUX GAMING LIGERO ---
 async fn handle_gaming(tcp: TcpStream) {
     let (mut tr, mut tw) = tcp.into_split();
     let (tx, mut rx) = mpsc::channel::<Frame>(1024);
     let streams = Arc::new(DashMap::<u32, mpsc::Sender<Vec<u8>>>::new());
 
-    // Tarea que escribe hacia el cliente Android
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let mut hdr = [0u8; 6];
@@ -161,7 +159,6 @@ async fn handle_gaming(tcp: TcpStream) {
         }
     });
 
-    // Bucle que lee desde el cliente Android
     loop {
         let mut hdr = [0u8; 6];
         if tr.read_exact(&mut hdr).await.is_err() { break; }
@@ -179,7 +176,6 @@ async fn handle_gaming(tcp: TcpStream) {
         let sender = if let Some(s) = streams.get(&id) {
             s.clone()
         } else {
-            // Conectar al hev-socks5-server local
             if let Ok(local) = TcpStream::connect(SOCKS5_LOCAL).await {
                 let (mut lr, mut lw) = local.into_split();
                 let (ltx, mut lrx) = mpsc::channel::<Vec<u8>>(32);
@@ -188,7 +184,6 @@ async fn handle_gaming(tcp: TcpStream) {
                 let tx_clone = tx.clone();
                 let streams_clone = streams.clone();
                 
-                // Leer del hev-socks5-server y enviar al túnel
                 tokio::spawn(async move {
                     let mut lbuf = [0u8; 4096];
                     loop {
@@ -201,7 +196,6 @@ async fn handle_gaming(tcp: TcpStream) {
                     streams_clone.remove(&id);
                 });
 
-                // Escribir hacia el hev-socks5-server
                 tokio::spawn(async move {
                     while let Some(data) = lrx.recv().await {
                         if lw.write_all(&data).await.is_err() { break; }
@@ -241,7 +235,8 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
     let is_gaming = extract_header(raw, b"action:").unwrap_or("").trim().eq_ignore_ascii_case("gaming");
     let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
-    match check_auth(user_id.clone()).await {
+    let auth_res = check_auth(user_id.clone()).await;
+    match auth_res {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
@@ -282,9 +277,10 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
             let mut map = sessions.lock().await; map.remove(&user_id);
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let status = match check_auth(user_id).await { AuthResult::Expired => "expired", _ => "waiting" };
+            let status = match auth_res { AuthResult::Expired => "expired", _ => "waiting" };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
             let _ = writer.write_all(resp.as_bytes()).await;
+            tokio::time::sleep(Duration::from_secs(180)).await;
         }
     }
 }
