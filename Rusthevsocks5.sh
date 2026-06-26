@@ -23,8 +23,8 @@ tokio              = { version = "1",    features = ["full"] }
 axum               = { version = "0.8"  }
 bytes              = "1"
 dashmap            = "6"
-h2    = "0.3"
-http  = "0.2"
+h2                 = "0.3"
+http               = "0.2"
 socket2            = { version = "0.5", features = ["all"] }
 libc               = "0.2"
 serde              = { version = "1",   features = ["derive"] }
