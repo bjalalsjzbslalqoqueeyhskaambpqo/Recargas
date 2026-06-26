@@ -85,7 +85,7 @@ const T_KICK:     u8 = 0x06;
 const T_EXPIRED:  u8 = 0x07;
 const T_SYNC:     u8 = 0x08;
 const T_WND:      u8 = 0x09;
-const T_OPEN_ACK: u8 = 0x0A;
+const T_SYNC_RST: u8 = 0x0B;
 
 fn maximize_fd_limit() {
     unsafe {
@@ -113,6 +113,11 @@ type IpCount  = Arc<DashMap<String, usize>>;
 #[inline(always)]
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
+#[inline(always)]
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn parse_expires(s: &str) -> Option<i64> {
@@ -222,9 +227,9 @@ impl Stream {
         Arc::new(Self { 
             tx, 
             closed:    AtomicBool::new(false),
-            tx_window: AtomicI32::new(32768),
+            tx_window: AtomicI32::new(4), // Ventana inicial de 4 chunks
             notify:    Notify::new(),
-            last_seen: AtomicU64::new(now_secs() as u64),
+            last_seen: AtomicU64::new(now_ms()),
         })
     }
     #[inline(always)] fn try_close(&self) -> bool {
@@ -371,10 +376,10 @@ async fn mux_gc(mux: Arc<Mux>) {
             biased;
             _ = kill_rx.changed() => break,
             _ = interval.tick() => {
-                let now = now_secs() as u64;
+                let now = now_ms();
                 let mut to_remove = Vec::new();
                 for entry in mux.streams.iter() {
-                    if now.saturating_sub(entry.value().last_seen.load(Ordering::Relaxed)) > 15 {
+                    if now.saturating_sub(entry.value().last_seen.load(Ordering::Relaxed)) > 15000 {
                         to_remove.push(*entry.key());
                     }
                 }
@@ -406,16 +411,15 @@ async fn handle_stream(
     tune_hev_fd(hev.as_raw_fd());
     let (mut hev_r, mut hev_w) = hev.into_split();
 
-    mux.send_ctrl(T_OPEN_ACK, sid);
-
     if !first.is_empty() {
         if hev_w.write_all(&first).await.is_err() {
             mux.close_stream_sync(sid);
             mux.send_ctrl(T_CLOSE, sid);
             return;
         }
-        // CONFIRMACIÓN DIRECTA: El motor consumió el paquete inicial.
-        mux.send_wnd(sid, first.len() as u32);
+        if first.len() >= 1024 {
+            mux.send_wnd(sid, 1);
+        }
     }
 
     let mux_clone = mux.clone();
@@ -430,8 +434,10 @@ async fn handle_stream(
                             if hev_w.write_all(&data).await.is_err() { 
                                 break; 
                             }
-                            // CONFIRMACIÓN DIRECTA: El motor consumió el paquete, avisamos al cliente al instante.
-                            mux_clone.send_wnd(sid, data.len() as u32);
+                            // CONFIRMACIÓN DIRECTA: El motor consumió el chunk
+                            if data.len() >= 1024 {
+                                mux_clone.send_wnd(sid, 1);
+                            }
                         }
                         None => break,
                     }
@@ -445,9 +451,9 @@ async fn handle_stream(
     let t_h2c = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
-            let current_wnd = loop {
+            loop {
                 let w = s.tx_window.load(Ordering::Acquire);
-                if w > 0 { break w; }
+                if w > 0 { break; }
                 
                 let notified = s.notify.notified();
                 if s.tx_window.load(Ordering::Acquire) > 0 { continue; }
@@ -456,18 +462,18 @@ async fn handle_stream(
                     _ = kill_rx2.changed() => return,
                     _ = notified => {}
                 }
-            };
-
-            let to_read = MAX_PAYLOAD.min(current_wnd as usize);
+            }
 
             tokio::select! {
                 biased;
                 _ = kill_rx2.changed() => break,
-                res = hev_r.read(&mut buf[..to_read]) => {
+                res = hev_r.read(&mut buf) => {
                     match res {
                         Ok(0) | Err(_) => break,
                         Ok(n) => { 
-                            s.tx_window.fetch_sub(n as i32, Ordering::Release);
+                            if n >= 1024 {
+                                s.tx_window.fetch_sub(1, Ordering::Release);
+                            }
                             if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
                         }
                     }
@@ -512,14 +518,14 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_PING => { mux.send_ctrl(T_PONG, sid); }
             T_PONG => {}
             T_SYNC => {
-                let now = now_secs() as u64;
+                let now = now_ms();
                 let mut i = 0;
                 while i + 4 <= ln {
                     let client_sid = u32::from_be_bytes(rbuf[i..i+4].try_into().unwrap());
                     if let Some(s) = mux.get_stream_sync(client_sid) {
                         s.last_seen.store(now, Ordering::Relaxed);
                     } else {
-                        mux.send_ctrl(T_CLOSE, client_sid);
+                        mux.send_ctrl(T_SYNC_RST, client_sid);
                     }
                     i += 4;
                 }
@@ -528,7 +534,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
                 if ln == 4 {
                     let credit = u32::from_be_bytes(rbuf[..4].try_into().unwrap()) as i32;
                     if let Some(s) = mux.get_stream_sync(sid) {
-                        s.last_seen.store(now_secs() as u64, Ordering::Relaxed);
+                        s.last_seen.store(now_ms(), Ordering::Relaxed);
                         s.add_window(credit);
                     }
                 }
@@ -549,9 +555,9 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
-                        s.last_seen.store(now_secs() as u64, Ordering::Relaxed);
+                        s.last_seen.store(now_ms(), Ordering::Relaxed);
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        // Enrutamiento directo: Si falla, se cierra, pero JAMÁS bloquea el mux_run
+                        // Enrutamiento directo sin bloqueo
                         if s.tx.send(payload).is_err() {
                             mux.close_stream_sync(sid);
                             mux.send_ctrl(T_CLOSE, sid);
