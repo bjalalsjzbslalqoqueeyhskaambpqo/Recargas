@@ -23,6 +23,8 @@ tokio              = { version = "1",    features = ["full"] }
 axum               = { version = "0.8"  }
 bytes              = "1"
 dashmap            = "6"
+h2    = "0.3"
+http  = "0.2"
 socket2            = { version = "0.5", features = ["all"] }
 libc               = "0.2"
 serde              = { version = "1",   features = ["derive"] }
@@ -44,80 +46,27 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
-use bytes::Bytes;
-use dashmap::DashMap;
-use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
-    sync::{mpsc, watch, Notify},
+    net::{TcpListener, TcpStream},
     time,
 };
 
-const HEV_ADDR:      &str = "127.0.0.1:1080";
-const LISTEN_ADDR:   &str = "0.0.0.0:80";
-const KICK_ADDR:     &str = "127.0.0.1:8091";
-const USERS_FILE:    &str = "/opt/btserver/users.txt";
+const LISTEN_ADDR: &str = "0.0.0.0:80";
+const USERS_FILE:  &str = "/opt/btserver/users.txt";
+const KICK_ADDR:   &str = "127.0.0.1:8091";
 
-const MAX_STREAMS:     usize = 10000;
-const MAX_PAYLOAD:     usize = 32768;
-const WAIT_TIMEOUT:    Duration = Duration::from_secs(300);
-const WAIT_MAX_PER_IP: usize = 3;
-
-const T_OPEN:     u8 = 0x01;
-const T_DATA:     u8 = 0x02;
-const T_CLOSE:    u8 = 0x03;
-const T_PING:     u8 = 0x04;
-const T_PONG:     u8 = 0x05;
-const T_KICK:     u8 = 0x06;
-const T_EXPIRED:  u8 = 0x07;
-const T_SYNC:     u8 = 0x08;
-const T_WND:      u8 = 0x09;
-const T_SYNC_RST: u8 = 0x0B;
-
-fn maximize_fd_limit() {
-    unsafe {
-        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
-            rl.rlim_cur = rl.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
-        }
-    }
-}
-
-fn valid_id(id: &str) -> bool {
-    if let Some(rest) = id.strip_prefix("S-") {
-        return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric());
-    }
-    if let Some(rest) = id.strip_prefix("STRK-") {
-        return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    false
-}
-
-type WaitRoom = Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>;
-type IpCount  = Arc<DashMap<String, usize>>;
-
-#[inline(always)]
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
-}
-
-#[inline(always)]
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn parse_expires(s: &str) -> Option<i64> {
@@ -130,8 +79,8 @@ fn parse_expires(s: &str) -> Option<i64> {
     if y < 2000 || y > 2100 { return None; }
     let m2 = if m <= 2 { m + 12 } else { m };
     let y2 = if m <= 2 { y - 1 } else { y };
-    let a  = y2 / 100;
-    let b  = 2 - a + a / 4;
+    let a = y2 / 100;
+    let b = 2 - a + a / 4;
     let days = (365.25 * (y2 + 4716) as f64) as i64
         + (30.6001 * (m2 + 1) as f64) as i64
         + d + b - 1524 - 2440588;
@@ -164,412 +113,14 @@ async fn check_auth(id: String) -> AuthResult {
         .unwrap_or(AuthResult::NotFound)
 }
 
-#[inline(always)]
-fn build_ctrl_frame(t: u8, sid: u32) -> Bytes {
-    let mut v = Vec::with_capacity(7);
-    v.push(t);
-    v.extend_from_slice(&sid.to_be_bytes());
-    v.extend_from_slice(&[0, 0]);
-    Bytes::from(v)
-}
-
-#[inline(always)]
-fn build_data_frame(sid: u32, payload: &[u8]) -> Bytes {
-    let mut v = Vec::with_capacity(7 + payload.len());
-    v.push(T_DATA);
-    v.extend_from_slice(&sid.to_be_bytes());
-    v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    v.extend_from_slice(payload);
-    Bytes::from(v)
-}
-
-#[inline(always)]
-unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
-    libc::setsockopt(fd, level, opt, &val as *const i32 as *const libc::c_void, 4);
-}
-
-fn tune_client_fd(fd: i32) {
-    unsafe {
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        let timeout: i32 = 60000;
-        libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   4);
+fn valid_id(id: &str) -> bool {
+    if let Some(rest) = id.strip_prefix("S-") {
+        return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric());
     }
-}
-
-fn tune_hev_fd(fd: i32) {
-    unsafe {
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        let timeout: i32 = 60000;
-        libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
-        setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   4);
-        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
+    if let Some(rest) = id.strip_prefix("STRK-") {
+        return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit());
     }
-}
-
-struct Stream {
-    tx:        mpsc::UnboundedSender<Bytes>,
-    closed:    AtomicBool,
-    tx_window: AtomicI32,
-    notify:    Notify,
-    last_seen: AtomicU64,
-}
-
-impl Stream {
-    fn new(tx: mpsc::UnboundedSender<Bytes>) -> Arc<Self> {
-        Arc::new(Self { 
-            tx, 
-            closed:    AtomicBool::new(false),
-            tx_window: AtomicI32::new(4), // Ventana inicial de 4 chunks
-            notify:    Notify::new(),
-            last_seen: AtomicU64::new(now_ms()),
-        })
-    }
-    #[inline(always)] fn try_close(&self) -> bool {
-        self.closed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok()
-    }
-    #[inline(always)] fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
-
-    #[inline(always)] fn add_window(&self, credit: i32) {
-        self.tx_window.fetch_add(credit, Ordering::Release);
-        self.notify.notify_one();
-    }
-}
-
-struct Mux {
-    write_tx: mpsc::Sender<Bytes>,
-    ctrl_tx:  mpsc::UnboundedSender<Bytes>,
-    kill_tx:  watch::Sender<bool>,
-    streams:  Arc<DashMap<u32, Arc<Stream>>>,
-    count:    AtomicU32,
-    dead:     AtomicBool,
-}
-
-impl Mux {
-    fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::UnboundedSender<Bytes>) -> Arc<Self> {
-        let (kill_tx, _) = watch::channel(false);
-        Arc::new(Self {
-            write_tx, ctrl_tx, kill_tx,
-            streams: Arc::new(DashMap::with_capacity(32)),
-            count:   AtomicU32::new(0),
-            dead:    AtomicBool::new(false),
-        })
-    }
-
-    #[inline(always)] fn kill(&self) {
-        if self.dead.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            let _ = self.kill_tx.send(true);
-            self.streams.clear();
-        }
-    }
-
-    #[inline(always)] fn is_dead(&self) -> bool { self.dead.load(Ordering::Acquire) }
-
-    #[inline(always)] fn has_stream_sync(&self, sid: u32) -> bool {
-        self.streams.contains_key(&sid)
-    }
-
-    #[inline(always)] fn get_stream_sync(&self, sid: u32) -> Option<Arc<Stream>> {
-        self.streams.get(&sid).map(|r| r.clone())
-    }
-
-    #[inline(always)] async fn send_data_async(&self, sid: u32, data: &[u8]) -> bool {
-        if self.is_dead() { return false; }
-        if self.write_tx.send(build_data_frame(sid, data)).await.is_err() {
-            self.close_stream_sync(sid);
-            self.send_ctrl(T_CLOSE, sid);
-            return false;
-        }
-        true
-    }
-
-    #[inline(always)] fn send_ctrl(&self, t: u8, sid: u32) {
-        if self.is_dead() { return; }
-        let _ = self.ctrl_tx.send(build_ctrl_frame(t, sid));
-    }
-
-    #[inline(always)] fn send_wnd(&self, sid: u32, credit: u32) {
-        if self.is_dead() { return; }
-        let mut v = Vec::with_capacity(11);
-        v.push(T_WND);
-        v.extend_from_slice(&sid.to_be_bytes());
-        v.extend_from_slice(&4u16.to_be_bytes());
-        v.extend_from_slice(&credit.to_be_bytes());
-        let _ = self.ctrl_tx.send(Bytes::from(v));
-    }
-
-    fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
-        if self.count.load(Ordering::Relaxed) as usize >= MAX_STREAMS { return false; }
-        self.streams.insert(sid, s);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
-    fn close_stream_sync(&self, sid: u32) {
-        if let Some((_, s)) = self.streams.remove(&sid) {
-            s.try_close();
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-}
-
-type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
-
-fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
-    if let Some((_, mux)) = sessions.remove(id) {
-        mux.send_ctrl(reason, 0);
-        mux.kill();
-        true
-    } else {
-        false
-    }
-}
-
-async fn write_loop(
-    mut writer:   OwnedWriteHalf,
-    mut write_rx: mpsc::Receiver<Bytes>,
-    mut ctrl_rx:  mpsc::UnboundedReceiver<Bytes>,
-    mut kill_rx:  watch::Receiver<bool>,
-    mux:          Arc<Mux>,
-) {
-    let mut buf = bytes::BytesMut::with_capacity(32768);
-
-    loop {
-        buf.clear();
-        if buf.capacity() > 131072 {
-            buf = bytes::BytesMut::with_capacity(32768);
-        }
-
-        tokio::select! {
-            biased;
-            _ = kill_rx.changed() => break,
-            frame = ctrl_rx.recv() => {
-                let Some(f) = frame else { break; };
-                buf.extend_from_slice(&f);
-                while let Ok(f) = ctrl_rx.try_recv() { buf.extend_from_slice(&f); }
-            }
-            frame = write_rx.recv() => {
-                let Some(f) = frame else { break; };
-                buf.extend_from_slice(&f);
-                while let Ok(f) = write_rx.try_recv() { buf.extend_from_slice(&f); }
-            }
-        }
-
-        if buf.is_empty() { continue; }
-        if writer.write_all(&buf).await.is_err() { break; }
-    }
-    mux.kill();
-}
-
-async fn mux_gc(mux: Arc<Mux>) {
-    let mut interval = time::interval(Duration::from_secs(15));
-    let mut kill_rx = mux.kill_tx.subscribe();
-    loop {
-        tokio::select! {
-            biased;
-            _ = kill_rx.changed() => break,
-            _ = interval.tick() => {
-                let now = now_ms();
-                let mut to_remove = Vec::new();
-                for entry in mux.streams.iter() {
-                    if now.saturating_sub(entry.value().last_seen.load(Ordering::Relaxed)) > 15000 {
-                        to_remove.push(*entry.key());
-                    }
-                }
-                for sid in to_remove {
-                    mux.close_stream_sync(sid);
-                    mux.send_ctrl(T_CLOSE, sid);
-                }
-            }
-        }
-    }
-}
-
-async fn handle_stream(
-    mux:    Arc<Mux>,
-    sid:    u32,
-    s:      Arc<Stream>,
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
-    first:  Bytes,
-) {
-    let mut kill_rx1 = mux.kill_tx.subscribe();
-    let mut kill_rx2 = mux.kill_tx.subscribe();
-
-    let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
-        mux.close_stream_sync(sid);
-        mux.send_ctrl(T_CLOSE, sid);
-        return;
-    };
-    
-    tune_hev_fd(hev.as_raw_fd());
-    let (mut hev_r, mut hev_w) = hev.into_split();
-
-    if !first.is_empty() {
-        if hev_w.write_all(&first).await.is_err() {
-            mux.close_stream_sync(sid);
-            mux.send_ctrl(T_CLOSE, sid);
-            return;
-        }
-        if first.len() >= 1024 {
-            mux.send_wnd(sid, 1);
-        }
-    }
-
-    let mux_clone = mux.clone();
-    let t_c2h = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = kill_rx1.changed() => break,
-                data = rx.recv() => {
-                    match data {
-                        Some(data) => { 
-                            if hev_w.write_all(&data).await.is_err() { 
-                                break; 
-                            }
-                            // CONFIRMACIÓN DIRECTA: El motor consumió el chunk
-                            if data.len() >= 1024 {
-                                mux_clone.send_wnd(sid, 1);
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        let _ = hev_w.shutdown().await;
-    });
-
-    let mux2 = mux.clone();
-    let t_h2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_PAYLOAD];
-        loop {
-            loop {
-                let w = s.tx_window.load(Ordering::Acquire);
-                if w > 0 { break; }
-                
-                let notified = s.notify.notified();
-                if s.tx_window.load(Ordering::Acquire) > 0 { continue; }
-                
-                tokio::select! {
-                    _ = kill_rx2.changed() => return,
-                    _ = notified => {}
-                }
-            }
-
-            tokio::select! {
-                biased;
-                _ = kill_rx2.changed() => break,
-                res = hev_r.read(&mut buf) => {
-                    match res {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => { 
-                            if n >= 1024 {
-                                s.tx_window.fetch_sub(1, Ordering::Release);
-                            }
-                            if !mux2.send_data_async(sid, &buf[..n]).await { break; } 
-                        }
-                    }
-                }
-            }
-        }
-        mux2.send_ctrl(T_CLOSE, sid);
-    });
-
-    let _ = tokio::join!(t_c2h, t_h2c);
-    mux.close_stream_sync(sid);
-    mux.send_ctrl(T_CLOSE, sid);
-}
-
-async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
-    let mut hdr  = [0u8; 7];
-    let mut rbuf = vec![0u8; MAX_PAYLOAD];
-    let mut kill_rx = mux.kill_tx.subscribe();
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = kill_rx.changed() => break,
-            res = reader.read_exact(&mut hdr) => { if res.is_err() { break; } }
-        }
-
-        let ft  = hdr[0];
-        let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
-        let ln  = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
-        
-        if ln > MAX_PAYLOAD { break; }
-
-        if ln > 0 {
-            tokio::select! {
-                biased;
-                _ = kill_rx.changed() => break,
-                res = reader.read_exact(&mut rbuf[..ln]) => { if res.is_err() { break; } }
-            }
-        }
-
-        match ft {
-            T_PING => { mux.send_ctrl(T_PONG, sid); }
-            T_PONG => {}
-            T_SYNC => {
-                let now = now_ms();
-                let mut i = 0;
-                while i + 4 <= ln {
-                    let client_sid = u32::from_be_bytes(rbuf[i..i+4].try_into().unwrap());
-                    if let Some(s) = mux.get_stream_sync(client_sid) {
-                        s.last_seen.store(now, Ordering::Relaxed);
-                    } else {
-                        mux.send_ctrl(T_SYNC_RST, client_sid);
-                    }
-                    i += 4;
-                }
-            }
-            T_WND => {
-                if ln == 4 {
-                    let credit = u32::from_be_bytes(rbuf[..4].try_into().unwrap()) as i32;
-                    if let Some(s) = mux.get_stream_sync(sid) {
-                        s.last_seen.store(now_ms(), Ordering::Relaxed);
-                        s.add_window(credit);
-                    }
-                }
-            }
-            T_OPEN => {
-                if mux.has_stream_sync(sid) {
-                    continue;
-                }
-                let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let (tx, rx) = mpsc::unbounded_channel();
-                let s = Stream::new(tx);
-                if !mux.add_stream_sync(sid, s.clone()) {
-                    mux.send_ctrl(T_CLOSE, sid);
-                    continue;
-                }
-                tokio::spawn(handle_stream(mux.clone(), sid, s.clone(), rx, payload));
-            }
-            T_DATA => {
-                if let Some(s) = mux.get_stream_sync(sid) {
-                    if !s.is_closed() {
-                        s.last_seen.store(now_ms(), Ordering::Relaxed);
-                        let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        // Enrutamiento directo sin bloqueo
-                        if s.tx.send(payload).is_err() {
-                            mux.close_stream_sync(sid);
-                            mux.send_ctrl(T_CLOSE, sid);
-                        }
-                    }
-                }
-            }
-            T_CLOSE => { mux.close_stream_sync(sid); }
-            _ => { break; }
-        }
-    }
-    mux.kill();
+    false
 }
 
 fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
@@ -582,13 +133,57 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     None
 }
 
-async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, ip_count: IpCount) {
-    let peer_ip = tcp.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+async fn handle_stream(
+    mut req: h2::RecvStream,
+    mut resp_tx: h2::SendStream<bytes::Bytes>,
+    authority: String,
+) {
+    let connect_addr = if authority.contains(':') {
+        authority.clone()
+    } else {
+        format!("{}:80", authority)
+    };
+
+    let Ok(Ok(mut tcp)) = time::timeout(
+        Duration::from_millis(3000),
+        TcpStream::connect(&connect_addr)
+    ).await else {
+        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR);
+        return;
+    };
+
+    let (mut tcp_r, mut tcp_w) = tcp.split();
+
+    let t_up = tokio::spawn(async move {
+        while let Some(Ok(chunk)) = req.data().await {
+            let _ = req.flow_control().release_capacity(chunk.len());
+            if tcp_w.write_all(&chunk).await.is_err() { break; }
+        }
+        let _ = tcp_w.shutdown().await;
+    });
+
+    let t_dn = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            match tcp_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    if resp_tx.send_data(data, false).is_err() { break; }
+                }
+            }
+        }
+        let _ = resp_tx.send_data(bytes::Bytes::new(), true);
+    });
+
+    let _ = tokio::join!(t_up, t_dn);
+}
+
+async fn handle_conn(tcp: TcpStream) {
     let mut buf = vec![0u8; 8192];
-    let mut n   = 0usize;
+    let mut n = 0usize;
     let deadline = time::Instant::now() + Duration::from_secs(10);
-    
-    let fd = tcp.as_raw_fd();
+
     let (mut reader, mut writer) = tcp.into_split();
 
     loop {
@@ -598,14 +193,13 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             Ok(nr) => {
                 n += nr;
                 let raw = &buf[..n];
-                if raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:")) && raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:"))
+                    && raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
             }
         }
     }
 
     let raw = &buf[..n];
-    
-    tune_client_fd(fd);
 
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
@@ -621,124 +215,61 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-            let (write_tx, write_rx) = mpsc::channel::<Bytes>(1024);
-            let (ctrl_tx,  ctrl_rx)  = mpsc::unbounded_channel::<Bytes>();
-            
-            let mux = Mux::new(write_tx, ctrl_tx);
-            let kill_rx = mux.kill_tx.subscribe();
+            let stream = reader.reunite(writer).unwrap();
 
-            if let Some((_, prev_mux)) = sessions.remove(&user_id) {
-                prev_mux.send_ctrl(T_KICK, 0);
-                prev_mux.kill();
+            let mut h2 = match server::handshake(stream).await {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+
+            while let Some(result) = h2.accept().await {
+                let (req, mut respond) = match result {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+
+                let authority = req.uri()
+                    .authority()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+
+                if authority.is_empty() { continue; }
+
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .unwrap();
+
+                let resp_tx = match respond.send_response(response, false) {
+                    Ok(tx) => tx,
+                    Err(_) => continue,
+                };
+
+                let body = req.into_body();
+                tokio::spawn(handle_stream(body, resp_tx, authority));
             }
-
-            sessions.insert(user_id.clone(), mux.clone());
-
-            tokio::spawn(write_loop(writer, write_rx, ctrl_rx, kill_rx, mux.clone()));
-            tokio::spawn(mux_gc(mux.clone()));
-            mux_run(mux.clone(), reader).await;
-            sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
-            mux.kill();
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let ip_conns = ip_count.get(&peer_ip).map(|v| *v).unwrap_or(0);
-            if ip_conns >= WAIT_MAX_PER_IP { return; }
-            let status = match check_auth(user_id.clone()).await { AuthResult::Expired => "expired", _ => "waiting" };
+            let status = match check_auth(user_id).await {
+                AuthResult::Expired => "expired",
+                _ => "waiting",
+            };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
-            if writer.write_all(resp.as_bytes()).await.is_err() { return; }
-            wait_room(writer, reader, user_id, peer_ip, waitroom, ip_count).await;
+            let _ = writer.write_all(resp.as_bytes()).await;
         }
     }
-}
-
-async fn wait_room(mut writer: OwnedWriteHalf, mut reader: OwnedReadHalf, user_id: String, ip: String, waitroom: WaitRoom, ip_count: IpCount) {
-    let activated_msg = b"{\"status\":\"activated\"}\n";
-    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<()>();
-    if let Some(prev_tx) = waitroom.insert(user_id.clone(), promote_tx) { let _ = prev_tx.send(()); }
-    *ip_count.entry(ip.clone()).or_insert(0) += 1;
-
-    let result = tokio::select! {
-        _ = promote_rx => "promoted",
-        _ = time::sleep(WAIT_TIMEOUT) => "timeout",
-        _ = async {
-            let mut drain = [0u8; 256];
-            loop { if reader.read(&mut drain).await.unwrap_or(0) == 0 { break; } }
-        } => "disconnected",
-    };
-
-    if result == "promoted" { let _ = writer.write_all(activated_msg).await; }
-    waitroom.remove(&user_id);
-    ip_count.entry(ip).and_modify(|c| { if *c > 0 { *c -= 1; } });
-}
-
-#[derive(Clone)] struct InternalState { sessions: SessionMap, waitroom: WaitRoom }
-
-async fn kick_api(sessions: SessionMap, waitroom: WaitRoom) {
-    use axum::{extract::{Query, State}, routing::get, Router};
-    async fn kick_handler(State(s): State<InternalState>, Query(p): Query<HashMap<String, String>>) -> String {
-        let Some(id) = p.get("id").filter(|id| !id.is_empty()) else { return "missing_id".into(); };
-        let reason = if p.get("reason").map(|s| s.as_str()) == Some("expired") { T_EXPIRED } else { T_KICK };
-        if kick_session_sync(&s.sessions, id, reason) { "kicked".into() } else { "not_connected".into() }
-    }
-    async fn active_handler(State(s): State<InternalState>) -> String {
-        let ids: Vec<String> = s.sessions.iter().filter(|r| !r.value().is_dead()).map(|r| r.key().clone()).collect();
-        serde_json::json!({ "active": ids, "count": ids.len() }).to_string()
-    }
-    async fn promote_handler(State(s): State<InternalState>, Query(p): Query<HashMap<String, String>>) -> String {
-        let Some(id) = p.get("id").filter(|id| !id.is_empty()) else { return "missing_id".into(); };
-        if let Some((_, tx)) = s.waitroom.remove(id.as_str()) { let _ = tx.send(()); "promoted".into() } else { "not_waiting".into() }
-    }
-    let state = InternalState { sessions, waitroom };
-    let app = Router::new().route("/kick", get(kick_handler)).route("/active", get(active_handler)).route("/promote", get(promote_handler)).with_state(state);
-    let ln = TcpListener::bind(KICK_ADDR).await.expect("kick bind");
-    axum::serve(ln, app).await.expect("kick serve");
-}
-
-async fn session_monitor(sessions: SessionMap) {
-    loop {
-        time::sleep(Duration::from_secs(60)).await;
-        let ids: Vec<String> = sessions.iter().map(|r| r.key().clone()).collect();
-        for id in ids {
-            match check_auth(id.clone()).await {
-                AuthResult::Ok { .. } => continue,
-                AuthResult::Expired => { kick_session_sync(&sessions, &id, T_EXPIRED); }
-                AuthResult::NotFound => { kick_session_sync(&sessions, &id, T_KICK); }
-            }
-        }
-    }
-}
-
-fn build_listener() -> std::io::Result<std::net::TcpListener> {
-    let addr: SocketAddr = LISTEN_ADDR.parse().unwrap();
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    sock.set_reuse_address(true)?; sock.set_reuse_port(true)?; sock.set_nodelay(true)?;
-    
-    let ka = TcpKeepalive::new().with_time(Duration::from_secs(15)).with_interval(Duration::from_secs(5));
-    sock.set_tcp_keepalive(&ka)?;
-    
-    unsafe { libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &1i32 as *const _ as _, 4); }
-    sock.set_nonblocking(true)?; sock.bind(&addr.into())?; sock.listen(65535)?;
-    Ok(sock.into())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    maximize_fd_limit();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("btserver=info".parse()?)).init();
-    let sessions: SessionMap = Arc::new(DashMap::new());
-    let waitroom: WaitRoom   = Arc::new(DashMap::new());
-    let ip_count: IpCount    = Arc::new(DashMap::new());
-    tokio::spawn(kick_api(sessions.clone(), waitroom.clone()));
-    tokio::spawn(session_monitor(sessions.clone()));
-    let std_ln = build_listener().expect("listener");
-    let listener = TcpListener::from_std(std_ln).expect("tokio listener");
+    let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
         match listener.accept().await {
-            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone(), waitroom.clone(), ip_count.clone())); }
+            Ok((conn, _)) => { tokio::spawn(handle_conn(conn)); }
             Err(_) => {}
         }
     }
-}
+} 
 RSEOF
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
