@@ -43,20 +43,25 @@ panic         = "abort"
 TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-use std::{
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::{Mutex, oneshot},
     time,
 };
 
 const LISTEN_ADDR: &str = "0.0.0.0:80";
 const USERS_FILE:  &str = "/opt/btserver/users.txt";
+const KICK_ADDR:   &str = "127.0.0.1:8091";
+
+type KickTx = oneshot::Sender<()>;
+type Sessions = Arc<Mutex<HashMap<String, KickTx>>>;
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -172,7 +177,7 @@ async fn handle_stream(
     let _ = tokio::join!(t_up, t_dn);
 }
 
-async fn handle_conn(tcp: TcpStream) {
+async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
     let mut buf = vec![0u8; 8192];
     let mut n = 0usize;
     let deadline = time::Instant::now() + Duration::from_secs(10);
@@ -215,32 +220,50 @@ async fn handle_conn(tcp: TcpStream) {
                 Err(_) => return,
             };
 
-            while let Some(result) = h2.accept().await {
-                let (req, mut respond) = match result {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-
-                let authority = req.uri()
-                    .authority()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
-
-                if authority.is_empty() { continue; }
-
-                let response = http::Response::builder()
-                    .status(200)
-                    .body(())
-                    .unwrap();
-
-                let resp_tx = match respond.send_response(response, false) {
-                    Ok(tx) => tx,
-                    Err(_) => continue,
-                };
-
-                let body = req.into_body();
-                tokio::spawn(handle_stream(body, resp_tx, authority));
+            let (kick_tx, mut kick_rx) = oneshot::channel::<()>();
+            {
+                let mut map = sessions.lock().await;
+                if let Some(old_tx) = map.insert(user_id.clone(), kick_tx) {
+                    let _ = old_tx.send(());
+                }
             }
+
+            loop {
+                tokio::select! {
+                    result = h2.accept() => {
+                        let (req, mut respond) = match result {
+                            Some(Ok(r)) => r,
+                            _ => break,
+                        };
+
+                        let authority = req.uri()
+                            .authority()
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+
+                        if authority.is_empty() { continue; }
+
+                        let response = http::Response::builder()
+                            .status(200)
+                            .body(())
+                            .unwrap();
+
+                        let resp_tx = match respond.send_response(response, false) {
+                            Ok(tx) => tx,
+                            Err(_) => continue,
+                        };
+
+                        let body = req.into_body();
+                        tokio::spawn(handle_stream(body, resp_tx, authority));
+                    }
+                    _ = &mut kick_rx => {
+                        break;
+                    }
+                }
+            }
+
+            let mut map = sessions.lock().await;
+            map.remove(&user_id);
         }
         AuthResult::NotFound | AuthResult::Expired => {
             let status = match check_auth(user_id).await {
@@ -253,12 +276,58 @@ async fn handle_conn(tcp: TcpStream) {
     }
 }
 
+async fn internal_server(sessions: Sessions) {
+    let listener = TcpListener::bind(KICK_ADDR).await.expect("fallo 8091");
+    loop {
+        let Ok((mut tcp, _)) = listener.accept().await else { continue };
+        let sessions = sessions.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let Ok(n) = tcp.read(&mut buf).await else { return };
+            let raw = &buf[..n];
+            let first_line = raw.split(|&b| b == b'\n').next().unwrap_or(b"");
+            let first_line = std::str::from_utf8(first_line).unwrap_or("").trim();
+
+            if first_line.starts_with("GET /kick?") {
+                let id = first_line
+                    .split('?').nth(1).unwrap_or("")
+                    .split('&').find_map(|p| p.strip_prefix("id="))
+                    .unwrap_or("").split_whitespace().next().unwrap_or("");
+                let kicked = {
+                    let mut map = sessions.lock().await;
+                    if let Some(tx) = map.remove(id) { let _ = tx.send(()); true } else { false }
+                };
+                let body = if kicked { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let _ = tcp.write_all(resp.as_bytes()).await;
+
+            } else if first_line.starts_with("GET /active") {
+                let map = sessions.lock().await;
+                let ids: Vec<_> = map.keys().collect();
+                let body = format!(r#"{{"active":{}}}"#, serde_json::json!(ids));
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let _ = tcp.write_all(resp.as_bytes()).await;
+
+            } else if first_line.starts_with("GET /promote") {
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"ok\":true}";
+                let _ = tcp.write_all(resp.as_bytes()).await;
+
+            } else {
+                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                let _ = tcp.write_all(resp.as_bytes()).await;
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(internal_server(sessions.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
         match listener.accept().await {
-            Ok((conn, _)) => { tokio::spawn(handle_conn(conn)); }
+            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone())); }
             Err(_) => {}
         }
     }
