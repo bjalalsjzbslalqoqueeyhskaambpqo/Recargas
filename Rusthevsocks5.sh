@@ -215,7 +215,13 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
 
             let stream = reader.reunite(writer).unwrap();
 
-            let mut h2 = match server::handshake(stream).await {
+            let mut h2 = match server::Builder::new()
+                .initial_connection_window_size(1 << 20)
+                .initial_window_size(1 << 20)
+                .max_concurrent_streams(4096)
+                .handshake(stream)
+                .await
+            {
                 Ok(h) => h,
                 Err(_) => return,
             };
