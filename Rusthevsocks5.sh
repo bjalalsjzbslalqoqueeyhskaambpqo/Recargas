@@ -414,11 +414,12 @@ async fn handle_stream(
             mux.send_ctrl(T_CLOSE, sid);
             return;
         }
+        // CONFIRMACIÓN DIRECTA: El motor consumió el paquete inicial.
+        mux.send_wnd(sid, first.len() as u32);
     }
 
     let mux_clone = mux.clone();
     let t_c2h = tokio::spawn(async move {
-        let mut rx_acked = 0u32;
         loop {
             tokio::select! {
                 biased;
@@ -429,11 +430,8 @@ async fn handle_stream(
                             if hev_w.write_all(&data).await.is_err() { 
                                 break; 
                             }
-                            rx_acked += data.len() as u32;
-                            if rx_acked >= 4096 { // Confirmación rápida cada 4KB
-                                mux_clone.send_wnd(sid, rx_acked);
-                                rx_acked = 0;
-                            }
+                            // CONFIRMACIÓN DIRECTA: El motor consumió el paquete, avisamos al cliente al instante.
+                            mux_clone.send_wnd(sid, data.len() as u32);
                         }
                         None => break,
                     }
@@ -447,15 +445,20 @@ async fn handle_stream(
     let t_h2c = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
-            while s.tx_window.load(Ordering::Acquire) <= 0 {
+            let current_wnd = loop {
+                let w = s.tx_window.load(Ordering::Acquire);
+                if w > 0 { break w; }
+                
+                let notified = s.notify.notified();
+                if s.tx_window.load(Ordering::Acquire) > 0 { continue; }
+                
                 tokio::select! {
                     _ = kill_rx2.changed() => return,
-                    _ = s.notify.notified() => {}
+                    _ = notified => {}
                 }
-            }
+            };
 
-            let current_wnd = s.tx_window.load(Ordering::Acquire).max(1) as usize;
-            let to_read = MAX_PAYLOAD.min(current_wnd);
+            let to_read = MAX_PAYLOAD.min(current_wnd as usize);
 
             tokio::select! {
                 biased;
