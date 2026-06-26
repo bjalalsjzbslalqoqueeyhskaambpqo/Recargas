@@ -114,11 +114,27 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     None
 }
 
-async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<bytes::Bytes>, authority: String) {
-    let connect_addr = if authority.contains(':') { authority.clone() } else { format!("{}:80", authority) };
-    let Ok(Ok(tcp)) = time::timeout(Duration::from_millis(3000), TcpStream::connect(&connect_addr)).await else {
+async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<bytes::Bytes>, authority: String, udp_cmd: Option<u8>) {
+    let tcp_result = if udp_cmd.is_some() {
+        time::timeout(Duration::from_millis(3000), TcpStream::connect(SOCKS5_LOCAL)).await
+    } else {
+        let connect_addr = if authority.contains(':') { authority.clone() } else { format!("{}:80", authority) };
+        time::timeout(Duration::from_millis(3000), TcpStream::connect(&connect_addr)).await
+    };
+
+    let Ok(Ok(mut tcp)) = tcp_result else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
+
+    if let Some(cmd) = udp_cmd {
+        if tcp.write_all(&[0x05, 0x01, 0x00]).await.is_err() { return; }
+        let mut rep1 = [0u8; 2];
+        if tcp.read_exact(&mut rep1).await.is_err() || rep1[1] != 0x00 { return; }
+        if tcp.write_all(&[0x05, cmd, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await.is_err() { return; }
+        let mut rep2 = [0u8; 10];
+        if tcp.read_exact(&mut rep2).await.is_err() || rep2[1] != 0x00 { return; }
+    }
+
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
@@ -261,9 +277,10 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
                             let (req, mut respond) = match result { Some(Ok(r)) => r, _ => break };
                             let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
                             if authority.is_empty() { continue; }
+                            let udp_cmd = req.headers().get("x-udp-cmd").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u8>().ok());
                             let response = http::Response::builder().status(200).body(()).unwrap();
                             let resp_tx = match respond.send_response(response, false) { Ok(tx) => tx, Err(_) => continue };
-                            tokio::spawn(handle_stream(req.into_body(), resp_tx, authority));
+                            tokio::spawn(handle_stream(req.into_body(), resp_tx, authority, udp_cmd));
                         }
                         _ = rx.recv() => { break; }
                     }
@@ -271,20 +288,18 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
             }
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let resp = format!("{resp_101}\r\n");
+            let status = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
+            let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_ok() {
-                let status = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
-                if writer.write_all(format!("WAITING:{}\n", status).as_bytes()).await.is_ok() {
-                    tokio::select! {
-                        msg = rx.recv() => {
-                            if let Some(m) = msg {
-                                if m == "PROMOTE" { let _ = writer.write_all(b"PROMOTED\n").await; }
-                                else if m.starts_with("KICK:") { let _ = writer.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
-                            }
+                tokio::select! {
+                    msg = rx.recv() => {
+                        if let Some(m) = msg {
+                            if m == "PROMOTE" { let _ = writer.write_all(b"PROMOTED\n").await; }
+                            else if m.starts_with("KICK:") { let _ = writer.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(180)) => {
-                            let _ = writer.write_all(b"TIMEOUT\n").await;
-                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(180)) => {
+                        let _ = writer.write_all(b"TIMEOUT\n").await;
                     }
                 }
             }
