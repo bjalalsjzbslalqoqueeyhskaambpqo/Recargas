@@ -52,36 +52,32 @@ use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, oneshot, mpsc},
     time,
 };
+use dashmap::DashMap;
 
 const LISTEN_ADDR: &str = "0.0.0.0:80";
 const USERS_FILE:  &str = "/opt/btserver/users.txt";
 const KICK_ADDR:   &str = "127.0.0.1:8091";
+const SOCKS5_LOCAL: &str = "127.0.0.1:1080";
 
 type KickTx = oneshot::Sender<()>;
 type Sessions = Arc<Mutex<HashMap<String, KickTx>>>;
 
-fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
-}
+struct Frame { id: u32, data: Vec<u8> }
+
+fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 
 fn parse_expires(s: &str) -> Option<i64> {
     let s = s.trim();
     if let Ok(ts) = s.parse::<i64>() { return Some(ts); }
     let mut it = s.splitn(3, '-');
-    let y: i64 = it.next()?.parse().ok()?;
-    let m: i64 = it.next()?.parse().ok()?;
-    let d: i64 = it.next()?.parse().ok()?;
+    let y: i64 = it.next()?.parse().ok()?; let m: i64 = it.next()?.parse().ok()?; let d: i64 = it.next()?.parse().ok()?;
     if y < 2000 || y > 2100 { return None; }
-    let m2 = if m <= 2 { m + 12 } else { m };
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let a = y2 / 100;
-    let b = 2 - a + a / 4;
-    let days = (365.25 * (y2 + 4716) as f64) as i64
-        + (30.6001 * (m2 + 1) as f64) as i64
-        + d + b - 1524 - 2440588;
+    let m2 = if m <= 2 { m + 12 } else { m }; let y2 = if m <= 2 { y - 1 } else { y };
+    let a = y2 / 100; let b = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64 + (30.6001 * (m2 + 1) as f64) as i64 + d + b - 1524 - 2440588;
     Some(days * 86400 + 86399)
 }
 
@@ -90,12 +86,9 @@ enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 fn check_auth_blocking(id: &str) -> AuthResult {
     let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return AuthResult::NotFound; };
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        let line = line.trim(); if line.is_empty() || line.starts_with('#') { continue; }
         let mut parts = line.splitn(3, ':');
-        let Some(uid)  = parts.next() else { continue };
-        let Some(name) = parts.next() else { continue };
-        let Some(exp)  = parts.next() else { continue };
+        let Some(uid) = parts.next() else { continue }; let Some(name) = parts.next() else { continue }; let Some(exp) = parts.next() else { continue };
         if uid != id { continue; }
         let Some(exp_ts) = parse_expires(exp) else { continue };
         let now = now_secs();
@@ -105,19 +98,11 @@ fn check_auth_blocking(id: &str) -> AuthResult {
     AuthResult::NotFound
 }
 
-async fn check_auth(id: String) -> AuthResult {
-    tokio::task::spawn_blocking(move || check_auth_blocking(&id))
-        .await
-        .unwrap_or(AuthResult::NotFound)
-}
+async fn check_auth(id: String) -> AuthResult { tokio::task::spawn_blocking(move || check_auth_blocking(&id)).await.unwrap_or(AuthResult::NotFound) }
 
 fn valid_id(id: &str) -> bool {
-    if let Some(rest) = id.strip_prefix("S-") {
-        return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric());
-    }
-    if let Some(rest) = id.strip_prefix("STRK-") {
-        return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit());
-    }
+    if let Some(rest) = id.strip_prefix("S-") { return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric()); }
+    if let Some(rest) = id.strip_prefix("STRK-") { return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit()); }
     false
 }
 
@@ -131,27 +116,12 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     None
 }
 
-async fn handle_stream(
-    mut req: h2::RecvStream,
-    mut resp_tx: h2::SendStream<bytes::Bytes>,
-    authority: String,
-) {
-    let connect_addr = if authority.contains(':') {
-        authority.clone()
-    } else {
-        format!("{}:80", authority)
+async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<bytes::Bytes>, authority: String) {
+    let connect_addr = if authority.contains(':') { authority.clone() } else { format!("{}:80", authority) };
+    let Ok(Ok(tcp)) = time::timeout(Duration::from_millis(3000), TcpStream::connect(&connect_addr)).await else {
+        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
-
-    let Ok(Ok(tcp)) = time::timeout(
-        Duration::from_millis(3000),
-        TcpStream::connect(&connect_addr),
-    ).await else {
-        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR);
-        return;
-    };
-
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
@@ -159,29 +129,97 @@ async fn handle_stream(
         }
         let _ = tcp_w.shutdown().await;
     });
-
     let t_dn = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
         loop {
             match tcp_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                    if resp_tx.send_data(data, false).is_err() { break; }
-                }
+                Ok(n) => { if resp_tx.send_data(bytes::Bytes::copy_from_slice(&buf[..n]), false).is_err() { break; } }
             }
         }
         let _ = resp_tx.send_data(bytes::Bytes::new(), true);
     });
-
     let _ = tokio::join!(t_up, t_dn);
+}
+
+// --- NUEVO: MUX GAMING LIGERO ---
+async fn handle_gaming(tcp: TcpStream) {
+    let (mut tr, mut tw) = tcp.into_split();
+    let (tx, mut rx) = mpsc::channel::<Frame>(1024);
+    let streams = Arc::new(DashMap::<u32, mpsc::Sender<Vec<u8>>>::new());
+
+    // Tarea que escribe hacia el cliente Android
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let mut hdr = [0u8; 6];
+            hdr[0..4].copy_from_slice(&frame.id.to_be_bytes());
+            hdr[4..6].copy_from_slice(&(frame.data.len() as u16).to_be_bytes());
+            if tw.write_all(&hdr).await.is_err() { break; }
+            if !frame.data.is_empty() {
+                if tw.write_all(&frame.data).await.is_err() { break; }
+            }
+        }
+    });
+
+    // Bucle que lee desde el cliente Android
+    loop {
+        let mut hdr = [0u8; 6];
+        if tr.read_exact(&mut hdr).await.is_err() { break; }
+        let id = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        let len = u16::from_be_bytes(hdr[4..6].try_into().unwrap()) as usize;
+
+        if len == 0 {
+            streams.remove(&id);
+            continue;
+        }
+
+        let mut buf = vec![0u8; len];
+        if tr.read_exact(&mut buf).await.is_err() { break; }
+
+        let sender = if let Some(s) = streams.get(&id) {
+            s.clone()
+        } else {
+            // Conectar al hev-socks5-server local
+            if let Ok(local) = TcpStream::connect(SOCKS5_LOCAL).await {
+                let (mut lr, mut lw) = local.into_split();
+                let (ltx, mut lrx) = mpsc::channel::<Vec<u8>>(32);
+                streams.insert(id, ltx.clone());
+
+                let tx_clone = tx.clone();
+                let streams_clone = streams.clone();
+                
+                // Leer del hev-socks5-server y enviar al túnel
+                tokio::spawn(async move {
+                    let mut lbuf = [0u8; 4096];
+                    loop {
+                        match lr.read(&mut lbuf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { if tx_clone.send(Frame { id, data: lbuf[..n].to_vec() }).await.is_err() { break; } }
+                        }
+                    }
+                    let _ = tx_clone.send(Frame { id, data: vec![] }).await;
+                    streams_clone.remove(&id);
+                });
+
+                // Escribir hacia el hev-socks5-server
+                tokio::spawn(async move {
+                    while let Some(data) = lrx.recv().await {
+                        if lw.write_all(&data).await.is_err() { break; }
+                    }
+                });
+                ltx
+            } else {
+                continue;
+            }
+        };
+        let _ = sender.send(buf).await;
+    }
 }
 
 async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
     let mut buf = vec![0u8; 8192];
     let mut n = 0usize;
     let deadline = time::Instant::now() + Duration::from_secs(10);
-
     let (mut reader, mut writer) = tcp.into_split();
 
     loop {
@@ -191,95 +229,60 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
             Ok(nr) => {
                 n += nr;
                 let raw = &buf[..n];
-                if raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:"))
-                    && raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"action:")) && raw.windows(4).any(|w| w == b"\r\n\r\n") { break; }
             }
         }
     }
 
     let raw = &buf[..n];
-
-    let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
-        Some(id) => id.to_string(),
-        None => return,
-    };
-
+    let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) { Some(id) => id.to_string(), None => return };
     if !valid_id(&user_id) { return; }
 
+    let is_gaming = extract_header(raw, b"action:").unwrap_or("").trim().eq_ignore_ascii_case("gaming");
     let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
 
     match check_auth(user_id.clone()).await {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
-
             let stream = reader.reunite(writer).unwrap();
-
-let mut preface_buf = [0u8; 24];
-let mut stream = tokio::io::BufReader::new(stream);
-if stream.read_exact(&mut preface_buf).await.is_err() { return; }
-
-let mut h2 = match server::Builder::new()
-    .initial_connection_window_size(1 << 20)
-    .initial_window_size(1 << 20)
-    .max_concurrent_streams(4096)
-    .handshake(stream)
-    .await
-{
-    Ok(h) => h,
-    Err(_) => return,
-};
 
             let (kick_tx, mut kick_rx) = oneshot::channel::<()>();
             {
                 let mut map = sessions.lock().await;
-                if let Some(old_tx) = map.insert(user_id.clone(), kick_tx) {
-                    let _ = old_tx.send(());
-                }
+                if let Some(old_tx) = map.insert(user_id.clone(), kick_tx) { let _ = old_tx.send(()); }
             }
 
-            loop {
+            if is_gaming {
                 tokio::select! {
-                    result = h2.accept() => {
-                        let (req, mut respond) = match result {
-                            Some(Ok(r)) => r,
-                            _ => break,
-                        };
-
-                        let authority = req.uri()
-                            .authority()
-                            .map(|a| a.to_string())
-                            .unwrap_or_default();
-
-                        if authority.is_empty() { continue; }
-
-                        let response = http::Response::builder()
-                            .status(200)
-                            .body(())
-                            .unwrap();
-
-                        let resp_tx = match respond.send_response(response, false) {
-                            Ok(tx) => tx,
-                            Err(_) => continue,
-                        };
-
-                        let body = req.into_body();
-                        tokio::spawn(handle_stream(body, resp_tx, authority));
-                    }
-                    _ = &mut kick_rx => {
-                        break;
+                    _ = handle_gaming(stream) => {},
+                    _ = &mut kick_rx => {}
+                }
+            } else {
+                let mut preface_buf = [0u8; 24];
+                let mut stream = tokio::io::BufReader::new(stream);
+                if stream.read_exact(&mut preface_buf).await.is_err() { return; }
+                let mut h2 = match server::Builder::new().initial_connection_window_size(1 << 20).initial_window_size(1 << 20).max_concurrent_streams(4096).handshake(stream).await {
+                    Ok(h) => h, Err(_) => return,
+                };
+                loop {
+                    tokio::select! {
+                        result = h2.accept() => {
+                            let (req, mut respond) = match result { Some(Ok(r)) => r, _ => break };
+                            let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+                            if authority.is_empty() { continue; }
+                            let response = http::Response::builder().status(200).body(()).unwrap();
+                            let resp_tx = match respond.send_response(response, false) { Ok(tx) => tx, Err(_) => continue };
+                            tokio::spawn(handle_stream(req.into_body(), resp_tx, authority));
+                        }
+                        _ = &mut kick_rx => { break; }
                     }
                 }
             }
-
-            let mut map = sessions.lock().await;
-            map.remove(&user_id);
+            let mut map = sessions.lock().await; map.remove(&user_id);
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let status = match check_auth(user_id).await {
-                AuthResult::Expired => "expired",
-                _ => "waiting",
-            };
+            let status = match check_auth(user_id).await { AuthResult::Expired => "expired", _ => "waiting" };
             let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
             let _ = writer.write_all(resp.as_bytes()).await;
         }
@@ -295,33 +298,23 @@ async fn internal_server(sessions: Sessions) {
             let mut buf = vec![0u8; 4096];
             let Ok(n) = tcp.read(&mut buf).await else { return };
             let raw = &buf[..n];
-            let first_line = raw.split(|&b| b == b'\n').next().unwrap_or(b"");
-            let first_line = std::str::from_utf8(first_line).unwrap_or("").trim();
+            let first_line = std::str::from_utf8(raw.split(|&b| b == b'\n').next().unwrap_or(b"")).unwrap_or("").trim();
 
             if first_line.starts_with("GET /kick?") {
-                let id = first_line
-                    .split('?').nth(1).unwrap_or("")
-                    .split('&').find_map(|p| p.strip_prefix("id="))
-                    .unwrap_or("").split_whitespace().next().unwrap_or("");
-                let kicked = {
-                    let mut map = sessions.lock().await;
-                    if let Some(tx) = map.remove(id) { let _ = tx.send(()); true } else { false }
-                };
+                let id = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").split_whitespace().next().unwrap_or("");
+                let kicked = { let mut map = sessions.lock().await; if let Some(tx) = map.remove(id) { let _ = tx.send(()); true } else { false } };
                 let body = if kicked { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
-
             } else if first_line.starts_with("GET /active") {
                 let map = sessions.lock().await;
                 let ids: Vec<_> = map.keys().collect();
                 let body = format!(r#"{{"active":{}}}"#, serde_json::json!(ids));
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
-
             } else if first_line.starts_with("GET /promote") {
                 let resp = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"ok\":true}";
                 let _ = tcp.write_all(resp.as_bytes()).await;
-
             } else {
                 let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                 let _ = tcp.write_all(resp.as_bytes()).await;
@@ -336,9 +329,8 @@ async fn main() -> Result<()> {
     tokio::spawn(internal_server(sessions.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
-        match listener.accept().await {
-            Ok((conn, _)) => { tokio::spawn(handle_conn(conn, sessions.clone())); }
-            Err(_) => {}
+        if let Ok((conn, _)) = listener.accept().await {
+            tokio::spawn(handle_conn(conn, sessions.clone()));
         }
     }
 }
