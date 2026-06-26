@@ -271,18 +271,20 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
             }
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let status = match auth_res { AuthResult::Expired => "expired", _ => "waiting" };
-            let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
+            let resp = format!("{resp_101}\r\n");
             if writer.write_all(resp.as_bytes()).await.is_ok() {
-                tokio::select! {
-                    msg = rx.recv() => {
-                        if let Some(m) = msg {
-                            if m == "PROMOTE" { let _ = writer.write_all(b"PROMOTED\n").await; }
-                            else if m.starts_with("KICK:") { let _ = writer.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
+                let status = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
+                if writer.write_all(format!("WAITING:{}\n", status).as_bytes()).await.is_ok() {
+                    tokio::select! {
+                        msg = rx.recv() => {
+                            if let Some(m) = msg {
+                                if m == "PROMOTE" { let _ = writer.write_all(b"PROMOTED\n").await; }
+                                else if m.starts_with("KICK:") { let _ = writer.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
+                            }
                         }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(180)) => {
-                        let _ = writer.write_all(b"TIMEOUT\n").await;
+                        _ = tokio::time::sleep(Duration::from_secs(180)) => {
+                            let _ = writer.write_all(b"TIMEOUT\n").await;
+                        }
                     }
                 }
             }
