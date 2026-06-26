@@ -87,14 +87,6 @@ const T_SYNC:     u8 = 0x08;
 const T_WND:      u8 = 0x09;
 const T_OPEN_ACK: u8 = 0x0A;
 
-const TCP_QUICKACK: i32 = 12;
-
-#[derive(Clone, Copy, PartialEq)]
-enum TunnelMode {
-    Normal,
-    Gaming,
-}
-
 fn maximize_fd_limit() {
     unsafe {
         let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -191,53 +183,34 @@ unsafe fn setsockopt_i32(fd: i32, level: i32, opt: i32, val: i32) {
     libc::setsockopt(fd, level, opt, &val as *const i32 as *const libc::c_void, 4);
 }
 
-fn tune_client_fd(fd: i32, mode: TunnelMode) {
+fn tune_client_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        
-        if mode == TunnelMode::Gaming {
-            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
-        }
-        
-        let timeout: i32 = if mode == TunnelMode::Gaming { 15000 } else { 60000 };
+        let timeout: i32 = 60000;
         libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
-
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
-        let idle = if mode == TunnelMode::Gaming { 15 } else { 60 };
-        let intvl = if mode == TunnelMode::Gaming { 5 } else { 15 };
-        let cnt = if mode == TunnelMode::Gaming { 3 } else { 4 };
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, intvl);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   cnt);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   4);
     }
 }
 
-fn tune_hev_fd(fd: i32, mode: TunnelMode) {
+fn tune_hev_fd(fd: i32) {
     unsafe {
         setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
-        
-        if mode == TunnelMode::Gaming {
-            setsockopt_i32(fd, libc::IPPROTO_TCP, TCP_QUICKACK, 1);
-        }
-        
-        let timeout: i32 = if mode == TunnelMode::Gaming { 15000 } else { 60000 };
+        let timeout: i32 = 60000;
         libc::setsockopt(fd, libc::IPPROTO_TCP, 18, &timeout as *const _ as _, 4);
-
         setsockopt_i32(fd, libc::SOL_SOCKET,  libc::SO_KEEPALIVE, 1);
-        let idle = if mode == TunnelMode::Gaming { 15 } else { 60 };
-        let intvl = if mode == TunnelMode::Gaming { 5 } else { 15 };
-        let cnt = if mode == TunnelMode::Gaming { 3 } else { 4 };
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, intvl);
-        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   cnt);
-
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15);
+        setsockopt_i32(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,   4);
         let linger = libc::linger { l_onoff: 1, l_linger: 0 };
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as _, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
 }
 
 struct Stream {
-    tx:        mpsc::Sender<Bytes>,
+    tx:        mpsc::UnboundedSender<Bytes>,
     closed:    AtomicBool,
     tx_window: AtomicI32,
     notify:    Notify,
@@ -245,11 +218,11 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+    fn new(tx: mpsc::UnboundedSender<Bytes>) -> Arc<Self> {
         Arc::new(Self { 
             tx, 
             closed:    AtomicBool::new(false),
-            tx_window: AtomicI32::new(65536),
+            tx_window: AtomicI32::new(32768),
             notify:    Notify::new(),
             last_seen: AtomicU64::new(now_secs() as u64),
         })
@@ -267,7 +240,7 @@ impl Stream {
 
 struct Mux {
     write_tx: mpsc::Sender<Bytes>,
-    ctrl_tx:  mpsc::Sender<Bytes>,
+    ctrl_tx:  mpsc::UnboundedSender<Bytes>,
     kill_tx:  watch::Sender<bool>,
     streams:  Arc<DashMap<u32, Arc<Stream>>>,
     count:    AtomicU32,
@@ -275,7 +248,7 @@ struct Mux {
 }
 
 impl Mux {
-    fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::Sender<Bytes>) -> Arc<Self> {
+    fn new(write_tx: mpsc::Sender<Bytes>, ctrl_tx: mpsc::UnboundedSender<Bytes>) -> Arc<Self> {
         let (kill_tx, _) = watch::channel(false);
         Arc::new(Self {
             write_tx, ctrl_tx, kill_tx,
@@ -306,25 +279,25 @@ impl Mux {
         if self.is_dead() { return false; }
         if self.write_tx.send(build_data_frame(sid, data)).await.is_err() {
             self.close_stream_sync(sid);
-            self.send_ctrl_async(T_CLOSE, sid).await;
+            self.send_ctrl(T_CLOSE, sid);
             return false;
         }
         true
     }
 
-    #[inline(always)] async fn send_ctrl_async(&self, t: u8, sid: u32) {
+    #[inline(always)] fn send_ctrl(&self, t: u8, sid: u32) {
         if self.is_dead() { return; }
-        let _ = self.ctrl_tx.send(build_ctrl_frame(t, sid)).await;
+        let _ = self.ctrl_tx.send(build_ctrl_frame(t, sid));
     }
 
-    #[inline(always)] async fn send_wnd_async(&self, sid: u32, credit: u32) {
+    #[inline(always)] fn send_wnd(&self, sid: u32, credit: u32) {
         if self.is_dead() { return; }
         let mut v = Vec::with_capacity(11);
         v.push(T_WND);
         v.extend_from_slice(&sid.to_be_bytes());
         v.extend_from_slice(&4u16.to_be_bytes());
         v.extend_from_slice(&credit.to_be_bytes());
-        let _ = self.ctrl_tx.send(Bytes::from(v)).await;
+        let _ = self.ctrl_tx.send(Bytes::from(v));
     }
 
     fn add_stream_sync(&self, sid: u32, s: Arc<Stream>) -> bool {
@@ -346,7 +319,7 @@ type SessionMap = Arc<DashMap<String, Arc<Mux>>>;
 
 fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
     if let Some((_, mux)) = sessions.remove(id) {
-        let _ = mux.ctrl_tx.try_send(build_ctrl_frame(reason, 0));
+        mux.send_ctrl(reason, 0);
         mux.kill();
         true
     } else {
@@ -357,7 +330,7 @@ fn kick_session_sync(sessions: &SessionMap, id: &str, reason: u8) -> bool {
 async fn write_loop(
     mut writer:   OwnedWriteHalf,
     mut write_rx: mpsc::Receiver<Bytes>,
-    mut ctrl_rx:  mpsc::Receiver<Bytes>,
+    mut ctrl_rx:  mpsc::UnboundedReceiver<Bytes>,
     mut kill_rx:  watch::Receiver<bool>,
     mux:          Arc<Mux>,
 ) {
@@ -407,7 +380,7 @@ async fn mux_gc(mux: Arc<Mux>) {
                 }
                 for sid in to_remove {
                     mux.close_stream_sync(sid);
-                    mux.send_ctrl_async(T_CLOSE, sid).await;
+                    mux.send_ctrl(T_CLOSE, sid);
                 }
             }
         }
@@ -418,28 +391,27 @@ async fn handle_stream(
     mux:    Arc<Mux>,
     sid:    u32,
     s:      Arc<Stream>,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
     first:  Bytes,
-    mode:   TunnelMode,
 ) {
     let mut kill_rx1 = mux.kill_tx.subscribe();
     let mut kill_rx2 = mux.kill_tx.subscribe();
 
     let Ok(Ok(hev)) = time::timeout(Duration::from_millis(10000), TcpStream::connect(HEV_ADDR)).await else {
         mux.close_stream_sync(sid);
-        mux.send_ctrl_async(T_CLOSE, sid).await;
+        mux.send_ctrl(T_CLOSE, sid);
         return;
     };
     
-    tune_hev_fd(hev.as_raw_fd(), mode);
+    tune_hev_fd(hev.as_raw_fd());
     let (mut hev_r, mut hev_w) = hev.into_split();
 
-    mux.send_ctrl_async(T_OPEN_ACK, sid).await;
+    mux.send_ctrl(T_OPEN_ACK, sid);
 
     if !first.is_empty() {
         if hev_w.write_all(&first).await.is_err() {
             mux.close_stream_sync(sid);
-            mux.send_ctrl_async(T_CLOSE, sid).await;
+            mux.send_ctrl(T_CLOSE, sid);
             return;
         }
     }
@@ -458,8 +430,8 @@ async fn handle_stream(
                                 break; 
                             }
                             rx_acked += data.len() as u32;
-                            if rx_acked >= 16384 {
-                                mux_clone.send_wnd_async(sid, rx_acked).await;
+                            if rx_acked >= 4096 { // Confirmación rápida cada 4KB
+                                mux_clone.send_wnd(sid, rx_acked);
                                 rx_acked = 0;
                             }
                         }
@@ -473,8 +445,7 @@ async fn handle_stream(
 
     let mux2 = mux.clone();
     let t_h2c = tokio::spawn(async move {
-        let chunk_size = if mode == TunnelMode::Gaming { 4096 } else { MAX_PAYLOAD };
-        let mut buf = vec![0u8; chunk_size];
+        let mut buf = vec![0u8; MAX_PAYLOAD];
         loop {
             while s.tx_window.load(Ordering::Acquire) <= 0 {
                 tokio::select! {
@@ -484,7 +455,7 @@ async fn handle_stream(
             }
 
             let current_wnd = s.tx_window.load(Ordering::Acquire).max(1) as usize;
-            let to_read = chunk_size.min(current_wnd);
+            let to_read = MAX_PAYLOAD.min(current_wnd);
 
             tokio::select! {
                 biased;
@@ -500,15 +471,15 @@ async fn handle_stream(
                 }
             }
         }
-        mux2.send_ctrl_async(T_CLOSE, sid).await;
+        mux2.send_ctrl(T_CLOSE, sid);
     });
 
     let _ = tokio::join!(t_c2h, t_h2c);
     mux.close_stream_sync(sid);
-    mux.send_ctrl_async(T_CLOSE, sid).await;
+    mux.send_ctrl(T_CLOSE, sid);
 }
 
-async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
+async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf) {
     let mut hdr  = [0u8; 7];
     let mut rbuf = vec![0u8; MAX_PAYLOAD];
     let mut kill_rx = mux.kill_tx.subscribe();
@@ -535,7 +506,7 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
         }
 
         match ft {
-            T_PING => { mux.send_ctrl_async(T_PONG, sid).await; }
+            T_PING => { mux.send_ctrl(T_PONG, sid); }
             T_PONG => {}
             T_SYNC => {
                 let now = now_secs() as u64;
@@ -544,6 +515,8 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
                     let client_sid = u32::from_be_bytes(rbuf[i..i+4].try_into().unwrap());
                     if let Some(s) = mux.get_stream_sync(client_sid) {
                         s.last_seen.store(now, Ordering::Relaxed);
+                    } else {
+                        mux.send_ctrl(T_CLOSE, client_sid);
                     }
                     i += 4;
                 }
@@ -562,23 +535,23 @@ async fn mux_run(mux: Arc<Mux>, mut reader: OwnedReadHalf, mode: TunnelMode) {
                     continue;
                 }
                 let payload = if ln > 0 { Bytes::copy_from_slice(&rbuf[..ln]) } else { Bytes::new() };
-                let queue_size = if mode == TunnelMode::Gaming { 32 } else { 128 };
-                let (tx, rx) = mpsc::channel(queue_size);
+                let (tx, rx) = mpsc::unbounded_channel();
                 let s = Stream::new(tx);
                 if !mux.add_stream_sync(sid, s.clone()) {
-                    mux.send_ctrl_async(T_CLOSE, sid).await;
+                    mux.send_ctrl(T_CLOSE, sid);
                     continue;
                 }
-                tokio::spawn(handle_stream(mux.clone(), sid, s.clone(), rx, payload, mode));
+                tokio::spawn(handle_stream(mux.clone(), sid, s.clone(), rx, payload));
             }
             T_DATA => {
                 if let Some(s) = mux.get_stream_sync(sid) {
                     if !s.is_closed() {
                         s.last_seen.store(now_secs() as u64, Ordering::Relaxed);
                         let payload = Bytes::copy_from_slice(&rbuf[..ln]);
-                        if s.tx.send(payload).await.is_err() {
+                        // Enrutamiento directo: Si falla, se cierra, pero JAMÁS bloquea el mux_run
+                        if s.tx.send(payload).is_err() {
                             mux.close_stream_sync(sid);
-                            mux.send_ctrl_async(T_CLOSE, sid).await;
+                            mux.send_ctrl(T_CLOSE, sid);
                         }
                     }
                 }
@@ -622,15 +595,8 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
     }
 
     let raw = &buf[..n];
-    let action_str = extract_header(raw, b"action:");
     
-    let mode = match action_str {
-        Some("tunnel-gaming") => TunnelMode::Gaming,
-        Some("tunnel") | Some("tunnel-tcp") => TunnelMode::Normal,
-        _ => return,
-    };
-
-    tune_client_fd(fd, mode);
+    tune_client_fd(fd);
 
     let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
@@ -646,16 +612,14 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if writer.write_all(resp.as_bytes()).await.is_err() { return; }
 
-            let mux_write_queue = if mode == TunnelMode::Gaming { 64 } else { 512 };
-            let (write_tx, write_rx) = mpsc::channel::<Bytes>(mux_write_queue);
-            let ctrl_queue = if mode == TunnelMode::Gaming { 32 } else { 128 };
-            let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<Bytes>(ctrl_queue);
+            let (write_tx, write_rx) = mpsc::channel::<Bytes>(1024);
+            let (ctrl_tx,  ctrl_rx)  = mpsc::unbounded_channel::<Bytes>();
             
             let mux = Mux::new(write_tx, ctrl_tx);
             let kill_rx = mux.kill_tx.subscribe();
 
             if let Some((_, prev_mux)) = sessions.remove(&user_id) {
-                let _ = prev_mux.ctrl_tx.try_send(build_ctrl_frame(T_KICK, 0));
+                prev_mux.send_ctrl(T_KICK, 0);
                 prev_mux.kill();
             }
 
@@ -663,7 +627,7 @@ async fn handle_conn(tcp: TcpStream, sessions: SessionMap, waitroom: WaitRoom, i
 
             tokio::spawn(write_loop(writer, write_rx, ctrl_rx, kill_rx, mux.clone()));
             tokio::spawn(mux_gc(mux.clone()));
-            mux_run(mux.clone(), reader, mode).await;
+            mux_run(mux.clone(), reader).await;
             sessions.remove_if(&user_id, |_, m| Arc::ptr_eq(m, &mux));
             mux.kill();
         }
