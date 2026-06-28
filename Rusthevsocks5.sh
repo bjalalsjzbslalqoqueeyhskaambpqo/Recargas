@@ -125,6 +125,9 @@ async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<byte
     let Ok(Ok(mut tcp)) = tcp_result else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
+    
+    // FIX CLAVE 1: Desactivar delay hacia el destino final (Telegram, etc.)
+    let _ = tcp.set_nodelay(true);
 
     if let Some(cmd) = udp_cmd {
         if tcp.write_all(&[0x05, 0x01, 0x00]).await.is_err() { return; }
@@ -191,6 +194,9 @@ async fn handle_gaming(tcp: TcpStream) {
             s.clone()
         } else {
             if let Ok(local) = TcpStream::connect(SOCKS5_LOCAL).await {
+                // FIX CLAVE 2: Desactivar delay hacia el puerto SOCKS5 interno
+                let _ = local.set_nodelay(true);
+                
                 let (mut lr, mut lw) = local.into_split();
                 let (ltx, mut lrx) = mpsc::channel::<Vec<u8>>(32);
                 streams.insert(id, ltx.clone());
@@ -352,6 +358,8 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
         if let Ok((conn, _)) = listener.accept().await {
+            // FIX CLAVE 3: Desactivar delay en la conexión entrante desde el cliente
+            let _ = conn.set_nodelay(true);
             tokio::spawn(handle_conn(conn, sessions.clone()));
         }
     }
