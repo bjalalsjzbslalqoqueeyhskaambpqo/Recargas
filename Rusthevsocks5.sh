@@ -126,7 +126,6 @@ async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<byte
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
     
-    // FIX CLAVE 1: Desactivar delay hacia el destino final (Telegram, etc.)
     let _ = tcp.set_nodelay(true);
 
     if let Some(cmd) = udp_cmd {
@@ -139,6 +138,7 @@ async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<byte
     }
 
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
@@ -146,16 +146,32 @@ async fn handle_stream(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<byte
         }
         let _ = tcp_w.shutdown().await;
     });
+    
     let t_dn = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
         loop {
             match tcp_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { if resp_tx.send_data(bytes::Bytes::copy_from_slice(&buf[..n]), false).is_err() { break; } }
+                Ok(n) => {
+                    // FIX CRÍTICO: Respetar el Flow Control de HTTP/2
+                    let mut chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    while !chunk.is_empty() {
+                        resp_tx.reserve_capacity(chunk.len());
+                        match std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
+                            Some(Ok(cap)) if cap > 0 => {
+                                let to_send = std::cmp::min(cap, chunk.len());
+                                let data = chunk.split_to(to_send);
+                                if resp_tx.send_data(data, false).is_err() { return; }
+                            }
+                            _ => return, // Si hay error de capacidad, abortamos limpiamente
+                        }
+                    }
+                }
             }
         }
         let _ = resp_tx.send_data(bytes::Bytes::new(), true);
     });
+    
     let _ = tokio::join!(t_up, t_dn);
 }
 
@@ -194,7 +210,6 @@ async fn handle_gaming(tcp: TcpStream) {
             s.clone()
         } else {
             if let Ok(local) = TcpStream::connect(SOCKS5_LOCAL).await {
-                // FIX CLAVE 2: Desactivar delay hacia el puerto SOCKS5 interno
                 let _ = local.set_nodelay(true);
                 
                 let (mut lr, mut lw) = local.into_split();
@@ -274,9 +289,16 @@ async fn handle_conn(tcp: TcpStream, sessions: Sessions) {
                 let mut preface_buf = [0u8; 24];
                 let mut stream = tokio::io::BufReader::new(stream);
                 if stream.read_exact(&mut preface_buf).await.is_err() { sessions.remove(&user_id); return; }
-                let mut h2 = match server::Builder::new().initial_connection_window_size(1 << 20).initial_window_size(1 << 20).max_concurrent_streams(4096).handshake(stream).await {
+                
+                // FIX CRÍTICO: Aumentar la ventana inicial a 100MB para evitar cuellos de botella
+                let mut h2 = match server::Builder::new()
+                    .initial_connection_window_size(104857600)
+                    .initial_window_size(104857600)
+                    .max_concurrent_streams(4096)
+                    .handshake(stream).await {
                     Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
                 };
+                
                 loop {
                     tokio::select! {
                         result = h2.accept() => {
@@ -358,7 +380,6 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
         if let Ok((conn, _)) = listener.accept().await {
-            // FIX CLAVE 3: Desactivar delay en la conexión entrante desde el cliente
             let _ = conn.set_nodelay(true);
             tokio::spawn(handle_conn(conn, sessions.clone()));
         }
