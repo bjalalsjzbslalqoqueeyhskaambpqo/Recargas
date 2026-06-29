@@ -47,7 +47,7 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, Buf, BufMut}; // <- Crucial para los buffers UDP
 use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -171,19 +171,35 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     let udp_rx = udp.clone();
     let udp_tx = udp.clone();
 
+    // UDP Framing - DECODER (Client -> Rust -> Game Server)
     let t_up = tokio::spawn(async move {
+        let mut buf = bytes::BytesMut::new();
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
-            if udp_tx.send(&chunk).await.is_err() { break; }
+            buf.extend_from_slice(&chunk);
+            
+            while buf.len() >= 2 {
+                let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                if buf.len() < 2 + len { break; } // Espera más paquetes si están cortados
+                buf.advance(2);
+                let packet = &buf[..len];
+                if udp_tx.send(packet).await.is_err() { return; }
+                buf.advance(len);
+            }
         }
     });
 
+    // UDP Framing - ENCODER (Game Server -> Rust -> Client)
     let t_dn = tokio::spawn(async move {
         let mut buf = [0u8; 65536];
         loop {
             match time::timeout(Duration::from_secs(60), udp_rx.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    let mut payload = bytes::BytesMut::with_capacity(2 + n);
+                    payload.put_u16(n as u16);
+                    payload.put_slice(&buf[..n]);
+                    let chunk = payload.freeze();
+                    
                     resp_tx.reserve_capacity(chunk.len());
                     if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
                         if cap > 0 && resp_tx.send_data(chunk, false).is_err() { break; }
