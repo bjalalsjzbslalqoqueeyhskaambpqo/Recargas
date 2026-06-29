@@ -47,7 +47,7 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use anyhow::Result;
-use bytes::{Bytes, Buf, BufMut}; // <- Crucial para los buffers UDP
+use bytes::{Bytes, Buf, BufMut, BytesMut};
 use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -62,6 +62,7 @@ const USERS_FILE:  &str = "/opt/btserver/users.txt";
 const KICK_ADDR:   &str = "127.0.0.1:8091";
 
 type Sessions = Arc<DashMap<String, mpsc::Sender<String>>>;
+type AuthCache = Arc<DashMap<String, (String, i64)>>;
 
 #[inline(always)]
 fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
@@ -78,25 +79,33 @@ fn parse_expires(s: &str) -> Option<i64> {
     Some(days * 86400 + 86399)
 }
 
-enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
-
-fn check_auth_blocking(id: &str) -> AuthResult {
-    let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return AuthResult::NotFound; };
+fn load_users_into_cache(cache: &AuthCache) {
+    let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return };
+    cache.clear();
     for line in content.lines() {
         let line = line.trim(); if line.is_empty() || line.starts_with('#') { continue; }
         let mut parts = line.splitn(3, ':');
-        let Some(uid) = parts.next() else { continue }; let Some(name) = parts.next() else { continue }; let Some(exp) = parts.next() else { continue };
-        if uid != id { continue; }
-        let Some(exp_ts) = parse_expires(exp) else { continue };
-        let now = now_secs();
-        if now > exp_ts { return AuthResult::Expired; }
-        return AuthResult::Ok { name: name.to_string(), secs_left: exp_ts - now };
+        let Some(uid) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let Some(exp) = parts.next() else { continue };
+        if let Some(exp_ts) = parse_expires(exp) {
+            cache.insert(uid.to_string(), (name.to_string(), exp_ts));
+        }
     }
-    AuthResult::NotFound
 }
 
-async fn check_auth(id: String) -> AuthResult { 
-    tokio::task::spawn_blocking(move || check_auth_blocking(&id)).await.unwrap_or(AuthResult::NotFound) 
+enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
+
+fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
+    if let Some(entry) = cache.get(id) {
+        let (name, exp_ts) = entry.value();
+        let now = now_secs();
+        if now > *exp_ts {
+            return AuthResult::Expired;
+        }
+        return AuthResult::Ok { name: name.clone(), secs_left: *exp_ts - now };
+    }
+    AuthResult::NotFound
 }
 
 fn valid_id(id: &str) -> bool {
@@ -121,7 +130,6 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
     let _ = tcp.set_nodelay(true);
-
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
     let t_up = tokio::spawn(async move {
@@ -133,12 +141,13 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     });
 
     let t_dn = tokio::spawn(async move {
-        let mut buf = [0u8; 65536];
+        let mut buf = BytesMut::with_capacity(65536);
         loop {
-            match tcp_r.read(&mut buf).await {
+            buf.clear();
+            match tcp_r.read_buf(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut chunk = Bytes::copy_from_slice(&buf[..n]);
+                Ok(_) => {
+                    let mut chunk = buf.split().freeze();
                     while !chunk.is_empty() {
                         resp_tx.reserve_capacity(chunk.len());
                         match std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
@@ -171,16 +180,14 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     let udp_rx = udp.clone();
     let udp_tx = udp.clone();
 
-    // UDP Framing - DECODER (Client -> Rust -> Game Server)
     let t_up = tokio::spawn(async move {
-        let mut buf = bytes::BytesMut::new();
+        let mut buf = BytesMut::new();
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             buf.extend_from_slice(&chunk);
-            
             while buf.len() >= 2 {
                 let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                if buf.len() < 2 + len { break; } // Espera más paquetes si están cortados
+                if buf.len() < 2 + len { break; }
                 buf.advance(2);
                 let packet = &buf[..len];
                 if udp_tx.send(packet).await.is_err() { return; }
@@ -189,17 +196,15 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
         }
     });
 
-    // UDP Framing - ENCODER (Game Server -> Rust -> Client)
     let t_dn = tokio::spawn(async move {
         let mut buf = [0u8; 65536];
         loop {
             match time::timeout(Duration::from_secs(60), udp_rx.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    let mut payload = bytes::BytesMut::with_capacity(2 + n);
+                    let mut payload = BytesMut::with_capacity(2 + n);
                     payload.put_u16(n as u16);
                     payload.put_slice(&buf[..n]);
                     let chunk = payload.freeze();
-                    
                     resp_tx.reserve_capacity(chunk.len());
                     if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
                         if cap > 0 && resp_tx.send_data(chunk, false).is_err() { break; }
@@ -216,9 +221,9 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     let _ = tokio::join!(t_up, t_dn);
 }
 
-async fn handle_conn(mut tcp: TcpStream, sessions: Sessions) {
+async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let _ = tcp.set_nodelay(true);
-    let mut buf = bytes::BytesMut::with_capacity(4096);
+    let mut buf = BytesMut::with_capacity(4096);
 
     let read_req = time::timeout(Duration::from_secs(10), async {
         loop {
@@ -238,7 +243,7 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions) {
     let (tx, mut rx) = mpsc::channel::<String>(10);
     sessions.insert(user_id.clone(), tx);
 
-    let auth_res = check_auth(user_id.clone()).await;
+    let auth_res = check_auth(&user_id, &cache);
     match auth_res {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
@@ -296,11 +301,12 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions) {
     sessions.remove(&user_id);
 }
 
-async fn internal_server(sessions: Sessions) {
-    let listener = TcpListener::bind(KICK_ADDR).await.expect("fallo 8091");
+async fn internal_server(sessions: Sessions, cache: AuthCache) {
+    let listener = TcpListener::bind(KICK_ADDR).await.unwrap();
     loop {
         let Ok((mut tcp, _)) = listener.accept().await else { continue };
         let sessions = sessions.clone();
+        let cache = cache.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let Ok(n) = tcp.read(&mut buf).await else { return };
@@ -325,6 +331,11 @@ async fn internal_server(sessions: Sessions) {
                 let body = if promoted { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 let _ = tcp.write_all(resp.as_bytes()).await;
+            } else if first_line.starts_with("GET /reload") {
+                load_users_into_cache(&cache);
+                let body = r#"{"ok":true}"#;
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let _ = tcp.write_all(resp.as_bytes()).await;
             } else {
                 let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                 let _ = tcp.write_all(resp.as_bytes()).await;
@@ -336,11 +347,13 @@ async fn internal_server(sessions: Sessions) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let sessions: Sessions = Arc::new(DashMap::new());
-    tokio::spawn(internal_server(sessions.clone()));
+    let auth_cache: AuthCache = Arc::new(DashMap::new());
+    load_users_into_cache(&auth_cache);
+    tokio::spawn(internal_server(sessions.clone(), auth_cache.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop {
         if let Ok((conn, _)) = listener.accept().await {
-            tokio::spawn(handle_conn(conn, sessions.clone()));
+            tokio::spawn(handle_conn(conn, sessions.clone(), auth_cache.clone()));
         }
     }
 }
@@ -358,6 +371,7 @@ const USERS_PATH: &str = "/opt/btserver/users.txt";
 const TOKEN_PATH: &str = "/opt/btserver/token.txt";
 const KICK_BASE:  &str = "http://127.0.0.1:8091/kick?id=";
 const PROMOTE_BASE: &str = "http://127.0.0.1:8091/promote?id=";
+const RELOAD_URL: &str = "http://127.0.0.1:8091/reload";
 
 #[inline(always)] fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 fn expires_from_days(days: i64) -> i64 { now_secs() + days * 86400 }
@@ -416,23 +430,23 @@ fn save_users_blocking(users: &HashMap<String, User>) {
     if std::fs::write(&tmp, &out).is_ok() { let _ = std::fs::rename(&tmp, USERS_PATH); }
 }
 
-async fn load_users() -> HashMap<String, User> {
-    tokio::task::spawn_blocking(load_users_blocking).await.unwrap_or_default()
-}
-
-async fn save_users(users: HashMap<String, User>) {
-    let _ = tokio::task::spawn_blocking(move || save_users_blocking(&users)).await;
-}
+async fn load_users() -> HashMap<String, User> { tokio::task::spawn_blocking(load_users_blocking).await.unwrap_or_default() }
+async fn save_users(users: HashMap<String, User>) { let _ = tokio::task::spawn_blocking(move || save_users_blocking(&users)).await; }
 
 fn user_row(id: &str, u: &User) -> serde_json::Value {
     let secs_left = (u.expires_ts - now_secs()).max(0);
     serde_json::json!({ "id": id, "name": u.name, "expires_ts": u.expires_ts, "secs_left": secs_left, "active": secs_left > 0 })
 }
 
+async fn reload_proxy() {
+    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(RELOAD_URL).send().await; }
+}
+
 async fn kick_user(id: String, reason: &'static str) {
     let url = format!("{KICK_BASE}{id}&reason={reason}");
     if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(&url).send().await; }
 }
+
 async fn promote_user(id: String) {
     let url = format!("{PROMOTE_BASE}{id}");
     if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(&url).send().await; }
@@ -492,6 +506,7 @@ async fn handle_create(State(st): State<AppState>, headers: HeaderMap, ConnectIn
     users.insert(id.clone(), User { name: name.clone(), expires_ts });
     save_users(users).await;
     drop(_l);
+    reload_proxy().await;
     tokio::spawn(promote_user(id.clone()));
     (StatusCode::CREATED, Json(user_row(&id, &User { name, expires_ts })))
 }
@@ -507,6 +522,7 @@ async fn handle_delete(State(st): State<AppState>, headers: HeaderMap, ConnectIn
         users.remove(&id);
         save_users(users).await;
     }
+    reload_proxy().await;
     tokio::spawn(kick_user(id, "kicked"));
     (StatusCode::OK, Json(serde_json::json!({"ok":true})))
 }
@@ -529,6 +545,7 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
         save_users(users).await;
         (final_id, u, kick_old)
     };
+    reload_proxy().await;
     if kick_old { tokio::spawn(kick_user(id, "kicked")); }
     if u.expires_ts <= now_secs() { tokio::spawn(kick_user(final_id.clone(), "expired")); } else { tokio::spawn(promote_user(final_id.clone())); }
     (StatusCode::OK, Json(user_row(&final_id, &u)))
@@ -536,7 +553,6 @@ async fn handle_update(State(st): State<AppState>, headers: HeaderMap, ConnectIn
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("panel=info".parse()?)).init();
     let state = AppState::new();
     let app = Router::new().route("/clients", get(handle_clients)).route("/client", get(handle_client)).route("/client/create", post(handle_create)).route("/client/delete", delete(handle_delete)).route("/client/update", put(handle_update)).with_state(state).into_make_service_with_connect_info::<SocketAddr>();
     let ln = TcpListener::bind(PANEL_ADDR).await?;
