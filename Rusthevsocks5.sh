@@ -134,6 +134,7 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
             let _ = req.flow_control().release_capacity(chunk.len());
             if tcp_w.write_all(&chunk).await.is_err() { break; }
         }
+        let _ = tcp_w.shutdown().await;
     });
     let t_dn = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(65536);
