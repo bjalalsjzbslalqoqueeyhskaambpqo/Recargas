@@ -7,7 +7,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "9.0.0"
+version = "9.5.0"
 edition = "2021"
 
 [[bin]]
@@ -41,7 +41,6 @@ codegen-units = 1
 strip         = true
 panic         = "abort"
 TOMLEOF
-
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -100,14 +99,13 @@ fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
     if let Some(entry) = cache.get(id) {
         let (name, exp_ts) = entry.value();
         let now = now_secs();
-        if now > *exp_ts {
-            return AuthResult::Expired;
-        }
+        if now > *exp_ts { return AuthResult::Expired; }
         return AuthResult::Ok { name: name.clone(), secs_left: *exp_ts - now };
     }
     AuthResult::NotFound
 }
 
+#[inline(always)]
 fn valid_id(id: &str) -> bool {
     if let Some(rest) = id.strip_prefix("S-") { return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric()); }
     if let Some(rest) = id.strip_prefix("STRK-") { return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit()); }
@@ -117,9 +115,9 @@ fn valid_id(id: &str) -> bool {
 fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     for line in raw.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() <= needle.len() { continue; }
-        if !line[..needle.len()].eq_ignore_ascii_case(needle) { continue; }
-        return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
+        if line.len() > needle.len() && line[..needle.len()].eq_ignore_ascii_case(needle) {
+            return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
+        }
     }
     None
 }
@@ -131,40 +129,27 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     };
     let _ = tcp.set_nodelay(true);
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             if tcp_w.write_all(&chunk).await.is_err() { break; }
         }
-        let _ = tcp_w.shutdown().await;
     });
-
     let t_dn = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(65536);
-        loop {
-            buf.clear();
-            match tcp_r.read_buf(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let mut chunk = buf.split().freeze();
-                    while !chunk.is_empty() {
-                        resp_tx.reserve_capacity(chunk.len());
-                        match std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
-                            Some(Ok(cap)) if cap > 0 => {
-                                let to_send = std::cmp::min(cap, chunk.len());
-                                let data = chunk.split_to(to_send);
-                                if resp_tx.send_data(data, false).is_err() { return; }
-                            }
-                            _ => return,
-                        }
-                    }
-                }
+        while let Ok(n) = tcp_r.read_buf(&mut buf).await {
+            if n == 0 { break; }
+            let mut chunk = buf.split().freeze();
+            while !chunk.is_empty() {
+                resp_tx.reserve_capacity(chunk.len());
+                if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
+                    let data = chunk.split_to(std::cmp::min(cap, chunk.len()));
+                    if resp_tx.send_data(data, false).is_err() { return; }
+                } else { return; }
             }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
     });
-
     let _ = tokio::join!(t_up, t_dn);
 }
 
@@ -175,11 +160,8 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     if time::timeout(Duration::from_secs(3), udp.connect(&authority)).await.is_err() {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     }
-
     let udp = Arc::new(udp);
-    let udp_rx = udp.clone();
-    let udp_tx = udp.clone();
-
+    let u_rx = udp.clone(); let u_tx = udp.clone();
     let t_up = tokio::spawn(async move {
         let mut buf = BytesMut::new();
         while let Some(Ok(chunk)) = req.data().await {
@@ -189,100 +171,70 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
                 let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
                 if buf.len() < 2 + len { break; }
                 buf.advance(2);
-                let packet = &buf[..len];
-                if udp_tx.send(packet).await.is_err() { return; }
+                if u_tx.send(&buf[..len]).await.is_err() { return; }
                 buf.advance(len);
             }
         }
     });
-
     let t_dn = tokio::spawn(async move {
-        let mut buf = [0u8; 65536];
-        loop {
-            match time::timeout(Duration::from_secs(60), udp_rx.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
-                    let mut payload = BytesMut::with_capacity(2 + n);
-                    payload.put_u16(n as u16);
-                    payload.put_slice(&buf[..n]);
-                    let chunk = payload.freeze();
-                    resp_tx.reserve_capacity(chunk.len());
-                    if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
-                        if cap > 0 && resp_tx.send_data(chunk, false).is_err() { break; }
-                    } else {
-                        break;
-                    }
-                }
-                _ => break,
-            }
+        let mut b = [0u8; 65536];
+        while let Ok(Ok(n)) = time::timeout(Duration::from_secs(60), u_rx.recv(&mut b)).await {
+            let mut p = BytesMut::with_capacity(2 + n);
+            p.put_u16(n as u16); p.put_slice(&b[..n]);
+            let chunk = p.freeze();
+            resp_tx.reserve_capacity(chunk.len());
+            if let Some(Ok(_)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
+                if resp_tx.send_data(chunk, false).is_err() { break; }
+            } else { break; }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
     });
-
     let _ = tokio::join!(t_up, t_dn);
 }
 
 async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let _ = tcp.set_nodelay(true);
     let mut buf = BytesMut::with_capacity(4096);
-
     let read_req = time::timeout(Duration::from_secs(10), async {
-        loop {
-            if tcp.read_buf(&mut buf).await? == 0 { return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)); }
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") { return Ok(()); }
-            if buf.len() > 8192 { return Err(std::io::Error::from(std::io::ErrorKind::InvalidData)); }
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            if tcp.read_buf(&mut buf).await? == 0 || buf.len() > 8192 { return Err(std::io::Error::from(std::io::ErrorKind::InvalidData)); }
         }
+        Ok(())
     }).await;
-
     if read_req.is_err() || read_req.unwrap().is_err() { return; }
-
     let raw = &buf[..];
-    let user_id = match extract_header(raw, b"x-internal-id:").filter(|s| !s.is_empty()) { Some(id) => id.to_string(), None => return };
+    let user_id = match extract_header(raw, b"x-internal-id:") { Some(id) => id.to_string(), None => return };
     if !valid_id(&user_id) { return; }
-
-    let resp_101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
     let (tx, mut rx) = mpsc::channel::<String>(10);
     sessions.insert(user_id.clone(), tx);
-
     let auth_res = check_auth(&user_id, &cache);
     match auth_res {
         AuthResult::Ok { name, secs_left } => {
-            let resp = format!("{resp_101}X-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
+            let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
-
-            let mut preface_buf = [0u8; 24];
-            if tcp.read_exact(&mut preface_buf).await.is_err() { sessions.remove(&user_id); return; }
-            
-            let mut h2 = match server::Builder::new()
-                .initial_connection_window_size(8388608)
-                .initial_window_size(8388608)
-                .max_concurrent_streams(4096)
-                .handshake(tcp).await {
+            let mut preface = [0u8; 24];
+            if tcp.read_exact(&mut preface).await.is_err() { sessions.remove(&user_id); return; }
+            let mut h2 = match server::Builder::new().initial_connection_window_size(8388608).initial_window_size(8388608).max_concurrent_streams(4096).handshake(tcp).await {
                 Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
             };
-            
             loop {
                 tokio::select! {
-                    result = h2.accept() => {
-                        let (req, mut respond) = match result { Some(Ok(r)) => r, _ => break };
+                    res = h2.accept() => {
+                        let (req, mut respond) = match res { Some(Ok(r)) => r, _ => break };
                         let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
                         if authority.is_empty() { continue; }
-                        let udp_cmd = req.headers().get("x-udp-cmd").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u8>().ok());
-                        let response = http::Response::builder().status(200).body(()).unwrap();
-                        let resp_tx = match respond.send_response(response, false) { Ok(tx) => tx, Err(_) => continue };
-                        
-                        if udp_cmd.is_some() {
-                            tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority));
-                        } else {
-                            tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority));
-                        }
+                        let is_udp = req.headers().contains_key("x-udp-cmd");
+                        let resp_tx = match respond.send_response(http::Response::builder().status(200).body(()).unwrap(), false) { Ok(tx) => tx, Err(_) => continue };
+                        if is_udp { tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority)); }
+                        else { tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority)); }
                     }
                     _ = rx.recv() => { break; }
                 }
             }
         }
         AuthResult::NotFound | AuthResult::Expired => {
-            let status = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
-            let resp = format!("{resp_101}X-Wait-Status: {status}\r\n\r\n");
+            let s = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
+            let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Wait-Status: {s}\r\n\r\n");
             if tcp.write_all(resp.as_bytes()).await.is_ok() {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -291,9 +243,7 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
                             else if m.starts_with("KICK:") { let _ = tcp.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(180)) => {
-                        let _ = tcp.write_all(b"TIMEOUT\n").await;
-                    }
+                    _ = tokio::time::sleep(Duration::from_secs(180)) => { let _ = tcp.write_all(b"TIMEOUT\n").await; }
                 }
             }
         }
@@ -305,57 +255,46 @@ async fn internal_server(sessions: Sessions, cache: AuthCache) {
     let listener = TcpListener::bind(KICK_ADDR).await.unwrap();
     loop {
         let Ok((mut tcp, _)) = listener.accept().await else { continue };
-        let sessions = sessions.clone();
-        let cache = cache.clone();
+        let sess = sessions.clone(); let c = cache.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let Ok(n) = tcp.read(&mut buf).await else { return };
-            let raw = &buf[..n];
-            let first_line = std::str::from_utf8(raw.split(|&b| b == b'\n').next().unwrap_or(b"")).unwrap_or("").trim();
-
-            if first_line.starts_with("GET /kick?") {
-                let id = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").split_whitespace().next().unwrap_or("");
-                let reason = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("reason=")).unwrap_or("").split_whitespace().next().unwrap_or("kicked");
-                let kicked = if let Some(tx) = sessions.get(id) { let _ = tx.send(format!("KICK:{}", reason)).await; true } else { false };
-                let body = if kicked { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tcp.write_all(resp.as_bytes()).await;
-            } else if first_line.starts_with("GET /active") {
-                let ids: Vec<_> = sessions.iter().map(|kv| kv.key().clone()).collect();
+            let line = std::str::from_utf8(raw_line(&buf[..n])).unwrap_or("").trim();
+            if line.starts_with("GET /kick?") {
+                let id = find_param(line, "id="); let reason = find_param(line, "reason=");
+                let kicked = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send(format!("KICK:{}", reason.unwrap_or("kicked"))).await; true } else { false };
+                send_json_resp(&mut tcp, kicked).await;
+            } else if line.starts_with("GET /active") {
+                let ids: Vec<_> = sess.iter().map(|kv| kv.key().clone()).collect();
                 let body = format!(r#"{{"active":{}}}"#, serde_json::json!(ids));
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tcp.write_all(resp.as_bytes()).await;
-            } else if first_line.starts_with("GET /promote?") {
-                let id = first_line.split('?').nth(1).unwrap_or("").split('&').find_map(|p| p.strip_prefix("id=")).unwrap_or("").split_whitespace().next().unwrap_or("");
-                let promoted = if let Some(tx) = sessions.get(id) { let _ = tx.send("PROMOTE".to_string()).await; true } else { false };
-                let body = if promoted { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tcp.write_all(resp.as_bytes()).await;
-            } else if first_line.starts_with("GET /reload") {
-                load_users_into_cache(&cache);
-                let body = r#"{"ok":true}"#;
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
-                let _ = tcp.write_all(resp.as_bytes()).await;
-            } else {
-                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                let _ = tcp.write_all(resp.as_bytes()).await;
+                let _ = tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await;
+            } else if line.starts_with("GET /promote?") {
+                let id = find_param(line, "id=");
+                let promoted = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send("PROMOTE".to_string()).await; true } else { false };
+                send_json_resp(&mut tcp, promoted).await;
+            } else if line.starts_with("GET /reload") {
+                load_users_into_cache(&c);
+                send_json_resp(&mut tcp, true).await;
             }
         });
     }
 }
 
+fn raw_line(b: &[u8]) -> &[u8] { b.split(|&x| x == b'\n').next().unwrap_or(b"") }
+fn find_param<'a>(line: &'a str, p: &str) -> Option<&'a str> { line.split('?').nth(1)?.split('&').find(|part| part.starts_with(p))?.split('=').nth(1) }
+async fn send_json_resp(tcp: &mut TcpStream, ok: bool) {
+    let body = if ok { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
+    let _ = tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let sessions: Sessions = Arc::new(DashMap::new());
-    let auth_cache: AuthCache = Arc::new(DashMap::new());
-    load_users_into_cache(&auth_cache);
-    tokio::spawn(internal_server(sessions.clone(), auth_cache.clone()));
+    let sess: Sessions = Arc::new(DashMap::new());
+    let cache: AuthCache = Arc::new(DashMap::new());
+    load_users_into_cache(&cache);
+    tokio::spawn(internal_server(sess.clone(), cache.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
-    loop {
-        if let Ok((conn, _)) = listener.accept().await {
-            tokio::spawn(handle_conn(conn, sessions.clone(), auth_cache.clone()));
-        }
-    }
+    loop { if let Ok((c, _)) = listener.accept().await { tokio::spawn(handle_conn(c, sess.clone(), cache.clone())); } }
 }
 RSEOF
 
