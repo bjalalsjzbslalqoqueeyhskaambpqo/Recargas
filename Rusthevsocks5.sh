@@ -116,7 +116,7 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
     for line in raw.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.len() > needle.len() && line[..needle.len()].eq_ignore_ascii_case(needle) {
-            return std::str::from_utf8(line[needle.len()..].trim_ascii()).ok();
+            return std::str::from_utf8(&line[needle.len()..]).ok().map(|s| s.trim());
         }
     }
     None
@@ -204,11 +204,14 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
             buf.put_u8(b[0]);
-            let text = String::from_utf8_lossy(&buf);
-            if text.contains("X-Internal-ID:") && text.ends_with("\r\n\r\n") {
-                break;
+            
+            if buf.ends_with(b"\r\n\r\n") {
+                let text = String::from_utf8_lossy(&buf).to_lowercase();
+                if text.contains("x-internal-id:") {
+                    break;
+                }
             }
-            if buf.len() > 8192 {
+            if buf.len() > 16384 {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
         }
