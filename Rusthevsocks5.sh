@@ -46,7 +46,7 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use anyhow::Result;
-use bytes::{Bytes, BufMut, BytesMut};
+use bytes::{Bytes, Buf, BufMut, BytesMut};
 use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -124,7 +124,7 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
 
 async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
     let connect_addr = if authority.contains(':') { authority } else { format!("{}:80", authority) };
-    let Ok(Ok(mut tcp)) = time::timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await else {
+    let Ok(Ok(tcp)) = time::timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
     let _ = tcp.set_nodelay(true);
