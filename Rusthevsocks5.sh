@@ -14,11 +14,25 @@ edition = "2021"
 name = "btserver"
 path = "src/bin/btserver.rs"
 
+[[bin]]
+name = "panel"
+path = "src/bin/panel.rs"
+
 [dependencies]
 tokio              = { version = "1",    features = ["full"] }
+axum               = { version = "0.8"  }
 bytes              = "1"
+dashmap            = "6"
 h2                 = "0.3"
 http               = "0.2"
+socket2            = { version = "0.5", features = ["all"] }
+libc               = "0.2"
+serde              = { version = "1",   features = ["derive"] }
+serde_json         = "1"
+anyhow             = "1"
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level     = 3
@@ -29,54 +43,104 @@ panic         = "abort"
 TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
-use bytes::{Bytes, BytesMut};
-use h2::server;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use anyhow::Result;
+use bytes::{Bytes, BufMut, BytesMut};
+use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    time::{self, Duration},
+    sync::mpsc,
+    time,
 };
+use dashmap::DashMap;
 
 const LISTEN_ADDR: &str = "0.0.0.0:80";
+const USERS_FILE:  &str = "/opt/btserver/users.txt";
+const KICK_ADDR:   &str = "127.0.0.1:8091";
+
+type Sessions = Arc<DashMap<String, mpsc::Sender<String>>>;
+type AuthCache = Arc<DashMap<String, (String, i64)>>;
+
+#[inline(always)]
+fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
+
+fn parse_expires(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(ts) = s.parse::<i64>() { return Some(ts); }
+    let mut it = s.splitn(3, '-');
+    let y: i64 = it.next()?.parse().ok()?; let m: i64 = it.next()?.parse().ok()?; let d: i64 = it.next()?.parse().ok()?;
+    if y < 2000 || y > 2100 { return None; }
+    let m2 = if m <= 2 { m + 12 } else { m }; let y2 = if m <= 2 { y - 1 } else { y };
+    let a = y2 / 100; let b = 2 - a + a / 4;
+    let days = (365.25 * (y2 + 4716) as f64) as i64 + (30.6001 * (m2 + 1) as f64) as i64 + d + b - 1524 - 2440588;
+    Some(days * 86400 + 86399)
+}
+
+fn load_users_into_cache(cache: &AuthCache) {
+    let Ok(content) = std::fs::read_to_string(USERS_FILE) else { return };
+    cache.clear();
+    for line in content.lines() {
+        let line = line.trim(); if line.is_empty() || line.starts_with('#') { continue; }
+        let mut parts = line.splitn(3, ':');
+        let Some(uid) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let Some(exp) = parts.next() else { continue };
+        if let Some(exp_ts) = parse_expires(exp) {
+            cache.insert(uid.to_string(), (name.to_string(), exp_ts));
+        }
+    }
+}
+
+enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
+
+fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
+    if let Some(entry) = cache.get(id) {
+        let (name, exp_ts) = entry.value();
+        let now = now_secs();
+        if now > *exp_ts { return AuthResult::Expired; }
+        return AuthResult::Ok { name: name.clone(), secs_left: *exp_ts - now };
+    }
+    AuthResult::NotFound
+}
+
+#[inline(always)]
+fn valid_id(id: &str) -> bool {
+    if let Some(rest) = id.strip_prefix("S-") { return rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_alphanumeric()); }
+    if let Some(rest) = id.strip_prefix("STRK-") { return rest.len() == 48 && rest.bytes().all(|b| b.is_ascii_hexdigit()); }
+    false
+}
+
+fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
+    for line in raw.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > needle.len() && line[..needle.len()].eq_ignore_ascii_case(needle) {
+            return std::str::from_utf8(&line[needle.len()..]).ok().map(|s| s.trim());
+        }
+    }
+    None
+}
 
 async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
-    println!("[TCP] Conectando a {}...", authority);
-    let connect_addr = if authority.contains(':') { authority.clone() } else { format!("{}:80", authority) };
-    let Ok(Ok(mut tcp)) = time::timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await else {
-        println!("[-] Fallo al conectar TCP a {}", connect_addr);
-        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR);
-        return;
+    let connect_addr = if authority.contains(':') { authority } else { format!("{}:80", authority) };
+    let Ok(Ok(tcp)) = time::timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await else {
+        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
-    println!("[TCP] Conectado a {}. Iniciando proxy bidireccional.", authority);
     let _ = tcp.set_nodelay(true);
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-    
-    let auth_clone = authority.clone();
     let t_up = tokio::spawn(async move {
-        let mut total = 0;
         while let Some(Ok(chunk)) = req.data().await {
-            total += chunk.len();
-            println!("[TCP -> {}] Recibidos {} bytes del cliente H2 (Total: {})", auth_clone, chunk.len(), total);
             let _ = req.flow_control().release_capacity(chunk.len());
-            if tcp_w.write_all(&chunk).await.is_err() { 
-                println!("[-] Error escribiendo al destino {}", auth_clone);
-                break; 
-            }
+            if tcp_w.write_all(&chunk).await.is_err() { break; }
         }
         let _ = tcp_w.shutdown().await;
-        println!("[TCP -> {}] Fin de subida.", auth_clone);
     });
-    
-    let auth_clone2 = authority.clone();
     let t_dn = tokio::spawn(async move {
-        let mut buf = [0u8; 65536];
-        let mut total = 0;
-        while let Ok(n) = tcp_r.read(&mut buf).await {
+        let mut buf = BytesMut::with_capacity(65536);
+        while let Ok(n) = tcp_r.read_buf(&mut buf).await {
             if n == 0 { break; }
-            total += n;
-            println!("[TCP <- {}] Recibidos {} bytes del destino (Total: {})", auth_clone2, n, total);
-            let mut chunk = Bytes::copy_from_slice(&buf[..n]);
+            let mut chunk = buf.split().freeze();
             while !chunk.is_empty() {
                 resp_tx.reserve_capacity(chunk.len());
                 if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
@@ -86,28 +150,21 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
             }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
-        println!("[TCP <- {}] Fin de bajada.", auth_clone2);
     });
     let _ = tokio::join!(t_up, t_dn);
-    println!("[*] Stream TCP cerrado: {}", authority);
 }
 
 async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
-    println!("[UDP] Conectando a {}...", authority);
     let Ok(udp) = UdpSocket::bind("0.0.0.0:0").await else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
     if time::timeout(Duration::from_secs(3), udp.connect(&authority)).await.is_err() {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     }
-    println!("[UDP] Conectado a {}. Iniciando proxy bidireccional.", authority);
     let udp = Arc::new(udp);
     let u_rx = udp.clone(); let u_tx = udp.clone();
-    
-    let auth_clone = authority.clone();
     let t_up = tokio::spawn(async move {
         let mut buf = BytesMut::new();
-        let mut total = 0;
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             buf.extend_from_slice(&chunk);
@@ -115,22 +172,14 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
                 let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
                 if buf.len() < 2 + len { break; }
                 let payload = buf[2..2+len].to_vec();
-                buf.split_to(2 + len);
-                total += payload.len();
-                println!("[UDP -> {}] Enviando {} bytes (Total: {})", auth_clone, payload.len(), total);
+                let _ = buf.split_to(2 + len);
                 if u_tx.send(&payload).await.is_err() { return; }
             }
         }
-        println!("[UDP -> {}] Fin de subida.", auth_clone);
     });
-    
-    let auth_clone2 = authority.clone();
     let t_dn = tokio::spawn(async move {
         let mut b = [0u8; 65536];
-        let mut total = 0;
         while let Ok(Ok(n)) = time::timeout(Duration::from_secs(60), u_rx.recv(&mut b)).await {
-            total += n;
-            println!("[UDP <- {}] Recibidos {} bytes (Total: {})", auth_clone2, n, total);
             let mut p = BytesMut::with_capacity(2 + n);
             p.extend_from_slice(&(n as u16).to_be_bytes());
             p.extend_from_slice(&b[..n]);
@@ -139,97 +188,153 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
                 resp_tx.reserve_capacity(chunk.len());
                 if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
                     let data = chunk.split_to(std::cmp::min(cap, chunk.len()));
-                    if resp_tx.send_data(data, false).is_err() { return; }
-                } else { return; }
+                    if resp_tx.send_data(data, false).is_err() { break; }
+                } else { break; }
             }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
-        println!("[UDP <- {}] Fin de bajada.", auth_clone2);
     });
     let _ = tokio::join!(t_up, t_dn);
-    println!("[*] Stream UDP cerrado: {}", authority);
 }
 
-async fn handle_conn(mut tcp: TcpStream) {
+async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let _ = tcp.set_nodelay(true);
     let mut buf = Vec::new();
     let mut b = [0u8; 1];
     
-    println!("\n[+] Nueva conexión TCP entrante...");
-    
     let read_req = time::timeout(Duration::from_secs(10), async {
         loop {
-            if tcp.read_exact(&mut b).await.is_err() { return Err(()); }
+            if tcp.read_exact(&mut b).await.is_err() {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
             buf.push(b[0]);
             if buf.ends_with(b"\r\n\r\n") {
                 let text = String::from_utf8_lossy(&buf).to_lowercase();
-                if text.contains("upgrade: websocket") { break; }
+                if text.contains("x-internal-id:") || text.contains("upgrade: websocket") {
+                    break;
+                }
             }
-            if buf.len() > 8192 { return Err(()); }
+            if buf.len() > 16384 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
         }
         Ok(())
     }).await;
     
-    if read_req.is_err() || read_req.unwrap().is_err() { 
-        println!("[-] Handshake HTTP fallido o timeout.");
-        return; 
-    }
+    if read_req.is_err() || read_req.unwrap().is_err() { return; }
+    let raw = &buf[..];
     
-    println!("[+] Handshake HTTP recibido. Enviando 101 Switching Protocols...");
-    let resp = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-User-Name: debug\r\nX-User-Secs: 9999\r\n\r\n";
-    if tcp.write_all(resp.as_bytes()).await.is_err() { return; }
-    
-    println!("[+] Iniciando H2...");
-    let mut h2 = match server::Builder::new()
-        .initial_connection_window_size(10485760)
-        .initial_window_size(5242880)
-        .max_concurrent_streams(4096)
-        .handshake(tcp).await 
-    {
-        Ok(h) => h, 
-        Err(e) => { println!("[-] Error H2 Handshake: {}", e); return; }
+    let user_id = match extract_header(raw, b"x-internal-id:") { 
+        Some(id) => id.to_string(), 
+        None => "debug".to_string() 
     };
     
-    println!("[+] H2 inicializado correctamente. Esperando streams...");
+    if !valid_id(&user_id) && user_id != "debug" { return; }
     
-    while let Some(res) = h2.accept().await {
-        let (req, mut respond) = match res { 
-            Ok(r) => r, 
-            Err(e) => { println!("[-] Error aceptando stream: {}", e); continue; }
-        };
-        
-        let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
-        if authority.is_empty() { 
-            println!("[-] Stream rechazado: No tiene authority.");
-            continue; 
+    let (tx, mut rx) = mpsc::channel::<String>(10);
+    sessions.insert(user_id.clone(), tx);
+    
+    let auth_res = if user_id == "debug" {
+        AuthResult::Ok { name: "debug".to_string(), secs_left: 9999 }
+    } else {
+        check_auth(&user_id, &cache)
+    };
+
+    match auth_res {
+        AuthResult::Ok { name, secs_left } => {
+            let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
+            if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
+            
+            let mut h2 = match server::Builder::new()
+                .initial_connection_window_size(10485760)
+                .initial_window_size(5242880)
+                .max_concurrent_streams(4096)
+                .handshake(tcp).await 
+            {
+                Ok(h) => h, 
+                Err(_) => { sessions.remove(&user_id); return; }
+            };
+            
+            loop {
+                tokio::select! {
+                    res = h2.accept() => {
+                        let (req, mut respond) = match res { Some(Ok(r)) => r, _ => break };
+                        let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+                        if authority.is_empty() { continue; }
+                        let is_udp = req.headers().contains_key("x-udp-cmd");
+                        let resp_tx = match respond.send_response(http::Response::builder().status(200).body(()).unwrap(), false) { Ok(tx) => tx, Err(_) => continue };
+                        if is_udp { tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority)); }
+                        else { tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority)); }
+                    }
+                    _ = rx.recv() => { break; }
+                }
+            }
         }
-        
-        let is_udp = req.headers().contains_key("x-udp-cmd");
-        println!("[>] Nuevo stream H2 -> {} (UDP: {})", authority, is_udp);
-        
-        let resp_tx = match respond.send_response(http::Response::builder().status(200).body(()).unwrap(), false) { 
-            Ok(tx) => tx, 
-            Err(e) => { println!("[-] Error enviando 200 OK al stream: {}", e); continue; }
-        };
-        
-        if is_udp { tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority)); }
-        else { tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority)); }
+        AuthResult::NotFound | AuthResult::Expired => {
+            let s = match auth_res { AuthResult::Expired => "expired", _ => "not_registered" };
+            let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Wait-Status: {s}\r\n\r\n");
+            if tcp.write_all(resp.as_bytes()).await.is_ok() {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        if let Some(m) = msg {
+                            if m == "PROMOTE" { let _ = tcp.write_all(b"PROMOTED\n").await; }
+                            else if m.starts_with("KICK:") { let _ = tcp.write_all(format!("KICKED:{}\n", &m[5..]).as_bytes()).await; }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(180)) => { let _ = tcp.write_all(b"TIMEOUT\n").await; }
+                }
+            }
+        }
     }
-    println!("[-] Conexión H2 finalizada.");
+    sessions.remove(&user_id);
+}
+
+async fn internal_server(sessions: Sessions, cache: AuthCache) {
+    let listener = TcpListener::bind(KICK_ADDR).await.unwrap();
+    loop {
+        let Ok((mut tcp, _)) = listener.accept().await else { continue };
+        let sess = sessions.clone(); let c = cache.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let Ok(n) = tcp.read(&mut buf).await else { return };
+            let line = std::str::from_utf8(raw_line(&buf[..n])).unwrap_or("").trim();
+            if line.starts_with("GET /kick?") {
+                let id = find_param(line, "id="); let reason = find_param(line, "reason=");
+                let kicked = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send(format!("KICK:{}", reason.unwrap_or("kicked"))).await; true } else { false };
+                send_json_resp(&mut tcp, kicked).await;
+            } else if line.starts_with("GET /active") {
+                let ids: Vec<_> = sess.iter().map(|kv| kv.key().clone()).collect();
+                let body = format!(r#"{{"active":{}}}"#, serde_json::json!(ids));
+                let _ = tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await;
+            } else if line.starts_with("GET /promote?") {
+                let id = find_param(line, "id=");
+                let promoted = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send("PROMOTE".to_string()).await; true } else { false };
+                send_json_resp(&mut tcp, promoted).await;
+            } else if line.starts_with("GET /reload") {
+                load_users_into_cache(&c);
+                send_json_resp(&mut tcp, true).await;
+            }
+        });
+    }
+}
+
+fn raw_line(b: &[u8]) -> &[u8] { b.split(|&x| x == b'\n').next().unwrap_or(b"") }
+fn find_param<'a>(line: &'a str, p: &str) -> Option<&'a str> { line.split('?').nth(1)?.split('&').find(|part| part.starts_with(p))?.split('=').nth(1) }
+async fn send_json_resp(tcp: &mut TcpStream, ok: bool) {
+    let body = if ok { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
+    let _ = tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await;
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("[*] Servidor Simple H2 iniciado en {}", LISTEN_ADDR);
+    let sess: Sessions = Arc::new(DashMap::new());
+    let cache: AuthCache = Arc::new(DashMap::new());
+    load_users_into_cache(&cache);
+    tokio::spawn(internal_server(sess.clone(), cache.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
-    loop { 
-        if let Ok((c, _)) = listener.accept().await { 
-            tokio::spawn(handle_conn(c)); 
-        } 
-    }
+    loop { if let Ok((c, _)) = listener.accept().await { tokio::spawn(handle_conn(c, sess.clone(), cache.clone())); } }
 }
 RSEOF
-
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
