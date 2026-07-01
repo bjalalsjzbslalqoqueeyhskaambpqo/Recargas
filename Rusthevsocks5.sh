@@ -7,7 +7,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "9.5.1"
+version = "9.5.2-test"
 edition = "2021"
 
 [[bin]]
@@ -89,13 +89,11 @@ fn load_users_into_cache(cache: &AuthCache) {
 enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 
 fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
-    if let Some(entry) = cache.get(id) {
-        let (name, exp_ts) = entry.value();
-        let now = now_secs();
-        if now > *exp_ts { return AuthResult::Expired; }
-        return AuthResult::Ok { name: name.clone(), secs_left: *exp_ts - now };
-    }
-    AuthResult::NotFound
+    // =========================================================================
+    // MODO PRUEBA DE FLUJO: ¡ACEPTAMOS A TODOS IGNORANDO LA CACHÉ!
+    // Así descartamos problemas de base de datos o panel y probamos internet
+    // =========================================================================
+    AuthResult::Ok { name: format!("User-{}", id), secs_left: 999999 }
 }
 
 #[inline(always)]
@@ -197,6 +195,8 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     
     let (tx, mut rx) = mpsc::channel::<String>(10);
     sessions.insert(user_id.clone(), tx);
+    
+    // AHORA ESTO SIEMPRE DARÁ "OK"
     let auth_res = check_auth(&user_id, &cache);
     
     match auth_res {
@@ -487,3 +487,7 @@ RSEOF
 
 cd "$PROJ"
 cargo build --release
+
+# Reiniciamos los servicios para que aplique
+systemctl restart btserver || pkill -f btserver
+nohup ./target/release/btserver &
