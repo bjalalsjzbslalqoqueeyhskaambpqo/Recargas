@@ -7,7 +7,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "9.5.0"
+version = "9.5.1"
 edition = "2021"
 
 [[bin]]
@@ -48,12 +48,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::{Bytes, Buf, BufMut, BytesMut};
 use h2::server;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
-    time,
-};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}, sync::mpsc, time};
 use dashmap::DashMap;
 
 const LISTEN_ADDR: &str = "0.0.0.0:80";
@@ -87,9 +82,7 @@ fn load_users_into_cache(cache: &AuthCache) {
         let Some(uid) = parts.next() else { continue };
         let Some(name) = parts.next() else { continue };
         let Some(exp) = parts.next() else { continue };
-        if let Some(exp_ts) = parse_expires(exp) {
-            cache.insert(uid.to_string(), (name.to_string(), exp_ts));
-        }
+        if let Some(exp_ts) = parse_expires(exp) { cache.insert(uid.to_string(), (name.to_string(), exp_ts)); }
     }
 }
 
@@ -154,12 +147,8 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
 }
 
 async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
-    let Ok(udp) = UdpSocket::bind("0.0.0.0:0").await else {
-        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
-    };
-    if time::timeout(Duration::from_secs(3), udp.connect(&authority)).await.is_err() {
-        let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
-    }
+    let Ok(udp) = UdpSocket::bind("0.0.0.0:0").await else { let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return; };
+    if time::timeout(Duration::from_secs(3), udp.connect(&authority)).await.is_err() { let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return; }
     let udp = Arc::new(udp);
     let u_rx = udp.clone(); let u_tx = udp.clone();
     let t_up = tokio::spawn(async move {
@@ -205,18 +194,20 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let raw = &buf[..];
     let user_id = match extract_header(raw, b"x-internal-id:") { Some(id) => id.to_string(), None => return };
     if !valid_id(&user_id) { return; }
+    
     let (tx, mut rx) = mpsc::channel::<String>(10);
     sessions.insert(user_id.clone(), tx);
     let auth_res = check_auth(&user_id, &cache);
+    
     match auth_res {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
-            let mut preface = [0u8; 24];
-            if tcp.read_exact(&mut preface).await.is_err() { sessions.remove(&user_id); return; }
+            
             let mut h2 = match server::Builder::new().initial_connection_window_size(8388608).initial_window_size(8388608).max_concurrent_streams(4096).handshake(tcp).await {
                 Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
             };
+            
             loop {
                 tokio::select! {
                     res = h2.accept() => {
@@ -341,9 +332,7 @@ impl AppState {
         hits.push(now); if map.len() > 1000 { map.clear(); }
         true
     }
-    fn check_token(&self, headers: &HeaderMap) -> bool {
-        headers.get("x-token").and_then(|v| v.to_str().ok()).map(|t| t.trim() == self.token.as_str()).unwrap_or(false)
-    }
+    fn check_token(&self, headers: &HeaderMap) -> bool { headers.get("x-token").and_then(|v| v.to_str().ok()).map(|t| t.trim() == self.token.as_str()).unwrap_or(false) }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)] struct User { name: String, expires_ts: i64 }
@@ -377,9 +366,7 @@ fn user_row(id: &str, u: &User) -> serde_json::Value {
     serde_json::json!({ "id": id, "name": u.name, "expires_ts": u.expires_ts, "secs_left": secs_left, "active": secs_left > 0 })
 }
 
-async fn reload_proxy() {
-    if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(RELOAD_URL).send().await; }
-}
+async fn reload_proxy() { if let Ok(c) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() { let _ = c.get(RELOAD_URL).send().await; } }
 
 async fn kick_user(id: String, reason: &'static str) {
     let url = format!("{KICK_BASE}{id}&reason={reason}");
@@ -419,9 +406,7 @@ async fn handle_clients(State(st): State<AppState>, headers: HeaderMap, ConnectI
     let active = fetch_active_ids().await;
     let _l = st.users_mu.lock().await;
     let users = load_users().await;
-    let rows: Vec<_> = users.iter().map(|(id, u)| {
-        let mut row = user_row(id, u); row["connected"] = serde_json::json!(active.contains(id.as_str())); row
-    }).collect();
+    let rows: Vec<_> = users.iter().map(|(id, u)| { let mut row = user_row(id, u); row["connected"] = serde_json::json!(active.contains(id.as_str())); row }).collect();
     (StatusCode::OK, Json(serde_json::json!({"clients":rows,"total":rows.len()})))
 }
 
