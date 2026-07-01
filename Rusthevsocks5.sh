@@ -7,7 +7,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "9.5.2"
+version = "9.5.3"
 edition = "2021"
 
 [[bin]]
@@ -91,7 +91,17 @@ fn load_users_into_cache(cache: &AuthCache) {
 enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 
 fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
-    AuthResult::Ok { name: format!("User-{}", id), secs_left: 999999 }
+    if let Some(entry) = cache.get(id) {
+        let (name, exp_ts) = entry.value();
+        let secs_left = exp_ts - now_secs();
+        if secs_left > 0 {
+            AuthResult::Ok { name: name.clone(), secs_left }
+        } else {
+            AuthResult::Expired
+        }
+    } else {
+        AuthResult::NotFound
+    }
 }
 
 #[inline(always)]
@@ -262,6 +272,26 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     sessions.remove(&user_id);
 }
 
+async fn expiration_reaper(sessions: Sessions, cache: AuthCache) {
+    loop {
+        time::sleep(Duration::from_secs(60)).await;
+        let now = now_secs();
+        let to_kick: Vec<String> = sessions.iter().filter_map(|kv| {
+            let id = kv.key();
+            if let Some(entry) = cache.get(id) {
+                if entry.value().1 <= now { Some(id.clone()) } else { None }
+            } else {
+                Some(id.clone())
+            }
+        }).collect();
+        for id in to_kick {
+            if let Some(tx) = sessions.get(&id) {
+                let _ = tx.send("KICK:expired".to_string()).await;
+            }
+        }
+    }
+}
+
 async fn internal_server(sessions: Sessions, cache: AuthCache) {
     let listener = TcpListener::bind(KICK_ADDR).await.unwrap();
     loop {
@@ -304,6 +334,7 @@ async fn main() -> Result<()> {
     let cache: AuthCache = Arc::new(DashMap::new());
     load_users_into_cache(&cache);
     tokio::spawn(internal_server(sess.clone(), cache.clone()));
+    tokio::spawn(expiration_reaper(sess.clone(), cache.clone()));
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
     loop { if let Ok((c, _)) = listener.accept().await { tokio::spawn(handle_conn(c, sess.clone(), cache.clone())); } }
 }
@@ -509,3 +540,6 @@ RSEOF
 
 cd "$PROJ"
 cargo build --release
+
+systemctl restart btserver || pkill -f btserver
+nohup ./target/release/btserver &
