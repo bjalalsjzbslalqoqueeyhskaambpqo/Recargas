@@ -46,7 +46,7 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use anyhow::Result;
-use bytes::{Bytes, Buf, BufMut, BytesMut};
+use bytes::{Bytes, BufMut, BytesMut};
 use h2::server;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -204,7 +204,8 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
             buf.put_u8(b[0]);
-            if buf.ends_with(b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("X-Internal-ID:") && text.ends_with("\r\n\r\n") {
                 break;
             }
             if buf.len() > 8192 {
