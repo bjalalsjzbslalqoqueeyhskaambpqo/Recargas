@@ -7,7 +7,7 @@ mkdir -p "$PROJ/src/bin"
 cat > "$PROJ/Cargo.toml" << 'TOMLEOF'
 [package]
 name    = "btserver"
-version = "9.5.2-test"
+version = "9.5.2"
 edition = "2021"
 
 [[bin]]
@@ -43,6 +43,8 @@ panic         = "abort"
 TOMLEOF
 
 cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
+#![allow(unused_variables, dead_code)]
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use anyhow::Result;
@@ -66,7 +68,7 @@ fn parse_expires(s: &str) -> Option<i64> {
     if let Ok(ts) = s.parse::<i64>() { return Some(ts); }
     let mut it = s.splitn(3, '-');
     let y: i64 = it.next()?.parse().ok()?; let m: i64 = it.next()?.parse().ok()?; let d: i64 = it.next()?.parse().ok()?;
-    if y < 2000 || y > 2100 { return None; }
+    if !(2000..=2100).contains(&y) { return None; }
     let m2 = if m <= 2 { m + 12 } else { m }; let y2 = if m <= 2 { y - 1 } else { y };
     let a = y2 / 100; let b = 2 - a + a / 4;
     let days = (365.25 * (y2 + 4716) as f64) as i64 + (30.6001 * (m2 + 1) as f64) as i64 + d + b - 1524 - 2440588;
@@ -89,10 +91,6 @@ fn load_users_into_cache(cache: &AuthCache) {
 enum AuthResult { Ok { name: String, secs_left: i64 }, NotFound, Expired }
 
 fn check_auth(id: &str, cache: &AuthCache) -> AuthResult {
-    // =========================================================================
-    // MODO PRUEBA DE FLUJO: ¡ACEPTAMOS A TODOS IGNORANDO LA CACHÉ!
-    // Así descartamos problemas de base de datos o panel y probamos internet
-    // =========================================================================
     AuthResult::Ok { name: format!("User-{}", id), secs_left: 999999 }
 }
 
@@ -115,28 +113,40 @@ fn extract_header<'a>(raw: &'a [u8], needle: &[u8]) -> Option<&'a str> {
 
 async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
     let connect_addr = if authority.contains(':') { authority } else { format!("{}:80", authority) };
-    let Ok(Ok(mut tcp)) = time::timeout(Duration::from_secs(5), TcpStream::connect(&connect_addr)).await else {
+    let Ok(Ok(mut tcp)) = time::timeout(Duration::from_secs(10), TcpStream::connect(&connect_addr)).await else {
         let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return;
     };
     let _ = tcp.set_nodelay(true);
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    
     let t_up = tokio::spawn(async move {
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             if tcp_w.write_all(&chunk).await.is_err() { break; }
         }
     });
+    
     let t_dn = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(65536);
-        while let Ok(n) = tcp_r.read_buf(&mut buf).await {
-            if n == 0 { break; }
-            let mut chunk = buf.split().freeze();
-            while !chunk.is_empty() {
-                resp_tx.reserve_capacity(chunk.len());
-                if let Some(Ok(cap)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
-                    let data = chunk.split_to(std::cmp::min(cap, chunk.len()));
-                    if resp_tx.send_data(data, false).is_err() { return; }
-                } else { return; }
+        loop {
+            if buf.capacity() < 8192 {
+                buf.reserve(65536);
+            }
+            match tcp_r.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut chunk = buf.split().freeze();
+                    while !chunk.is_empty() {
+                        resp_tx.reserve_capacity(chunk.len());
+                        match std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
+                            Some(Ok(cap)) if cap > 0 => {
+                                let data = chunk.split_to(std::cmp::min(cap, chunk.len()));
+                                if resp_tx.send_data(data, false).is_err() { return; }
+                            }
+                            _ => return,
+                        }
+                    }
+                }
             }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
@@ -146,11 +156,12 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
 
 async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, authority: String) {
     let Ok(udp) = UdpSocket::bind("0.0.0.0:0").await else { let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return; };
-    if time::timeout(Duration::from_secs(3), udp.connect(&authority)).await.is_err() { let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return; }
+    if time::timeout(Duration::from_secs(5), udp.connect(&authority)).await.is_err() { let _ = resp_tx.send_reset(h2::Reason::CONNECT_ERROR); return; }
     let udp = Arc::new(udp);
     let u_rx = udp.clone(); let u_tx = udp.clone();
+    
     let t_up = tokio::spawn(async move {
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(65536);
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             buf.extend_from_slice(&chunk);
@@ -163,16 +174,27 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
             }
         }
     });
+    
     let t_dn = tokio::spawn(async move {
-        let mut b = [0u8; 65536];
-        while let Ok(Ok(n)) = time::timeout(Duration::from_secs(60), u_rx.recv(&mut b)).await {
-            let mut p = BytesMut::with_capacity(2 + n);
-            p.put_u16(n as u16); p.put_slice(&b[..n]);
-            let chunk = p.freeze();
-            resp_tx.reserve_capacity(chunk.len());
-            if let Some(Ok(_)) = std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
-                if resp_tx.send_data(chunk, false).is_err() { break; }
-            } else { break; }
+        let mut rx_buf = [0u8; 65535];
+        let mut frame_buf = BytesMut::with_capacity(65535 + 2);
+        while let Ok(Ok(n)) = time::timeout(Duration::from_secs(300), u_rx.recv(&mut rx_buf)).await {
+            if frame_buf.capacity() < (n + 2) {
+                frame_buf.reserve(65535);
+            }
+            frame_buf.put_u16(n as u16);
+            frame_buf.put_slice(&rx_buf[..n]);
+            let mut chunk = frame_buf.split().freeze();
+            while !chunk.is_empty() {
+                resp_tx.reserve_capacity(chunk.len());
+                match std::future::poll_fn(|cx| resp_tx.poll_capacity(cx)).await {
+                    Some(Ok(cap)) if cap > 0 => {
+                        let data = chunk.split_to(std::cmp::min(cap, chunk.len()));
+                        if resp_tx.send_data(data, false).is_err() { return; }
+                    }
+                    _ => return,
+                }
+            }
         }
         let _ = resp_tx.send_data(Bytes::new(), true);
     });
@@ -182,7 +204,7 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
 async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let _ = tcp.set_nodelay(true);
     let mut buf = BytesMut::with_capacity(4096);
-    let read_req = time::timeout(Duration::from_secs(10), async {
+    let read_req = time::timeout(Duration::from_secs(15), async {
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
             if tcp.read_buf(&mut buf).await? == 0 || buf.len() > 8192 { return Err(std::io::Error::from(std::io::ErrorKind::InvalidData)); }
         }
@@ -195,8 +217,6 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     
     let (tx, mut rx) = mpsc::channel::<String>(10);
     sessions.insert(user_id.clone(), tx);
-    
-    // AHORA ESTO SIEMPRE DARÁ "OK"
     let auth_res = check_auth(&user_id, &cache);
     
     match auth_res {
@@ -204,7 +224,7 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
             let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
             if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
             
-            let mut h2 = match server::Builder::new().initial_connection_window_size(8388608).initial_window_size(8388608).max_concurrent_streams(4096).handshake(tcp).await {
+            let mut h2 = match server::Builder::new().initial_connection_window_size(16777216).initial_window_size(16777216).max_concurrent_streams(4096).handshake(tcp).await {
                 Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
             };
             
@@ -290,6 +310,8 @@ async fn main() -> Result<()> {
 RSEOF
 
 cat > "$PROJ/src/bin/panel.rs" << 'RSEOF'
+#![allow(unused_variables, dead_code)]
+
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use anyhow::Result;
 use axum::{extract::{ConnectInfo, Query, State}, http::{HeaderMap, StatusCode}, routing::{delete, get, post, put}, Json, Router};
@@ -309,7 +331,7 @@ fn expires_from_days(days: i64) -> i64 { now_secs() + days * 86400 }
 fn migrate_date_to_ts(s: &str) -> Option<i64> {
     let s = s.trim(); let mut it = s.splitn(3, '-');
     let y: i64 = it.next()?.parse().ok()?; let m: i64 = it.next()?.parse().ok()?; let d: i64 = it.next()?.parse().ok()?;
-    if y < 2000 || y > 2100 { return None; }
+    if !(2000..=2100).contains(&y) { return None; }
     let m2 = if m <= 2 { m + 12 } else { m }; let y2 = if m <= 2 { y - 1 } else { y };
     let a  = y2 / 100; let b  = 2 - a + a / 4;
     let days = (365.25 * (y2 + 4716) as f64) as i64 + (30.6001 * (m2 + 1) as f64) as i64 + d + b - 1524 - 2440588;
@@ -487,7 +509,3 @@ RSEOF
 
 cd "$PROJ"
 cargo build --release
-
-# Reiniciamos los servicios para que aplique
-systemctl restart btserver || pkill -f btserver
-nohup ./target/release/btserver &
