@@ -198,16 +198,17 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
     let mut buf = BytesMut::with_capacity(8192);
     
     let read_req = time::timeout(Duration::from_secs(10), async {
+        let mut b = [0u8; 1];
         loop {
-            if tcp.read_buf(&mut buf).await? == 0 || buf.len() > 8192 {
+            if tcp.read_exact(&mut b).await.is_err() {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
-            let text = String::from_utf8_lossy(&buf);
-            if text.contains("x-internal-id:") && text.ends_with("\r\n\r\n") {
+            buf.put_u8(b[0]);
+            if buf.ends_with(b"\r\n\r\n") {
                 break;
             }
-            if !text.contains("PACHTS ") && text.ends_with("\r\n\r\n") {
-                break;
+            if buf.len() > 8192 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
         }
         Ok(())
@@ -233,35 +234,23 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
             if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
             
             let mut h2 = match server::Builder::new()
-                .initial_connection_window_size(10485760)
-                .initial_window_size(5242880)
+                .initial_connection_window_size(8388608)
+                .initial_window_size(8388608)
                 .max_concurrent_streams(4096)
                 .handshake(tcp).await 
             {
                 Ok(h) => h, 
-                Err(_) => { 
-                    sessions.remove(&user_id); 
-                    return; 
-                }
+                Err(_) => { sessions.remove(&user_id); return; }
             };
             
             loop {
                 tokio::select! {
                     res = h2.accept() => {
-                        let (req, mut respond) = match res { 
-                            Some(Ok(r)) => r, 
-                            _ => break 
-                        };
-                        
+                        let (req, mut respond) = match res { Some(Ok(r)) => r, _ => break };
                         let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
                         if authority.is_empty() { continue; }
-                        
                         let is_udp = req.headers().contains_key("x-udp-cmd");
-                        let resp_tx = match respond.send_response(http::Response::builder().status(200).body(()).unwrap(), false) { 
-                            Ok(tx) => tx, 
-                            Err(_) => continue 
-                        };
-                        
+                        let resp_tx = match respond.send_response(http::Response::builder().status(200).body(()).unwrap(), false) { Ok(tx) => tx, Err(_) => continue };
                         if is_udp { tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority)); }
                         else { tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority)); }
                     }
