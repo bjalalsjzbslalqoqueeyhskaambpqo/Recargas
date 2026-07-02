@@ -46,6 +46,7 @@ cat > "$PROJ/src/bin/btserver.rs" << 'RSEOF'
 #![allow(unused_variables, dead_code)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::Result;
 use bytes::{Bytes, Buf, BufMut, BytesMut};
@@ -57,8 +58,10 @@ const LISTEN_ADDR: &str = "0.0.0.0:80";
 const USERS_FILE:  &str = "/opt/btserver/users.txt";
 const KICK_ADDR:   &str = "127.0.0.1:8091";
 
-type Sessions = Arc<DashMap<String, mpsc::Sender<String>>>;
+type Sessions = Arc<DashMap<String, (u64, mpsc::Sender<String>)>>;
 type AuthCache = Arc<DashMap<String, (String, i64)>>;
+
+static CONN_ID_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 fn now_secs() -> i64 { 
@@ -220,22 +223,34 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
         }
         Ok(())
     }).await;
+    
     if read_req.is_err() || read_req.unwrap().is_err() { return; }
     let raw = &buf[..];
     let user_id = match extract_header(raw, b"x-internal-id:") { Some(id) => id.to_string(), None => return };
     if !valid_id(&user_id) { return; }
     
+    let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel::<String>(10);
-    sessions.insert(user_id.clone(), tx);
+    
+    if let Some(old_session) = sessions.insert(user_id.clone(), (conn_id, tx)) {
+        let _ = old_session.1.send("KICK:reconnected".to_string()).await;
+    }
+    
     let auth_res = check_auth(&user_id, &cache);
     
     match auth_res {
         AuthResult::Ok { name, secs_left } => {
             let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-User-Name: {name}\r\nX-User-Secs: {secs_left}\r\n\r\n");
-            if tcp.write_all(resp.as_bytes()).await.is_err() { sessions.remove(&user_id); return; }
+            if tcp.write_all(resp.as_bytes()).await.is_err() { 
+                sessions.remove_if(&user_id, |_, (id, _)| *id == conn_id); 
+                return; 
+            }
             
             let mut h2 = match server::Builder::new().initial_connection_window_size(16777216).initial_window_size(16777216).max_concurrent_streams(4096).handshake(tcp).await {
-                Ok(h) => h, Err(_) => { sessions.remove(&user_id); return; }
+                Ok(h) => h, Err(_) => { 
+                    sessions.remove_if(&user_id, |_, (id, _)| *id == conn_id); 
+                    return; 
+                }
             };
             
             loop {
@@ -249,7 +264,13 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
                         if is_udp { tokio::spawn(proxy_udp(req.into_body(), resp_tx, authority)); }
                         else { tokio::spawn(proxy_tcp(req.into_body(), resp_tx, authority)); }
                     }
-                    _ = rx.recv() => { break; }
+                    msg = rx.recv() => {
+                        if let Some(m) = msg {
+                            if m.starts_with("KICK:") { break; }
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -269,7 +290,8 @@ async fn handle_conn(mut tcp: TcpStream, sessions: Sessions, cache: AuthCache) {
             }
         }
     }
-    sessions.remove(&user_id);
+    
+    sessions.remove_if(&user_id, |_, (id, _)| *id == conn_id);
 }
 
 async fn expiration_reaper(sessions: Sessions, cache: AuthCache) {
@@ -285,8 +307,8 @@ async fn expiration_reaper(sessions: Sessions, cache: AuthCache) {
             }
         }).collect();
         for id in to_kick {
-            if let Some(tx) = sessions.get(&id) {
-                let _ = tx.send("KICK:expired".to_string()).await;
+            if let Some(entry) = sessions.get(&id) {
+                let _ = entry.value().1.send("KICK:expired".to_string()).await;
             }
         }
     }
@@ -303,7 +325,7 @@ async fn internal_server(sessions: Sessions, cache: AuthCache) {
             let line = std::str::from_utf8(raw_line(&buf[..n])).unwrap_or("").trim();
             if line.starts_with("GET /kick?") {
                 let id = find_param(line, "id="); let reason = find_param(line, "reason=");
-                let kicked = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send(format!("KICK:{}", reason.unwrap_or("kicked"))).await; true } else { false };
+                let kicked = if let Some(entry) = sess.get(id.unwrap_or("")) { let _ = entry.value().1.send(format!("KICK:{}", reason.unwrap_or("kicked"))).await; true } else { false };
                 send_json_resp(&mut tcp, kicked).await;
             } else if line.starts_with("GET /active") {
                 let ids: Vec<_> = sess.iter().map(|kv| kv.key().clone()).collect();
@@ -311,7 +333,7 @@ async fn internal_server(sessions: Sessions, cache: AuthCache) {
                 let _ = tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await;
             } else if line.starts_with("GET /promote?") {
                 let id = find_param(line, "id=");
-                let promoted = if let Some(tx) = sess.get(id.unwrap_or("")) { let _ = tx.send("PROMOTE".to_string()).await; true } else { false };
+                let promoted = if let Some(entry) = sess.get(id.unwrap_or("")) { let _ = entry.value().1.send("PROMOTE".to_string()).await; true } else { false };
                 send_json_resp(&mut tcp, promoted).await;
             } else if line.starts_with("GET /reload") {
                 load_users_into_cache(&c);
