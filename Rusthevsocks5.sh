@@ -142,10 +142,10 @@ async fn proxy_tcp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     });
     
     let t_dn = tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(65536);
+        let mut buf = BytesMut::with_capacity(8192);
         loop {
             if buf.capacity() < 8192 {
-                buf.reserve(65536);
+                buf.reserve(8192);
             }
             match tcp_r.read_buf(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -176,7 +176,7 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     let u_rx = udp.clone(); let u_tx = udp.clone();
     
     let t_up = tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(65536);
+        let mut buf = BytesMut::with_capacity(8192);
         while let Some(Ok(chunk)) = req.data().await {
             let _ = req.flow_control().release_capacity(chunk.len());
             buf.extend_from_slice(&chunk);
@@ -192,11 +192,15 @@ async fn proxy_udp(mut req: h2::RecvStream, mut resp_tx: h2::SendStream<Bytes>, 
     
     let t_dn = tokio::spawn(async move {
         let mut rx_buf = [0u8; 2048];
+        let mut out_buf = BytesMut::with_capacity(8192);
+        
         while let Ok(Ok(n)) = time::timeout(Duration::from_secs(300), u_rx.recv(&mut rx_buf)).await {
-            let mut chunk = BytesMut::with_capacity(n + 2);
-            chunk.put_u16(n as u16);
-            chunk.put_slice(&rx_buf[..n]);
-            let mut data = chunk.freeze();
+            if out_buf.capacity() < n + 2 {
+                out_buf.reserve(8192);
+            }
+            out_buf.put_u16(n as u16);
+            out_buf.put_slice(&rx_buf[..n]);
+            let mut data = out_buf.split().freeze();
             
             while !data.is_empty() {
                 resp_tx.reserve_capacity(data.len());
